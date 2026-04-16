@@ -5,6 +5,8 @@ import { getStaging, parseApproval } from "../../src/core/staging.js";
 import { getToolAcl } from "../../src/core/toolAcl.js";
 import { getDispatcher } from "../../src/transport/dispatcher.js";
 import { getWhitelist } from "../../src/core/whitelist.js";
+import { evaluate as evaluatePolicy, type Decision } from "../../src/core/policy.js";
+import * as totp from "../../src/core/totp.js";
 
 // =============================================================================
 // admin_gate — policy enforcement tying whitelist + roles + tool ACL +
@@ -46,17 +48,12 @@ import { getWhitelist } from "../../src/core/whitelist.js";
 //     from Telegram/Slack without knowing your user_id upfront.
 // =============================================================================
 
-const STAGED_SUFFIX = ""; // reserved for future "require TOTP" extension
-
-// Tools that are admin-gated but DO NOT require staging. They fail immediately
-// for non-admins. Override via /tool-acl set. Everything else that's admin-only
-// goes through staging by default so the workflow allows admin approval.
-//
-// NOTE: For Sprint 5 we're erring on the safe side — ALL admin-only tools
-// fail immediately for non-admins rather than staging by default. This avoids
-// surprising the admin with auto-staged ACT tokens for every tool the agent
-// tries. Future: a "stageable" flag on tools that opts them into staging.
-const STAGING_ENABLED = false;
+// Staging is now driven by policy: a tool is staged when its evaluated
+// decision is `require_confirm` or `require_2fa`. Pure base-role failures
+// hard-block (no auto-staging surprise). Tools opt into confirmation via
+// `alwaysConfirm: true` or per-rule `require_confirm`/`require_2fa` actions
+// in their tool_acl.json entry. Hand-edit data/<bot>/tool_acl.json to author
+// rules; use /tool-acl test to dry-run before committing them.
 
 export default function (pi: ExtensionAPI) {
     const dispatcher = getDispatcher();
@@ -171,9 +168,10 @@ export default function (pi: ExtensionAPI) {
             return { action: "handled" };
         }
 
-        // Approve ACT-XXXXXX flow.
-        const token = parseApproval(text);
-        if (token) {
+        // Approve ACT-XXXXXX [123456] flow.
+        const approval = parseApproval(text);
+        if (approval) {
+            const { token, totpCode } = approval;
             const origin = currentOrigin(ctx.sessionManager);
             const approver = origin ?? inferOriginFromCli(ctx);
             if (!approver) {
@@ -184,9 +182,36 @@ export default function (pi: ExtensionAPI) {
                 ctx.ui.notify("Only admins can approve staged actions.", "error");
                 return { action: "handled" };
             }
+            // Peek before consume so we can demand a TOTP code if needed
+            // without burning the token on the failed attempt.
+            const pending = staging.peek(token);
+            if (!pending) {
+                ctx.ui.notify(`Token ${token} not found, already used, or expired.`, "error");
+                return { action: "handled" };
+            }
+            if (pending.requires2fa) {
+                if (!totpCode) {
+                    ctx.ui.notify(
+                        `Action ${token} requires 2FA. Reply: Approve ${token} <6-digit code>`,
+                        "warning",
+                    );
+                    return { action: "handled" };
+                }
+                if (!totp.isEnrolled(approver.platform, approver.senderId)) {
+                    ctx.ui.notify(
+                        `2FA required for ${token}, but you have no TOTP enrolled. Run /totp setup first.`,
+                        "error",
+                    );
+                    return { action: "handled" };
+                }
+                if (!totp.verify(approver.platform, approver.senderId, totpCode)) {
+                    ctx.ui.notify(`Invalid 2FA code for ${token}.`, "error");
+                    return { action: "handled" };
+                }
+            }
             const action = staging.approve(token, `${approver.platform}:${approver.senderId}`);
             if (!action) {
-                ctx.ui.notify(`Token ${token} not found, already used, or expired.`, "error");
+                ctx.ui.notify(`Token ${token} could not be consumed (race or expiry).`, "error");
                 return { action: "handled" };
             }
             // Don't actually execute the tool here — instead, transform the
@@ -222,41 +247,63 @@ export default function (pi: ExtensionAPI) {
             };
         }
 
-        // Check one-shot admin-approved allowance from the Approve flow.
+        // One-shot admin-approved allowance short-circuits everything else.
+        // The Approve flow already ran the policy + 2FA check; the LLM is
+        // re-attempting the same tool that was just unblocked.
         if (consumeOneShotAllowance(toolName, origin)) return; // allow
 
-        const required = toolAcl.requiredRoles(toolName);
-        if (whitelist.hasAnyRole(origin.platform, origin.senderId, required)) return; // allow
+        const callerRoles = whitelist.rolesOf(origin.platform, origin.senderId);
+        const decision = evaluatePolicy(toolAcl.policyEntry(toolName), {
+            callerPlatform: origin.platform,
+            callerSenderId: origin.senderId,
+            callerRoles,
+            toolArgs: event.input,
+        }).decision;
 
-        // Not allowed. Either hard-block or stage.
-        const isAdminOnly = required.length === 1 && required[0] === "admin";
-        if (isAdminOnly && STAGING_ENABLED) {
-            try {
-                const action = staging.stage({
-                    toolName,
-                    args: event.input,
-                    userPlatform: origin.platform,
-                    userSenderId: origin.senderId,
-                    ...(origin.senderDisplayName ? { userDisplayName: origin.senderDisplayName } : {}),
-                });
-                return {
-                    block: true,
-                    reason:
-                        `Action staged — admin approval required.${STAGED_SUFFIX}\n` +
-                        `Admin reply: "Approve ${action.token}" within 15 minutes to proceed.`,
-                };
-            } catch (e) {
-                return { block: true, reason: `Admin gate: staging failed (${e instanceof Error ? e.message : String(e)})` };
+        return applyDecision(decision, toolName, event.input, origin);
+    });
+
+    function applyDecision(
+        decision: Decision,
+        toolName: string,
+        toolArgs: unknown,
+        origin: InboundOrigin,
+    ): { block: true; reason: string } | undefined {
+        switch (decision.kind) {
+            case "allow":
+                return undefined;
+            case "deny":
+                return { block: true, reason: `Admin gate: ${decision.reason}` };
+            case "require_confirm":
+            case "require_2fa": {
+                try {
+                    const action = staging.stage({
+                        toolName,
+                        args: toolArgs,
+                        userPlatform: origin.platform,
+                        userSenderId: origin.senderId,
+                        ...(origin.senderDisplayName ? { userDisplayName: origin.senderDisplayName } : {}),
+                        requires2fa: decision.kind === "require_2fa",
+                    });
+                    const replyHint =
+                        decision.kind === "require_2fa"
+                            ? `Approve ${action.token} <6-digit TOTP code>`
+                            : `Approve ${action.token}`;
+                    return {
+                        block: true,
+                        reason:
+                            `Action staged — admin confirmation required.\n` +
+                            `Admin reply: "${replyHint}" within 15 minutes to proceed.`,
+                    };
+                } catch (e) {
+                    return {
+                        block: true,
+                        reason: `Admin gate: staging failed (${e instanceof Error ? e.message : String(e)})`,
+                    };
+                }
             }
         }
-
-        return {
-            block: true,
-            reason:
-                `Admin gate: \`${toolName}\` requires role(s) [${required.join(", ")}]. ` +
-                `Your roles: [${whitelist.rolesOf(origin.platform, origin.senderId).join(", ") || "(none)"}].`,
-        };
-    });
+    }
 
     // ---------------- Slash commands ----------------
 
@@ -460,7 +507,7 @@ export default function (pi: ExtensionAPI) {
     });
 
     pi.registerCommand("tool-acl", {
-        description: "Manage tool ACLs. Usage: /tool-acl list | set <toolName> <role1,role2,...>",
+        description: "Manage tool ACLs. Usage: /tool-acl list | set <toolName> <roles> | test <toolName> <platform>:<senderId> [argsJson]",
         handler: async (args, ctx) => {
             const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
             const sub = (parts[0] ?? "list").toLowerCase();
@@ -469,7 +516,14 @@ export default function (pi: ExtensionAPI) {
                 const entries = toolAcl.listConfigured();
                 if (entries.length === 0) { ctx.ui.notify("No tool ACLs configured. Defaults apply (admin-only for unlisted tools).", "info"); return; }
                 const lines = ["Tool ACLs:", ""];
-                for (const e of entries) lines.push(`  ${e.toolName.padEnd(28)} requires=[${e.requiredRoles.join(", ")}]`);
+                for (const e of entries) {
+                    const flags: string[] = [];
+                    if (e.alwaysConfirm) flags.push("alwaysConfirm");
+                    if (e.rules && e.rules.length > 0) flags.push(`${e.rules.length} rule(s)`);
+                    const tail = flags.length > 0 ? `  [${flags.join(", ")}]` : "";
+                    lines.push(`  ${e.toolName.padEnd(28)} requires=[${e.requiredRoles.join(", ")}]${tail}`);
+                }
+                lines.push("", "Hand-edit data/<bot>/tool_acl.json to author rules / alwaysConfirm.");
                 ctx.ui.notify(lines.join("\n"), "info");
                 return;
             }
@@ -485,11 +539,136 @@ export default function (pi: ExtensionAPI) {
                 if (!toolName || !rolesCsv) { ctx.ui.notify("Usage: /tool-acl set <toolName> <role1,role2,...>", "error"); return; }
                 const roles = rolesCsv.split(",").map((r) => r.trim()).filter(Boolean);
                 toolAcl.set(toolName, roles, origin ? `${origin.platform}:${origin.senderId}` : "unknown");
-                ctx.ui.notify(`Set ${toolName} → requires [${roles.join(", ")}].`, "info");
+                ctx.ui.notify(`Set ${toolName} → requires [${roles.join(", ")}]. (rules + alwaysConfirm preserved.)`, "info");
                 return;
             }
 
-            ctx.ui.notify("Usage: /tool-acl list | set <toolName> <role1,role2,...>", "info");
+            if (sub === "test") {
+                const origin = currentOrigin(ctx.sessionManager) ?? inferOriginFromCli(ctx);
+                if (origin && !whitelist.isAdmin(origin.platform, origin.senderId)) {
+                    ctx.ui.notify("Only admins can dry-run tool ACL evaluation.", "error");
+                    return;
+                }
+                // Match `test <toolName> <platform>:<senderId> [optional rest treated as JSON]`.
+                // JSON may contain whitespace, so we anchor on the first three tokens then
+                // grab everything after as a single string.
+                const m = (args ?? "").trim().match(/^test\s+(\S+)\s+(\S+)(?:\s+([\s\S]+))?$/i);
+                if (!m) {
+                    ctx.ui.notify('Usage: /tool-acl test <toolName> <platform>:<senderId> [argsJson]', "error");
+                    return;
+                }
+                const toolName = m[1]!;
+                const userStr = m[2]!;
+                const argsJsonRaw = m[3] ?? "{}";
+                const colon = userStr.indexOf(":");
+                if (colon < 1 || colon === userStr.length - 1) {
+                    ctx.ui.notify('User must be "<platform>:<senderId>" (e.g. telegram:12345).', "error");
+                    return;
+                }
+                const platform = userStr.slice(0, colon);
+                const senderId = userStr.slice(colon + 1);
+                let toolArgs: unknown;
+                try { toolArgs = JSON.parse(argsJsonRaw); } catch (e) {
+                    ctx.ui.notify(`Invalid JSON for args: ${e instanceof Error ? e.message : String(e)}`, "error");
+                    return;
+                }
+                const callerRoles = whitelist.rolesOf(platform, senderId);
+                const trace = evaluatePolicy(toolAcl.policyEntry(toolName), {
+                    callerPlatform: platform,
+                    callerSenderId: senderId,
+                    callerRoles,
+                    toolArgs,
+                });
+                const lines = [
+                    `Policy dry-run for tool=${toolName}`,
+                    `  caller:    ${platform}:${senderId}`,
+                    `  roles:     [${callerRoles.join(", ") || "(none)"}]`,
+                    `  args:      ${argsJsonRaw}`,
+                    `  decision:  ${trace.decision.kind}` + (trace.decision.kind === "deny" ? ` — ${trace.decision.reason}` : ""),
+                    `  via:       ${trace.explanation}`,
+                ];
+                ctx.ui.notify(lines.join("\n"), "info");
+                return;
+            }
+
+            ctx.ui.notify("Usage: /tool-acl list | set <toolName> <roles> | test <toolName> <platform>:<senderId> [argsJson]", "info");
+        },
+    });
+
+    pi.registerCommand("totp", {
+        description: "Per-admin TOTP enrollment for 2FA. Usage: /totp setup | verify <code> | status | disable",
+        handler: async (args, ctx) => {
+            const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
+            const sub = (parts[0] ?? "status").toLowerCase();
+
+            const origin = currentOrigin(ctx.sessionManager) ?? inferOriginFromCli(ctx);
+            if (!origin) {
+                ctx.ui.notify("Could not determine your identity for TOTP.", "error");
+                return;
+            }
+            if (!whitelist.isAdmin(origin.platform, origin.senderId)) {
+                ctx.ui.notify("Only admins can manage their own TOTP enrollment.", "error");
+                return;
+            }
+
+            if (sub === "setup") {
+                const wasEnrolled = totp.isEnrolled(origin.platform, origin.senderId);
+                const result = totp.enroll(origin.platform, origin.senderId, origin.senderDisplayName);
+                const lines = [
+                    wasEnrolled
+                        ? "⚠️  TOTP RE-ENROLLED — your previous secret has been replaced."
+                        : "✅ TOTP enrolled. Scan the URI below in your Authenticator app.",
+                    "",
+                    `otpauth URI: ${result.otpauthUri}`,
+                    `Bare secret: ${result.secret}`,
+                    "",
+                    "Then verify your setup with: /totp verify <6-digit code>",
+                    "Until verified, the secret is stored but never been confirmed to match your app.",
+                ];
+                ctx.ui.notify(lines.join("\n"), "info");
+                return;
+            }
+
+            if (sub === "verify") {
+                const code = parts[1];
+                if (!code) { ctx.ui.notify("Usage: /totp verify <6-digit code>", "error"); return; }
+                if (!totp.isEnrolled(origin.platform, origin.senderId)) {
+                    ctx.ui.notify("You are not enrolled. Run /totp setup first.", "error");
+                    return;
+                }
+                const ok = totp.verify(origin.platform, origin.senderId, code);
+                ctx.ui.notify(
+                    ok ? "✅ Code valid. TOTP is working." : "❌ Code did not verify. Check device clock and re-enter, or /totp setup again to re-enroll.",
+                    ok ? "info" : "error",
+                );
+                return;
+            }
+
+            if (sub === "status") {
+                const s = totp.status(origin.platform, origin.senderId);
+                if (!s.enrolled) {
+                    ctx.ui.notify(`TOTP NOT enrolled for ${origin.platform}:${origin.senderId}. Run /totp setup.`, "info");
+                    return;
+                }
+                const last = s.lastVerifiedAt ? new Date(s.lastVerifiedAt).toISOString() : "never";
+                const enrolled = s.enrolledAt ? new Date(s.enrolledAt).toISOString() : "unknown";
+                ctx.ui.notify(
+                    `TOTP enrolled for ${origin.platform}:${origin.senderId}.\n  enrolled at:        ${enrolled}\n  last verified at:   ${last}`,
+                    "info",
+                );
+                return;
+            }
+
+            if (sub === "disable") {
+                const ok = totp.disable(origin.platform, origin.senderId);
+                ctx.ui.notify(
+                    ok ? "TOTP disabled. Re-enroll via /totp setup." : "You were not enrolled.",
+                    "info",
+                );
+                return;
+            }
+
+            ctx.ui.notify("Usage: /totp setup | verify <code> | status | disable", "info");
         },
     });
 

@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { botDir, ensureDir } from "./paths.js";
+import type { PolicyEntry, PolicyRule } from "./policy.js";
 
 // =============================================================================
 // Tool ACL — maps toolName → requiredRoles[] (any-of semantics).
@@ -32,9 +33,21 @@ import { botDir, ensureDir } from "./paths.js";
 //              authored/seeded one).
 // =============================================================================
 
-interface AclEntry {
+export interface AclEntry {
     toolName: string;
     requiredRoles: string[];
+    /**
+     * Optional per-tool policy rules. Hand-authored in tool_acl.json (the
+     * file is per-bot, atomic-written, mode 0600). See src/core/policy.ts
+     * for shape and evaluation order.
+     */
+    rules?: PolicyRule[];
+    /**
+     * If true, callers who pass the role check still need to confirm via
+     * action staging (Approve ACT-XXXXXX). Mirrors Google ADK's
+     * `require_confirmation=True` per-tool flag.
+     */
+    alwaysConfirm?: boolean;
     updatedAt: number;
     updatedBy: string;
 }
@@ -45,7 +58,9 @@ interface AclFile {
     entries: AclEntry[];
 }
 
-const FILE_VERSION = 1;
+// v1 → v2: added optional rules[] and alwaysConfirm fields. v1 files load
+// transparently; the next save() rewrites them as v2.
+const FILE_VERSION = 2;
 
 const DEFAULTS: Record<string, string[]> = {
     // Built-in Pi tools
@@ -127,12 +142,24 @@ export class ToolAcl {
             }
             for (const e of file.entries) {
                 if (typeof e.toolName === "string" && Array.isArray(e.requiredRoles)) {
-                    this.entries.set(e.toolName, {
+                    const entry: AclEntry = {
                         toolName: e.toolName,
                         requiredRoles: e.requiredRoles.filter((r): r is string => typeof r === "string"),
                         updatedAt: typeof e.updatedAt === "number" ? e.updatedAt : Date.now(),
                         updatedBy: typeof e.updatedBy === "string" ? e.updatedBy : "unknown",
-                    });
+                    };
+                    // Trust hand-authored rules — admin edits the file directly.
+                    // Defensive shape check only; no value-level validation here
+                    // (the evaluator handles malformed rules by not matching).
+                    if (Array.isArray(e.rules)) {
+                        entry.rules = e.rules.filter((r): r is PolicyRule =>
+                            !!r && typeof r === "object" && "match" in r && "action" in r,
+                        );
+                    }
+                    if (typeof e.alwaysConfirm === "boolean") {
+                        entry.alwaysConfirm = e.alwaysConfirm;
+                    }
+                    this.entries.set(e.toolName, entry);
                 }
             }
         }
@@ -168,6 +195,21 @@ export class ToolAcl {
         return entry ? [...entry.requiredRoles] : [...FALLBACK_DEFAULT];
     }
 
+    /**
+     * Full policy view of a tool, suitable for passing to policy.evaluate().
+     * Unlisted tools collapse to the lock-down-by-default `["admin"]` floor
+     * with no rules and no alwaysConfirm.
+     */
+    policyEntry(toolName: string): PolicyEntry {
+        this.load();
+        const entry = this.entries.get(toolName);
+        if (!entry) return { requiredRoles: [...FALLBACK_DEFAULT] };
+        const out: PolicyEntry = { requiredRoles: [...entry.requiredRoles] };
+        if (entry.rules) out.rules = entry.rules;
+        if (entry.alwaysConfirm !== undefined) out.alwaysConfirm = entry.alwaysConfirm;
+        return out;
+    }
+
     /** Explicitly listed (non-default) tools. For /tool-acl list. */
     listConfigured(): AclEntry[] {
         this.load();
@@ -186,12 +228,19 @@ export class ToolAcl {
 
     set(toolName: string, requiredRoles: string[], updatedBy: string): void {
         this.load();
-        this.entries.set(toolName, {
+        // Preserve any existing rules/alwaysConfirm so /tool-acl set doesn't
+        // wipe hand-authored policy. Admin edits the JSON file directly to
+        // change rules; the slash command only touches the base role.
+        const existing = this.entries.get(toolName);
+        const next: AclEntry = {
             toolName,
             requiredRoles: [...requiredRoles],
             updatedAt: Date.now(),
             updatedBy,
-        });
+        };
+        if (existing?.rules) next.rules = existing.rules;
+        if (existing?.alwaysConfirm !== undefined) next.alwaysConfirm = existing.alwaysConfirm;
+        this.entries.set(toolName, next);
         this.save();
     }
 

@@ -19,6 +19,7 @@
     "dotenv": "^17.4.2",
     "fastembed": "^2.1.0",
     "node-schedule": "^2.1.1",
+    "otplib": "^12.0.1",
     "pdf-parse": "^2.4.5",
     "sqlite-vec": "^0.1.9"
   },
