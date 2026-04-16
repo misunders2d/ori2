@@ -4,8 +4,9 @@
 # department's bot is built from this baseline, so a regression here ripples
 # to N forks. Don't merge red.
 #
-# Matrix: Node 20, 22, 24. Pi SDK requires Node ≥ 18 but we exercise the
-# realistic deployment range.
+# Matrix: Node 22, 24. Node 22 is the current LTS (since Oct 2024). We
+# previously included Node 20 but its test-runner glob support varies across
+# minor versions and bit us — bumping the floor avoids a class of brittleness.
 #
 # Security note: this workflow takes no untrusted input from PR/issue bodies
 # or commit messages, so the standard injection vectors don't apply. If you
@@ -31,7 +32,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node: ["20", "22", "24"]
+        node: ["22", "24"]
 
     steps:
       - uses: actions/checkout@v4

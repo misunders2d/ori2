@@ -64,8 +64,10 @@ require git
 require node
 require npm
 NODE_MAJOR=$(node -p "process.versions.node.split('.')[0]")
-if [[ "$NODE_MAJOR" -lt 18 ]]; then
-    err "Node.js v18+ required (found v$(node -v))."
+# Node 22 is current LTS (Oct 2024); CI runs the suite on 22 + 24. Older
+# versions hit subtle differences in node:test runner globbing and --import.
+if [[ "$NODE_MAJOR" -lt 22 ]]; then
+    err "Node.js v22+ required (found v$(node -v)). Install via nvm: 'nvm install --lts'"
 fi
 echo "Node $(node -v), npm $(npm -v), git $(git --version | head -1)"
 

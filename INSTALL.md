@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- **Node.js v18+** (`node -v`)
+- **Node.js v22+** (`node -v`) — current LTS. The `npm test` runner relies on `node:test` features stabilized in 22.
 - **git**
 - **build tools** for native modules (Linux: `build-essential`, `python3`; macOS: Xcode CLT) — needed by `better-sqlite3` first install
 - ~250MB free disk for embeddings + node_modules
