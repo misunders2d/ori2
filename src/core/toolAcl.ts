@@ -99,9 +99,14 @@ const DEFAULTS: Record<string, string[]> = {
     cancel_friend_task: ["user"],
     get_agent_identity: ["user"],
     list_friend_dna_features: ["user"],
-    // Admin-gated A2A tools fall to the FALLBACK_DEFAULT (["admin"]) so we
-    // don't enumerate them here — add_friend, accept_invitation, call_agent,
-    // update_friend_address, update_friend_key, broadcast_address_update.
+    list_dna_features: ["user"],
+    list_dna_imports: ["user"],
+    list_dna_snapshots: ["user"],
+    // Admin-gated A2A + DNA tools fall to the FALLBACK_DEFAULT (["admin"]) so
+    // we don't enumerate them here — add_friend, accept_invitation,
+    // call_agent, update_friend_address, update_friend_key,
+    // broadcast_address_update, register_dna_feature, unregister_dna_feature,
+    // pull_dna, apply_dna, rollback_dna.
     // Sprint 9 evolution surface
     evolve_extension: ["admin"],
     evolve_skill: ["admin"],

@@ -8,11 +8,13 @@ import {
     UnauthenticatedUser,
 } from "@a2a-js/sdk/server";
 import { jsonRpcHandler, agentCardHandler } from "@a2a-js/sdk/server/express";
+import fs from "node:fs";
 import { getFriends, type Friends } from "./friends.js";
 import { buildAgentCard, type BuildAgentCardInput } from "./agentCard.js";
 import { allocatePort } from "./portAlloc.js";
 import { getA2AAdapter, type A2AAdapter } from "./adapter.js";
 import { A2AAgentExecutor } from "./agentExecutor.js";
+import { getDnaCatalog, packageFeature } from "./dna.js";
 import type { AgentCard } from "./types.js";
 
 // =============================================================================
@@ -154,6 +156,10 @@ export async function startA2AServer(opts: A2AServerOptions): Promise<A2AServerH
 
     const boundPort = await allocatePort({ preferred: preferredPort, host });
 
+    // DNA features for the agent card: explicit override > live catalog.
+    // Most boots will rely on the catalog (auto-populated).
+    const initialDna = opts.dnaFeatures ?? getDnaCatalog().asAgentCardEntries();
+
     let agentCard = buildAgentCard({
         botName: opts.botName,
         agentId: opts.agentId,
@@ -163,7 +169,7 @@ export async function startA2AServer(opts: A2AServerOptions): Promise<A2AServerH
         ...(opts.providerName !== undefined ? { providerName: opts.providerName } : {}),
         ...(opts.providerUrl !== undefined ? { providerUrl: opts.providerUrl } : {}),
         ...(opts.additionalSkills !== undefined ? { additionalSkills: opts.additionalSkills } : {}),
-        ...(opts.dnaFeatures !== undefined ? { dnaFeatures: opts.dnaFeatures } : {}),
+        dnaFeatures: initialDna,
         hasApiKey: true,
     });
 
@@ -287,6 +293,49 @@ export async function startA2AServer(opts: A2AServerOptions): Promise<A2AServerH
         res.json({ status: "accepted", local_name: localName });
     });
 
+    // -------------------- DNA exchange endpoint --------------------
+
+    /**
+     * GET /dna/<feature-id>.tar.gz
+     * Auth: x-a2a-api-key (already validated; req.a2aFriend tells us who).
+     * ACL: feature.share_with must include the requesting friend (or "*").
+     * Packaging is on the fly — no pre-built tarballs sit on disk.
+     */
+    app.get(/^\/dna\/([a-zA-Z0-9_-]+)\.tar\.gz$/, async (req, res) => {
+        const featureId = req.params[0];
+        if (typeof featureId !== "string" || !featureId) { res.status(400).send("invalid feature path"); return; }
+        const requester = (req as Request & { a2aFriend?: string }).a2aFriend;
+        if (!requester) { res.status(401).json({ error: "unauthenticated" }); return; }
+        const catalog = getDnaCatalog();
+        if (!catalog.get(featureId)) { res.status(404).json({ error: "feature not found" }); return; }
+        if (!catalog.canShareWith(featureId, requester)) {
+            res.status(403).json({ error: `feature '${featureId}' not shared with you` });
+            return;
+        }
+        let pkg;
+        try {
+            // Pi SDK version is read from package.json — for now hardcode the
+            // major minor; refine later if friends start enforcing version match.
+            pkg = await packageFeature(featureId, { piSdkVersion: "0.67" });
+        } catch (e) {
+            res.status(500).json({ error: e instanceof Error ? e.message : String(e) });
+            return;
+        }
+        try {
+            const stat = fs.statSync(pkg.tarPath);
+            res.setHeader("content-type", "application/gzip");
+            res.setHeader("content-length", String(stat.size));
+            res.setHeader("content-disposition", `attachment; filename="${featureId}.tar.gz"`);
+            res.setHeader("x-dna-sha256", pkg.sha256);
+            const stream = fs.createReadStream(pkg.tarPath);
+            stream.pipe(res);
+            stream.on("close", () => { try { fs.unlinkSync(pkg!.tarPath); } catch { /* ignore */ } });
+            stream.on("error", () => { try { fs.unlinkSync(pkg!.tarPath); } catch { /* ignore */ } });
+        } catch (e) {
+            res.status(500).json({ error: `streaming failed: ${e instanceof Error ? e.message : String(e)}` });
+        }
+    });
+
     // -------------------- A2A SDK JSON-RPC handler --------------------
 
     const taskStore = new InMemoryTaskStore();
@@ -330,6 +379,10 @@ export async function startA2AServer(opts: A2AServerOptions): Promise<A2AServerH
         agentCard,
         refreshAgentCard(patch) {
             const merged: A2AServerOptions = { ...opts, ...(patch ?? {}) };
+            // DNA features default to the live catalog so register/unregister
+            // events propagate to the served card without callers having to
+            // pass them every refresh.
+            const dnaFeatures = merged.dnaFeatures ?? getDnaCatalog().asAgentCardEntries();
             agentCard = buildAgentCard({
                 botName: merged.botName,
                 agentId: merged.agentId,
@@ -341,7 +394,7 @@ export async function startA2AServer(opts: A2AServerOptions): Promise<A2AServerH
                 ...(merged.additionalSkills !== undefined
                     ? { additionalSkills: merged.additionalSkills }
                     : {}),
-                ...(merged.dnaFeatures !== undefined ? { dnaFeatures: merged.dnaFeatures } : {}),
+                dnaFeatures,
                 hasApiKey: true,
             });
             handle.agentCard = agentCard;
