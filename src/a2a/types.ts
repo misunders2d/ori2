@@ -11,7 +11,8 @@ export interface AgentCardSkill {
     id: string;
     name: string;
     description: string;
-    tags?: string[];
+    /** Required by @a2a-js/sdk's AgentSkill. Empty array if no tags. */
+    tags: string[];
 }
 
 export interface AgentCardEndpoint {
@@ -33,6 +34,12 @@ export interface AgentCardSecurityScheme {
 }
 
 export interface AgentCard {
+    /**
+     * A2A spec version we implement. Required by @a2a-js/sdk's AgentCard
+     * shape — value is the spec version we render to (e.g. "0.3.0").
+     */
+    protocolVersion: string;
+    /** Our internal agent id. SDK doesn't require it but we use it for our own audit. */
     id: string;
     name: string;
     version: string;
@@ -41,6 +48,7 @@ export interface AgentCard {
     provider: { organization: string; url: string };
     defaultInputModes: string[];
     defaultOutputModes: string[];
+    /** Our-side legacy field — SDK uses `additionalInterfaces` instead. Kept for backward audit logs. */
     endpoints: AgentCardEndpoint[];
     capabilities: AgentCardCapabilities;
     skills: AgentCardSkill[];

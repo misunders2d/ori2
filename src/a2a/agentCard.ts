@@ -60,7 +60,15 @@ export function buildAgentCard(input: BuildAgentCardInput): AgentCard {
         tags: ["dna", ...(f.tags ?? [])],
     }));
 
+    // Defensive: any operator-supplied additional skills must also satisfy the
+    // SDK's required `tags` field. Default to an empty array if missing.
+    const additionalSkills: AgentCardSkill[] = (input.additionalSkills ?? []).map((s) => ({
+        ...s,
+        tags: s.tags ?? [],
+    }));
+
     const card: AgentCard = {
+        protocolVersion: "0.3.0",
         id: input.agentId,
         name: input.botName,
         version: input.version ?? "1.0.0",
@@ -81,7 +89,7 @@ export function buildAgentCard(input: BuildAgentCardInput): AgentCard {
         },
         skills: [
             ...FIXED_SKILLS,
-            ...(input.additionalSkills ?? []),
+            ...additionalSkills,
             ...dnaSkills,
         ],
     };

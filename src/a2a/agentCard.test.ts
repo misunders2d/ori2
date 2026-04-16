@@ -98,7 +98,7 @@ describe("buildAgentCard — skills composition", () => {
     it("ordering: fixed → additional → dna", () => {
         const card = buildAgentCard({
             ...BASE,
-            additionalSkills: [{ id: "extra", name: "extra", description: "x" }],
+            additionalSkills: [{ id: "extra", name: "extra", description: "x", tags: [] }],
             dnaFeatures: [{ id: "feat-x", description: "x" }],
         });
         const ids = card.skills.map((s) => s.id);
