@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { getDispatcher } from "../../src/transport/dispatcher.js";
 import type { Message } from "../../src/transport/types.js";
+import { getVault } from "../../src/core/vault.js";
 
 // =============================================================================
 // transport_bridge — Pi-side glue for the transport abstraction.
@@ -153,6 +154,67 @@ export default function (pi: ExtensionAPI) {
                 if (a.lastError) lines.push(`    last_error: ${a.lastError}`);
             }
             ctx.ui.notify(lines.join("\n"), "info");
+        },
+    });
+
+    pi.registerCommand("connect-telegram", {
+        description: "Validate a Telegram bot token, store it in the vault, and (re)start the Telegram adapter. Args: <bot_token>",
+        handler: async (args, ctx) => {
+            const token = (args ?? "").trim();
+            if (!token) {
+                ctx.ui.notify("Usage: /connect-telegram <bot_token>\nGet a token from @BotFather on Telegram.", "error");
+                return;
+            }
+            // Validate by calling getMe.
+            ctx.ui.notify("Validating token via Telegram getMe...", "info");
+            type BotInfo = { id: number; username?: string; first_name: string };
+            let me: BotInfo | null = null;
+            try {
+                const res = await fetch(`https://api.telegram.org/bot${token}/getMe`);
+                const json = (await res.json()) as { ok: boolean; result?: BotInfo; description?: string };
+                if (!json.ok || !json.result) {
+                    ctx.ui.notify(`Invalid token: ${json.description ?? "Telegram rejected the token"}`, "error");
+                    return;
+                }
+                me = json.result;
+            } catch (e) {
+                ctx.ui.notify(`Failed to reach Telegram API: ${e instanceof Error ? e.message : String(e)}`, "error");
+                return;
+            }
+            // TS flow-narrows `me` to its initialised type — re-typed local escapes.
+            const validatedMe = me as BotInfo | null;
+
+            // Store in vault.
+            getVault().set("TELEGRAM_BOT_TOKEN", token);
+
+            // Restart the Telegram adapter so it picks up the new token.
+            const adapter = dispatcher.getAdapter("telegram");
+            if (!adapter) {
+                ctx.ui.notify(
+                    `Token saved to vault. Telegram adapter is not registered yet — restart the bot to enable it.`,
+                    "warning",
+                );
+                return;
+            }
+            await adapter.stop();
+            await adapter.start();
+            const status = adapter.status();
+            const username = validatedMe?.username ? `@${validatedMe.username}` : validatedMe?.first_name ?? "(unknown)";
+            if (status.state === "running") {
+                ctx.ui.notify(
+                    `✅ Telegram bot ${username} connected.\n` +
+                    `⚠️ Stopgap whitelist active until Sprint 5: nobody can talk to the bot until you set\n` +
+                    `   TELEGRAM_ALLOWED_USERS=<your_telegram_user_id>,<other_user_ids>\n` +
+                    `   in the vault. (Use the vault tools or edit data/<bot>/vault.json directly, then /reload.)\n` +
+                    `   Send the bot a message and check the logs to see your user_id.`,
+                    "info",
+                );
+            } else {
+                ctx.ui.notify(
+                    `Token saved but adapter state=${status.state}: ${status.lastError ?? "(no error reason)"}`,
+                    "warning",
+                );
+            }
         },
     });
 }

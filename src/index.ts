@@ -14,6 +14,7 @@ import { botDir, ensureDir, getBotName } from "./core/paths.js";
 import { getVault } from "./core/vault.js";
 import { getDispatcher } from "./transport/dispatcher.js";
 import { CliAdapter } from "./transport/cli.js";
+import { TelegramAdapter } from "./transport/telegram.js";
 
 // .env carries non-secret runtime config only (BOT_NAME, PRIMARY_PROVIDER,
 // REQUIRE_2FA, GUARDRAIL_EMBEDDINGS). Secrets live in the vault.
@@ -69,6 +70,10 @@ async function bootstrap() {
     // Slack (future), and Synapse-A2A (Sprint 9) register the same way.
     const dispatcher = getDispatcher();
     dispatcher.register(new CliAdapter());
+    // Telegram adapter — always registered. Self-stops cleanly if no
+    // TELEGRAM_BOT_TOKEN in vault, surfaces a "needs token" status. Use
+    // /connect-telegram <token> from a session to provision it.
+    dispatcher.register(new TelegramAdapter());
     const startResult = await dispatcher.startAll();
     if (startResult.failed.length > 0) {
         for (const f of startResult.failed) {
