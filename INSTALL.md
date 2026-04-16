@@ -45,11 +45,17 @@ The bootstrap can install a systemd user unit. Manual setup:
 
 ```bash
 mkdir -p ~/.config/systemd/user
+mkdir -p "$PWD/data/MyBot/.pi-state"
+
+NPM_PATH="$(command -v npm)"
+PATH_ENV="$(dirname "$NPM_PATH"):/usr/local/bin:/usr/bin:/bin"
 
 # Render the template
-sed -e 's|@INSTALL_DIR@|'"$PWD"'|g' \
-    -e 's|@BOT_NAME@|MyBot|g' \
-    -e 's|@USER@|'"$USER"'|g' \
+sed -e "s|@INSTALL_DIR@|$PWD|g" \
+    -e "s|@BOT_NAME@|MyBot|g" \
+    -e "s|@USER@|$USER|g" \
+    -e "s|@NPM_PATH@|$NPM_PATH|g" \
+    -e "s|@PATH@|$PATH_ENV|g" \
     systemd/ori2.service > ~/.config/systemd/user/ori2-MyBot.service
 
 systemctl --user daemon-reload
@@ -70,36 +76,36 @@ systemctl --user restart ori2-MyBot
 
 ## Headless deployment (macOS, launchd)
 
-Create `~/Library/LaunchAgents/dev.ori2.MyBot.plist`:
+The bootstrap installer auto-renders and loads the plist if you accept the
+prompt. To do it manually from a checkout:
 
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key><string>dev.ori2.MyBot</string>
-    <key>WorkingDirectory</key><string>/path/to/ori2</string>
-    <key>ProgramArguments</key>
-    <array><string>/usr/bin/env</string><string>npm</string><string>run</string><string>start</string></array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>ORI2_DAEMON</key><string>true</string>
-        <key>BOT_NAME</key><string>MyBot</string>
-        <key>PATH</key><string>/usr/local/bin:/usr/bin:/bin</string>
-    </dict>
-    <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><dict><key>Crashed</key><true/></dict>
-    <key>StandardOutPath</key><string>/tmp/ori2-MyBot.log</string>
-    <key>StandardErrorPath</key><string>/tmp/ori2-MyBot.log</string>
-</dict>
-</plist>
+```bash
+NPM_PATH="$(command -v npm)"
+PATH_ENV="$(dirname "$NPM_PATH"):/usr/local/bin:/usr/bin:/bin"
+
+sed -e "s|@INSTALL_DIR@|$PWD|g" \
+    -e "s|@BOT_NAME@|MyBot|g" \
+    -e "s|@USER@|$USER|g" \
+    -e "s|@NPM_PATH@|$NPM_PATH|g" \
+    -e "s|@PATH@|$PATH_ENV|g" \
+    launchd/dev.ori2.plist.template \
+  > ~/Library/LaunchAgents/dev.ori2.MyBot.plist
+
+launchctl load   ~/Library/LaunchAgents/dev.ori2.MyBot.plist
+launchctl start  dev.ori2.MyBot
+tail -f /tmp/ori2-MyBot.log
 ```
 
-Then:
+Restart after a code update:
 ```bash
-launchctl load ~/Library/LaunchAgents/dev.ori2.MyBot.plist
-launchctl start dev.ori2.MyBot
-tail -f /tmp/ori2-MyBot.log
+cd /path/to/ori2 && git pull && npm install
+launchctl kickstart -k gui/$(id -u)/dev.ori2.MyBot
+```
+
+Uninstall:
+```bash
+launchctl unload ~/Library/LaunchAgents/dev.ori2.MyBot.plist
+rm ~/Library/LaunchAgents/dev.ori2.MyBot.plist
 ```
 
 ## Headless deployment (Docker)
@@ -120,6 +126,24 @@ CMD ["npm", "run", "start"]
 ```
 
 Mount `data/` as a volume to persist sessions/vault/memory.
+
+## Running multiple bots on one host
+
+Each bot lives in its own checkout. The two checkouts are fully independent:
+
+| Resource | Per-bot | Where |
+|---|---|---|
+| Vault, memory, sessions, plans, OAuth, credentials, channel log | ✅ | `<checkout>/data/<BOT>/` |
+| Fastembed model cache (~130MB) | ✅ | `<checkout>/data/<BOT>/.fastembed_cache/` |
+| Pi SDK global config (auth/models/settings/themes/debug log) | ✅ | `<checkout>/data/<BOT>/.pi-state/` (via `PI_CODING_AGENT_DIR`) |
+| Instance lock | ✅ | `<checkout>/data/<BOT>/.instance.lock` (PID-checked, stale-tolerant) |
+| systemd unit / launchd label | ✅ | `ori2-<BOT>.service` / `dev.ori2.<BOT>` |
+| Telegram bot token | ✅ | each bot's vault — different bot accounts |
+| `.env`, `.pi/extensions/`, `node_modules/` | ✅ (separate checkout) | each checkout's own |
+
+No port collisions: Telegram is long-poll, OAuth uses Device Code (no callback). Two bots talking to two different Telegram bots can run side-by-side under one OS user with zero shared mutable state.
+
+`PI_CODING_AGENT_DIR` is the only piece of isolation you need to know about: without it, every bot run by the same OS user would share `~/.pi/agent/` (Pi SDK's default) and concurrent writes to `auth.json` / `settings.json` would race. The bootstrap, the systemd template, the launchd template, and `npm start` all set this per-bot.
 
 ## After install — claiming admin
 

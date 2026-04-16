@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ori2 launchd UNIT TEMPLATE (macOS). Don't edit this file in-place.
+
+  The bootstrap installer renders it into
+    ~/Library/LaunchAgents/dev.ori2.<BOT_NAME>.plist
+  with five placeholders substituted: INSTALL_DIR, BOT_NAME, USER, NPM_PATH,
+  PATH (each wrapped in @-signs in the body below).
+
+  See INSTALL.md "Headless deployment (macOS, launchd)" for the manual
+  substitution + load + restart commands.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.ori2.@BOT_NAME@</string>
+
+    <key>WorkingDirectory</key>
+    <string>@INSTALL_DIR@</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>@NPM_PATH@</string>
+        <string>run</string>
+        <string>start</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>ORI2_DAEMON</key>
+        <string>true</string>
+        <key>NODE_ENV</key>
+        <string>production</string>
+        <key>BOT_NAME</key>
+        <string>@BOT_NAME@</string>
+        <key>PATH</key>
+        <string>@PATH@</string>
+        <key>HOME</key>
+        <string>/Users/@USER@</string>
+        <!-- PI_CODING_AGENT_DIR pins Pi SDK's global config (auth.json,
+             models.json, settings.json, themes, debug log) into the bot's
+             own data dir. Without this, every bot run by the same OS user
+             shares ~/.pi/agent/ and concurrent writes race. -->
+        <key>PI_CODING_AGENT_DIR</key>
+        <string>@INSTALL_DIR@/data/@BOT_NAME@/.pi-state</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart on crash. Don't restart on clean exit (so `launchctl unload`
+         doesn't fight us). KeepAlive.SuccessfulExit=false → only relaunch
+         when the process exits non-zero or is killed. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <!-- Throttle: don't relaunch faster than once every 10s. Mirrors the
+         systemd unit's RestartSec=5 / StartLimitBurst=3 idea. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Graceful shutdown: SIGTERM, then 30s before SIGKILL. Matches the
+         systemd unit's TimeoutStopSec=30. -->
+    <key>ExitTimeOut</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/ori2-@BOT_NAME@.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/ori2-@BOT_NAME@.log</string>
+
+    <!-- Run the agent at low scheduling priority so it doesn't hog the
+         workstation when an admin is also using the machine interactively. -->
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

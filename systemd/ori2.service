@@ -1,27 +1,14 @@
-[Unit]
-# ori2 systemd UNIT TEMPLATE.
+# ori2 systemd UNIT TEMPLATE. Don't edit in-place.
 #
-# Don't edit this file in-place. The bootstrap installer renders it into
-# ~/.config/systemd/user/ori2-<BOT_NAME>.service with these placeholders
-# substituted: @INSTALL_DIR@, @BOT_NAME@, @USER@. If you install manually,
-# do the substitution yourself or run:
+# The bootstrap installer renders it into
+#   ~/.config/systemd/user/ori2-<BOT_NAME>.service
+# with these placeholders substituted: INSTALL_DIR, BOT_NAME, USER, NPM_PATH,
+# PATH (each wrapped in @-signs in the body below).
 #
-#   sed -e 's|@INSTALL_DIR@|/path/to/ori2|g' \
-#       -e 's|@BOT_NAME@|MyBot|g' \
-#       -e 's|@USER@|youruser|g' \
-#       systemd/ori2.service > ~/.config/systemd/user/ori2-MyBot.service
-#
-# Then:
-#   systemctl --user daemon-reload
-#   systemctl --user enable --now ori2-MyBot
-#   sudo loginctl enable-linger youruser   # survive logout
-#
-# Logs:
-#   journalctl --user -u ori2-MyBot -f
-#
-# To restart cleanly after a code update:
-#   cd /path/to/ori2 && git pull && npm install && systemctl --user restart ori2-MyBot
+# See INSTALL.md "Headless deployment (Linux, systemd user mode)" for the
+# manual substitution + load + restart commands.
 
+[Unit]
 Description=Ori2 — @BOT_NAME@ (autonomous assistant)
 After=network-online.target
 Wants=network-online.target
@@ -36,7 +23,22 @@ Environment=ORI2_DAEMON=true
 Environment=NODE_ENV=production
 Environment=BOT_NAME=@BOT_NAME@
 
-ExecStart=/usr/bin/env npm run start
+# PATH is baked at install time so nvm-installed Node resolves. systemd's
+# default PATH is /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin — fine
+# for system Node, but invisible to nvm. The bootstrap renders @PATH@ from
+# `dirname $(command -v npm)` plus the standard dirs.
+Environment=PATH=@PATH@
+
+# PI_CODING_AGENT_DIR pins Pi SDK's global config dir (auth.json, models.json,
+# settings.json, themes, debug log) into the bot's own data dir. Without this,
+# every bot run by the same OS user shares ~/.pi/agent/ — concurrent writes
+# (e.g. pi auth login from one bot while another runs) race. Per-bot makes
+# each checkout fully self-contained.
+Environment=PI_CODING_AGENT_DIR=@INSTALL_DIR@/data/@BOT_NAME@/.pi-state
+
+# Use the absolute npm path (baked at install time) instead of /usr/bin/env npm
+# so nvm/asdf/volta don't break under systemd's minimal env.
+ExecStart=@NPM_PATH@ run start
 
 # Restart on crash, give up after 3 consecutive failures within 60s so a
 # real bug doesn't crash-loop forever burning CPU.

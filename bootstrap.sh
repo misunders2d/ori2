@@ -112,7 +112,10 @@ else
     fi
 fi
 
-# systemd unit (Linux only, optional)
+# Service-manager unit (optional). systemd on Linux, launchd on macOS.
+# Combined under one --no-systemd flag because both are "auto-install the
+# headless service unit" — keeping a single skip flag avoids a confusing
+# --no-systemd-but-yes-launchd matrix.
 if [[ "$SKIP_SYSTEMD" -ne 1 ]] && command -v systemctl >/dev/null 2>&1; then
     step "Optional: install systemd user unit for headless deployment"
     echo "This installs ~/.config/systemd/user/ori2-${BOT_NAME:-yourname}.service"
@@ -124,12 +127,24 @@ if [[ "$SKIP_SYSTEMD" -ne 1 ]] && command -v systemctl >/dev/null 2>&1; then
         if [[ -z "$BOT_NAME" ]]; then
             read -r -p "Bot name for the unit (matches BOT_NAME in .env): " BOT_NAME
         fi
+        NPM_PATH="$(command -v npm)"
+        if [[ -z "$NPM_PATH" ]]; then
+            err "npm not found on PATH — required to render systemd unit."
+        fi
+        # Bake an explicit PATH so nvm/asdf/volta-installed Node resolves
+        # under systemd's minimal env. Mirror the launchd block.
+        PATH_ENV="$(dirname "$NPM_PATH"):/usr/local/bin:/usr/bin:/bin"
         UNIT_DIR="$HOME/.config/systemd/user"
         mkdir -p "$UNIT_DIR"
+        # Pre-create the per-bot Pi-state dir so PI_CODING_AGENT_DIR points at
+        # something Pi can immediately read/write.
+        mkdir -p "$INSTALL_DIR/data/${BOT_NAME}/.pi-state"
         UNIT_FILE="$UNIT_DIR/ori2-${BOT_NAME}.service"
         sed -e "s|@INSTALL_DIR@|$INSTALL_DIR|g" \
             -e "s|@BOT_NAME@|$BOT_NAME|g" \
             -e "s|@USER@|$USER|g" \
+            -e "s|@NPM_PATH@|$NPM_PATH|g" \
+            -e "s|@PATH@|$PATH_ENV|g" \
             "$INSTALL_DIR/systemd/ori2.service" > "$UNIT_FILE"
         chmod 0644 "$UNIT_FILE"
         echo "Installed: $UNIT_FILE"
@@ -139,6 +154,56 @@ if [[ "$SKIP_SYSTEMD" -ne 1 ]] && command -v systemctl >/dev/null 2>&1; then
         echo "To enable boot: systemctl --user enable ori2-${BOT_NAME}"
         echo "To survive logout: sudo loginctl enable-linger $USER"
         echo "Logs:           journalctl --user -u ori2-${BOT_NAME} -f"
+    fi
+elif [[ "$SKIP_SYSTEMD" -ne 1 ]] && [[ "$(uname -s)" == "Darwin" ]] && command -v launchctl >/dev/null 2>&1; then
+    step "Optional: install launchd user agent for headless deployment"
+    echo "This installs ~/Library/LaunchAgents/dev.ori2.${BOT_NAME:-MyBot}.plist"
+    echo "to run the bot under your user account and auto-restart on crash."
+    echo "Logs go to /tmp/ori2-${BOT_NAME:-MyBot}.log."
+    echo
+    read -r -p "Install launchd user agent? [y/N] " yn
+    if [[ "$yn" =~ ^[Yy]$ ]]; then
+        if [[ -z "$BOT_NAME" ]]; then
+            read -r -p "Bot name for the agent (matches BOT_NAME in .env): " BOT_NAME
+        fi
+        NPM_PATH="$(command -v npm)"
+        if [[ -z "$NPM_PATH" ]]; then
+            err "npm not found on PATH — required to render launchd plist."
+        fi
+        # launchd jobs run with a minimal PATH; bake the dir holding npm
+        # into PATH= so node + tsx + git resolve. Append the standard dirs
+        # in case the agent shells out.
+        PATH_ENV="$(dirname "$NPM_PATH"):/usr/local/bin:/usr/bin:/bin"
+        AGENT_DIR="$HOME/Library/LaunchAgents"
+        mkdir -p "$AGENT_DIR"
+        # Pre-create the per-bot Pi-state dir so PI_CODING_AGENT_DIR points at
+        # something Pi can immediately read/write.
+        mkdir -p "$INSTALL_DIR/data/${BOT_NAME}/.pi-state"
+        AGENT_LABEL="dev.ori2.${BOT_NAME}"
+        AGENT_FILE="$AGENT_DIR/${AGENT_LABEL}.plist"
+        sed -e "s|@INSTALL_DIR@|$INSTALL_DIR|g" \
+            -e "s|@BOT_NAME@|$BOT_NAME|g" \
+            -e "s|@USER@|$USER|g" \
+            -e "s|@NPM_PATH@|$NPM_PATH|g" \
+            -e "s|@PATH@|$PATH_ENV|g" \
+            "$INSTALL_DIR/launchd/dev.ori2.plist.template" > "$AGENT_FILE"
+        chmod 0644 "$AGENT_FILE"
+        echo "Installed: $AGENT_FILE"
+        # Reload if already loaded (idempotent re-run); ignore failure on
+        # first install where the label isn't loaded yet.
+        launchctl unload "$AGENT_FILE" 2>/dev/null || true
+        if launchctl load "$AGENT_FILE"; then
+            echo "Loaded:    $AGENT_LABEL"
+        else
+            echo "WARNING: launchctl load failed — inspect the plist with:"
+            echo "  plutil -lint $AGENT_FILE"
+        fi
+        echo
+        echo "To start now:   launchctl start ${AGENT_LABEL}"
+        echo "To stop:        launchctl stop  ${AGENT_LABEL}"
+        echo "To restart:     launchctl kickstart -k gui/\$(id -u)/${AGENT_LABEL}"
+        echo "To uninstall:   launchctl unload $AGENT_FILE && rm $AGENT_FILE"
+        echo "Logs:           tail -f /tmp/ori2-${BOT_NAME}.log"
     fi
 fi
 

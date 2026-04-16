@@ -10,7 +10,7 @@ import {
 import dotenv from "dotenv";
 import { runOnboardingFlow, isSystemConfigured } from "./onboarding/setup.js";
 import { acquireInstanceLock } from "./core/instanceLock.js";
-import { botDir, ensureDir, getBotName } from "./core/paths.js";
+import { botDir, botSubdir, ensureDir, getBotName } from "./core/paths.js";
 import { getVault } from "./core/vault.js";
 import { getDispatcher } from "./transport/dispatcher.js";
 import { CliAdapter } from "./transport/cli.js";
@@ -70,6 +70,19 @@ async function bootstrap() {
     const botName = getBotName();
     const storagePath = botDir();
     ensureDir(storagePath);
+
+    // Pi-state isolation: pin PI_CODING_AGENT_DIR per-bot so Pi's global
+    // config (auth.json, models.json, settings.json, themes, debug log)
+    // lives under data/<BOT>/.pi-state/ instead of the OS-user-wide
+    // ~/.pi/agent/. Without this, every ori2 bot run by the same OS user
+    // shares ~/.pi/agent/ and concurrent writes race. systemd/launchd units
+    // set this explicitly; this default covers `npm start` so plain
+    // interactive launches are also per-checkout-isolated.
+    if (!process.env["PI_CODING_AGENT_DIR"]) {
+        const piStateDir = botSubdir(".pi-state");
+        ensureDir(piStateDir);
+        process.env["PI_CODING_AGENT_DIR"] = piStateDir;
+    }
 
     // Hydrate process.env from vault BEFORE any extension or Pi component reads
     // these keys. After this point, every subsequent process.env access for a
