@@ -708,18 +708,14 @@ export default function (pi: ExtensionAPI) {
         );
     });
 
-    // ---------- Admin Override Option A: Synapse A2A (placeholder) ----------
+    // ---------- Admin Override Option A: A2A peer command (placeholder) ----------
 
     /**
-     * PLACEHOLDER — Admin Override Option A: Synapse A2A admin command.
+     * PLACEHOLDER — Admin Override Option A: A2A peer-issued admin command.
      *
-     * Once `synapse_a2a.ts` is rewritten as a proper TransportAdapter (Sprint 9)
-     * and inbound Synapse traffic flows through the dispatcher, an admin from any agent on the
-     * Synapse network can run:
-     *     synapse send <bot> "/plan-abort <sessionId> <reason>"
-     *
-     * The Synapse inbound listener in bus.ts must dispatch slash commands the
-     * same way the terminal does — for /plan-abort it should emit a
+     * Inbound A2A traffic flows through the standard dispatcher, so a friendly
+     * admin peer can call_friend(<our-name>, "/plan-abort <sessionId> <reason>")
+     * and reach the same slash-command handler. The handler should emit a
      * `plan:admin-action` event (see Option C placeholder above). No additional
      * code is needed in this file; the Option C listener catches it.
      */

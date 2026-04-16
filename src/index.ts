@@ -100,7 +100,7 @@ async function bootstrap() {
 
     // Transport dispatcher — singleton hub between adapters and Pi runtime.
     // CLI adapter is the only built-in baseline adapter; Telegram (Sprint 4),
-    // Slack (future), and Synapse-A2A (Sprint 9) register the same way.
+    // Slack (future), and A2A (peer-to-peer) register the same way.
     const dispatcher = getDispatcher();
     dispatcher.register(new CliAdapter());
     // Telegram adapter — always registered. Self-stops cleanly if no

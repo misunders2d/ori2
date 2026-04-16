@@ -92,6 +92,12 @@ export class TunnelManager extends EventEmitter {
             };
             const onReady = (url: string) => settle(url);
             this.once("url-ready", onReady);
+            // NOT unref'd — we're actively awaiting the resolve. unref'ing
+            // would let the loop exit before the timeout fires when nothing
+            // else holds it alive (e.g. /bin/false in tests, or a CI runner
+            // that has no other pending work). caller is expected to await
+            // start() before going idle, so a brief synchronous wait here
+            // is fine.
             const timeout = setTimeout(() => {
                 console.warn(
                     `[a2a/tunnel] cloudflared did not emit a URL within ${initialUrlTimeoutMs}ms; ` +
@@ -100,7 +106,6 @@ export class TunnelManager extends EventEmitter {
                 this.off("url-ready", onReady);
                 resolve(undefined);
             }, initialUrlTimeoutMs);
-            timeout.unref();
             this.spawnChild();
         });
     }
