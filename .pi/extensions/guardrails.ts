@@ -1,8 +1,8 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { EmbeddingModel, FlagEmbedding } from "fastembed";
 import fs from "node:fs";
 import path from "node:path";
 import { botSubdir, ensureDir } from "../../src/core/paths.js";
+import { cosineSim, embedBatch, embedQuery } from "../../src/core/embeddings.js";
 
 // =============================================================================
 // Prompt-Injection Guardrail (local-first, zero-API-key baseline)
@@ -60,43 +60,6 @@ function pickBackend(): Backend {
     return "local";
 }
 
-function cosineSim(a: number[], b: number[]): number {
-    if (a.length !== b.length || a.length === 0) return 0;
-    let dot = 0, ma = 0, mb = 0;
-    for (let i = 0; i < a.length; i++) {
-        const av = a[i]!;
-        const bv = b[i]!;
-        dot += av * bv;
-        ma += av * av;
-        mb += bv * bv;
-    }
-    const denom = Math.sqrt(ma) * Math.sqrt(mb);
-    return denom === 0 ? 0 : dot / denom;
-}
-
-// Coerce TypedArray (Float32Array, etc.) or plain array into number[].
-// fastembed's TS types claim number[][] but the runtime yields Float32Array,
-// which JSON-serializes as { "0": x, "1": y, ... } — silently breaks cosine on
-// the next reload. Always pass through this before storing or comparing.
-function toArray(v: unknown): number[] {
-    if (Array.isArray(v)) return v as number[];
-    if (ArrayBuffer.isView(v) && !(v instanceof DataView)) {
-        return Array.from(v as unknown as ArrayLike<number>);
-    }
-    // Fallback for the on-disk-cache shape from a buggy prior version
-    // (vectors stored as { "0": x, "1": y } objects with numeric-string keys).
-    if (typeof v === "object" && v !== null) {
-        const obj = v as Record<string, number>;
-        const keys = Object.keys(obj);
-        if (keys.length > 0 && keys.every((k) => /^\d+$/.test(k))) {
-            const out = new Array<number>(keys.length);
-            for (const k of keys) out[Number(k)] = obj[k]!;
-            return out;
-        }
-    }
-    return [];
-}
-
 function corpusHash(anchors: string[]): string {
     // Tiny non-cryptographic hash — only needs to detect corpus drift.
     let h = 0;
@@ -152,9 +115,28 @@ async function getRemoteEmbedding(text: string, backend: "google" | "openai"): P
     }
 }
 
+// Defense-in-depth: coerces buggy-era cache-file vectors stored as
+// {"0": x, "1": y} objects with numeric-string keys back into arrays.
+// New writes never produce that shape (shared embedder coerces upstream).
+function toArray(v: unknown): number[] {
+    if (Array.isArray(v)) return v as number[];
+    if (ArrayBuffer.isView(v) && !(v instanceof DataView)) {
+        return Array.from(v as unknown as ArrayLike<number>);
+    }
+    if (typeof v === "object" && v !== null) {
+        const obj = v as Record<string, number>;
+        const keys = Object.keys(obj);
+        if (keys.length > 0 && keys.every((k) => /^\d+$/.test(k))) {
+            const out = new Array<number>(keys.length);
+            for (const k of keys) out[Number(k)] = obj[k]!;
+            return out;
+        }
+    }
+    return [];
+}
+
 class GuardrailEmbedder {
     private backend: Backend;
-    private localModel: FlagEmbedding | null = null;
     private corpusVectors: number[][] = [];
     private corpusReady = false;
     private initPromise: Promise<void> | null = null;
@@ -207,14 +189,10 @@ class GuardrailEmbedder {
 
         // Cache miss — embed the corpus now.
         console.log(`[guardrails] embedding ${corpus.anchors.length} anchors with backend=${this.backend}...`);
-        const vectors: number[][] = [];
+        let vectors: number[][] = [];
         if (this.backend === "local") {
-            await this.ensureLocalModel();
-            const gen = this.localModel!.embed(corpus.anchors, 16);
-            // fastembed yields Float32Array (not number[] as types claim) — coerce
-            // to plain arrays so JSON.stringify produces real arrays, not objects
-            // with numeric-string keys (would silently break cosineSim on reload).
-            for await (const batch of gen) for (const v of batch) vectors.push(toArray(v));
+            // Shared embedder; coerces TypedArray→number[] internally.
+            vectors = await embedBatch(corpus.anchors, 16);
         } else {
             for (const a of corpus.anchors) {
                 const v = await getRemoteEmbedding(a, this.backend);
@@ -243,29 +221,13 @@ class GuardrailEmbedder {
         console.log(`[guardrails] corpus ready (${vectors.length} vectors, dim=${dim})`);
     }
 
-    private async ensureLocalModel(): Promise<void> {
-        if (this.localModel) return;
-        const cacheDir = botSubdir(".fastembed_cache");
-        ensureDir(cacheDir);
-        this.localModel = await FlagEmbedding.init({
-            model: EmbeddingModel.BGESmallENV15,
-            cacheDir,
-            showDownloadProgress: true,
-        });
-    }
-
     // FAIL-LOUD: throws on any embedding failure. The caller MUST NOT swallow
     // — a failed embedding means the next user prompt cannot be checked.
     async queryEmbed(text: string): Promise<number[]> {
         await this.ensureReady();
         if (this.backend === "local") {
-            await this.ensureLocalModel();
-            const v = await this.localModel!.queryEmbed(text);
-            const arr = toArray(v);
-            if (arr.length === 0) {
-                throw new Error(`[guardrails] FATAL: local queryEmbed returned empty vector for input of length ${text.length}.`);
-            }
-            return arr;
+            // Shared embedder throws on empty vectors itself.
+            return embedQuery(text);
         }
         const v = await getRemoteEmbedding(text, this.backend);
         if (!v || v.length === 0) {
