@@ -16,6 +16,11 @@ import { getDispatcher } from "./transport/dispatcher.js";
 import { CliAdapter } from "./transport/cli.js";
 import { TelegramAdapter } from "./transport/telegram.js";
 import { ensureInitPasscode, isPasscodeConsumed } from "./core/passcode.js";
+import { randomBytes } from "node:crypto";
+import { getA2AAdapter } from "./a2a/adapter.js";
+import { setA2AServerHandle, startA2AServer, type A2AServerHandle } from "./a2a/server.js";
+import { TunnelManager, type TunnelMode } from "./a2a/tunnel.js";
+import { broadcastAddressUpdate } from "./a2a/broadcaster.js";
 
 // .env carries non-secret runtime config only (BOT_NAME, PRIMARY_PROVIDER,
 // REQUIRE_2FA, GUARDRAIL_EMBEDDINGS). Secrets live in the vault.
@@ -102,6 +107,10 @@ async function bootstrap() {
     // TELEGRAM_BOT_TOKEN in vault, surfaces a "needs token" status. Use
     // /connect-telegram <token> from a session to provision it.
     dispatcher.register(new TelegramAdapter());
+    // A2A adapter — peer-to-peer agent communication. Server lifecycle is
+    // separate (startA2A below); this just registers the routing target so
+    // dispatcher.send("a2a", ...) reaches us.
+    dispatcher.register(getA2AAdapter());
     const startResult = await dispatcher.startAll();
     if (startResult.failed.length > 0) {
         for (const f of startResult.failed) {
@@ -112,6 +121,13 @@ async function bootstrap() {
     console.log(`✅ Platform Ready. Bot Name: [${botName}]`);
     console.log(`📂 Data Storage: ${storagePath}`);
     console.log(`📡 Transport: ${startResult.started.length} adapter${startResult.started.length === 1 ? "" : "s"} registered (${startResult.started.join(", ") || "none"})`);
+
+    // A2A subsystem — peer-to-peer agent communication. Non-fatal: any failure
+    // here logs loudly but never kills the rest of the bot. /a2a status from
+    // chat reports the diagnosed state.
+    await startA2A(botName).catch((e: unknown) => {
+        console.error(`⚠️  A2A subsystem failed to start: ${e instanceof Error ? e.message : String(e)}`);
+    });
 
     // Init passcode — one-time chat-based admin claim. Only generated on fresh
     // installs (see passcode.ts for semantics). Printed ONCE to the terminal
@@ -223,6 +239,136 @@ async function bootstrap() {
 
     // This takes over the terminal and starts the Pi UI!
     await mode.run();
+}
+
+// =============================================================================
+// A2A bootstrap — wired non-fatally from bootstrap(). Runs the tunnel manager
+// (cloudflared / external / disabled), starts the HTTP server on an
+// auto-allocated port, registers the singleton handle, and subscribes to
+// tunnel URL changes to fire the address-update broadcaster.
+// =============================================================================
+
+async function startA2A(botName: string): Promise<void> {
+    const vault = getVault();
+    const mode = ((vault.get("A2A_TUNNEL_MODE") ?? "cloudflared") as TunnelMode);
+    if (mode === "disabled") {
+        console.log("🛰  A2A: disabled via vault A2A_TUNNEL_MODE=disabled");
+        return;
+    }
+
+    const externalUrl = vault.get("A2A_BASE_URL");
+    if (mode === "external" && !externalUrl) {
+        console.warn("🛰  A2A: mode=external but A2A_BASE_URL not set in vault — server will start without a public URL");
+    }
+
+    // OUR API key — what every peer must present when calling us. Generated
+    // on first boot, never rotated automatically.
+    let apiKey = vault.get("A2A_API_KEY");
+    if (!apiKey) {
+        apiKey = randomBytes(32).toString("hex");
+        vault.set("A2A_API_KEY", apiKey);
+        console.log("🛰  A2A: generated new A2A_API_KEY (stored in vault)");
+    }
+
+    const preferredPort = parseInt(vault.get("A2A_BIND_PORT") ?? "8085", 10) || 8085;
+    const bindHost = vault.get("A2A_BIND_HOST") ?? "127.0.0.1";
+
+    // Optional operator overrides for the agent card.
+    const description = vault.get("A2A_DESCRIPTION") ?? `${botName} — ori2 agent`;
+    const additionalSkillsJson = vault.get("A2A_SKILLS_JSON");
+    let additionalSkills: Array<{ id: string; name: string; description: string; tags: string[] }> | undefined;
+    if (additionalSkillsJson) {
+        try {
+            const raw = JSON.parse(additionalSkillsJson) as Array<{
+                id?: unknown; name?: unknown; description?: unknown; tags?: unknown;
+            }>;
+            additionalSkills = raw
+                .filter((s) => typeof s.id === "string" && typeof s.name === "string" && typeof s.description === "string")
+                .map((s) => ({
+                    id: s.id as string,
+                    name: s.name as string,
+                    description: s.description as string,
+                    tags: Array.isArray(s.tags) ? (s.tags as unknown[]).filter((t): t is string => typeof t === "string") : [],
+                }));
+        }
+        catch (e) { console.warn(`🛰  A2A: A2A_SKILLS_JSON invalid: ${e instanceof Error ? e.message : String(e)}`); }
+    }
+
+    // Phase 1: server starts FIRST so the bound port is known. Then we kick
+    // the tunnel which forwards to that port. Card initially has whatever
+    // baseUrl we know now (operator-supplied or empty); we refreshAgentCard
+    // once the tunnel discovers the real URL.
+    let initialBaseUrl = externalUrl ?? "";
+
+    let handle: A2AServerHandle;
+    try {
+        handle = await startA2AServer({
+            botName,
+            agentId: vault.get("A2A_AGENT_ID") ?? `ori2-${botName.toLowerCase()}`,
+            description,
+            baseUrl: initialBaseUrl,
+            apiKey,
+            host: bindHost,
+            preferredPort,
+            ...(vault.get("A2A_PROVIDER_NAME") !== undefined ? { providerName: vault.get("A2A_PROVIDER_NAME")! } : {}),
+            ...(vault.get("A2A_PROVIDER_URL") !== undefined ? { providerUrl: vault.get("A2A_PROVIDER_URL")! } : {}),
+            ...(additionalSkills !== undefined ? { additionalSkills } : {}),
+        });
+    } catch (e) {
+        getA2AAdapter().markError(e instanceof Error ? e.message : String(e));
+        throw e;
+    }
+    setA2AServerHandle(handle);
+    // Persist the actually-bound port so the next boot prefers it (sticky).
+    vault.set("A2A_BIND_PORT", String(handle.boundPort));
+    console.log(`🛰  A2A: server bound on ${bindHost}:${handle.boundPort}`);
+
+    // Tunnel.
+    const tunnel = new TunnelManager({
+        mode,
+        localPort: handle.boundPort,
+        ...(externalUrl !== undefined ? { externalUrl } : {}),
+    });
+    tunnel.on("url-ready", (url: string) => {
+        vault.set("A2A_BASE_URL", url);
+        handle.refreshAgentCard({ baseUrl: url });
+        getA2AAdapter().markRunning(handle.boundPort, url);
+        initialBaseUrl = url;
+        console.log(`🛰  A2A: tunnel URL ready → ${url}`);
+        // First broadcast — friends learn our URL.
+        void broadcastAddressUpdate({ senderName: botName, newBaseUrl: url }).then((report) => {
+            if (report.succeeded.length || report.failed.length) {
+                console.log(
+                    `🛰  A2A: address broadcast: ${report.succeeded.length} ok, ${report.failed.length} failed, ${report.skippedNoKey.length} no-key`,
+                );
+            }
+        });
+    });
+    tunnel.on("url-changed", (url: string) => {
+        vault.set("A2A_BASE_URL", url);
+        handle.refreshAgentCard({ baseUrl: url });
+        getA2AAdapter().markRunning(handle.boundPort, url);
+        console.log(`🛰  A2A: tunnel URL changed → ${url}`);
+        void broadcastAddressUpdate({ senderName: botName, newBaseUrl: url });
+    });
+    tunnel.on("error", (e: Error) => {
+        console.warn(`🛰  A2A tunnel: ${e.message}`);
+    });
+
+    // Process shutdown — stop the tunnel and the server before the dispatcher.
+    const stopA2A = async () => {
+        try { await tunnel.stop(); } catch { /* ignore */ }
+        try { await handle.stop(); } catch { /* ignore */ }
+        setA2AServerHandle(null);
+    };
+    process.once("SIGINT", () => { void stopA2A(); });
+    process.once("SIGTERM", () => { void stopA2A(); });
+    process.once("SIGHUP", () => { void stopA2A(); });
+
+    // Kick the tunnel — don't await indefinitely. start() resolves when the
+    // first URL is detected (or the timeout fires); url-ready handler does
+    // the rest.
+    void tunnel.start();
 }
 
 bootstrap().catch(console.error);

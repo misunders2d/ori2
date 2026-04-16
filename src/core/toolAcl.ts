@@ -92,6 +92,16 @@ const DEFAULTS: Record<string, string[]> = {
     memory_save: ["user"],
     memory_search: ["user"],
     memory_reset: ["admin"],
+    // A2A tools — gateable per-tool. `user` for read-only / safe operations,
+    // `admin` (default fallback) for state-changing / call-out operations.
+    list_friends: ["user"],
+    call_friend: ["user"],
+    cancel_friend_task: ["user"],
+    get_agent_identity: ["user"],
+    list_friend_dna_features: ["user"],
+    // Admin-gated A2A tools fall to the FALLBACK_DEFAULT (["admin"]) so we
+    // don't enumerate them here — add_friend, accept_invitation, call_agent,
+    // update_friend_address, update_friend_key, broadcast_address_update.
     // Sprint 9 evolution surface
     evolve_extension: ["admin"],
     evolve_skill: ["admin"],

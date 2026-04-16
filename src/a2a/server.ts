@@ -368,3 +368,21 @@ export function generateInviteId(): string {
 
 /** Re-export the adapter for tests + callers that need to wire the dispatcher. */
 export { type A2AAdapter };
+
+// =============================================================================
+// Singleton handle access — extensions like .pi/extensions/a2a.ts need to
+// reach the running server (to register pending invitations, refresh the card
+// after a manual key rotation, etc.). src/index.ts is the only place that
+// SHOULD call setA2AServerHandle, immediately after startA2AServer resolves.
+// =============================================================================
+
+let _handle: A2AServerHandle | null = null;
+
+export function setA2AServerHandle(h: A2AServerHandle | null): void {
+    _handle = h;
+}
+
+/** Returns the running A2A server handle, or null if A2A is disabled / boot failed. */
+export function getA2AServerHandle(): A2AServerHandle | null {
+    return _handle;
+}
