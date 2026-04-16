@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Environment Variables & Secrets (CRITICAL)
+.env
+.env.local
+.env.*
+*.pem
+*.key
+
+# Agent Memory, State, and Databases (CRITICAL)
+data/
+*.sqlite
+*.sqlite-journal
+.instance.lock
+
+# Build outputs
+dist/
+build/
+*.tsbuildinfo
+
+# OS Files
+.DS_Store
+Thumbs.db
