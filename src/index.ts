@@ -21,6 +21,20 @@ import { ensureInitPasscode, isPasscodeConsumed } from "./core/passcode.js";
 // REQUIRE_2FA, GUARDRAIL_EMBEDDINGS). Secrets live in the vault.
 dotenv.config();
 
+// Daemon mode detection — production VPS deploys run with no TTY (systemd /
+// launchd / docker / detached SSH session). InteractiveMode requires a TTY
+// to render its TUI. We detect either:
+//   - Explicit ORI2_DAEMON=true|false env override (always wins)
+//   - Otherwise: process.stdout.isTTY → interactive, else → daemon
+// In daemon mode, the bot loads extensions and adapters as usual, then
+// blocks on signals. Inbound from network adapters drives the agent.
+function isDaemonMode(): boolean {
+    const explicit = (process.env["ORI2_DAEMON"] ?? "").toLowerCase();
+    if (explicit === "true" || explicit === "1") return true;
+    if (explicit === "false" || explicit === "0") return false;
+    return !process.stdout.isTTY;
+}
+
 // Keys the vault is authoritative for. After vault load these are pushed into
 // process.env so any code path that still reads them by name (Pi's auth flow,
 // 3rd-party SDKs, our extensions) finds them. Vault is the source of truth;
@@ -109,22 +123,55 @@ async function bootstrap() {
 
     console.log(`🔐 Vault Entries: ${getVault().list().length} (keys-only enumeration; values not logged)`);
 
-    // Graceful shutdown — stop adapters before exit.
-    const shutdown = async () => {
-        await dispatcher.stopAll();
-    };
-    process.on("SIGINT", () => { void shutdown(); });
-    process.on("SIGTERM", () => { void shutdown(); });
-
     // Guardrails: defaults to local fastembed (no API key required). The
     // .pi/extensions/guardrails.ts extension does the actual embed/check.
     // First boot will download the BGE-small ONNX model (~130MB) into
     // data/<BOT_NAME>/.fastembed_cache/ — first user message may be delayed.
     // Set GUARDRAIL_EMBEDDINGS=google|openai in env to use a remote backend instead.
 
+    const projectRoot = process.cwd();
+    const daemon = isDaemonMode();
+
+    if (daemon) {
+        console.log(`👤 Daemon mode (no TTY, or ORI2_DAEMON=true). Network adapters drive the agent.\n`);
+
+        // In daemon mode we skip InteractiveMode (no TUI to render) and
+        // create a single AgentSession directly. Extensions load as usual
+        // (this is what gives us tool registration, hooks, etc.). Inbound
+        // chat messages from registered adapters trigger the agent via
+        // pi.sendUserMessage from transport_bridge.
+        const services = await createAgentSessionServices({ cwd: projectRoot });
+        await createAgentSessionFromServices({
+            services,
+            sessionManager: SessionManager.create(storagePath),
+        });
+        console.log(`✅ Daemon ready. PID=${process.pid}. SIGTERM/SIGINT to stop.`);
+
+        // Block forever — adapters' polling timers and node-schedule cron
+        // jobs keep the event loop busy. We also need to handle the shutdown
+        // flow cleanly so adapters stop polling before exit.
+        await new Promise<void>((resolve) => {
+            const stop = async () => {
+                console.log("\n[daemon] shutdown signal received");
+                await dispatcher.stopAll();
+                resolve();
+            };
+            process.once("SIGINT", () => { void stop(); });
+            process.once("SIGTERM", () => { void stop(); });
+            process.once("SIGHUP", () => { void stop(); });
+        });
+        console.log("[daemon] exited cleanly");
+        return;
+    }
+
+    // Graceful shutdown for interactive mode.
+    const shutdown = async () => { await dispatcher.stopAll(); };
+    process.on("SIGINT", () => { void shutdown(); });
+    process.on("SIGTERM", () => { void shutdown(); });
+
     console.log("Launching Platform Control Agent...\n");
 
-    // 3. Launching the interactive agent session (The "Control Agent")
+    // 3. Interactive agent session (The "Control Agent")
     //
     // cwd = project root (process.cwd()) so Pi auto-discovers our
     // .pi/extensions/, .pi/skills/, .pi/prompts/ from the codebase. The agent's
@@ -136,7 +183,6 @@ async function bootstrap() {
     // data/<BOT_NAME>/. All other per-bot runtime data (vault, memory,
     // active-plans, etc.) is also written under data/<BOT_NAME>/ via the
     // botDir() helper in src/core/paths.ts.
-    const projectRoot = process.cwd();
     const createRuntime: CreateAgentSessionRuntimeFactory = async ({ sessionManager, sessionStartEvent }) => {
         const services = await createAgentSessionServices({ cwd: projectRoot });
         return {

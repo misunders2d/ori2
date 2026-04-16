@@ -76,6 +76,15 @@ const DEFAULTS: Record<string, string[]> = {
     web_fetch: ["user"],
     memory_save: ["user"],
     memory_search: ["user"],
+    // Sprint 9 evolution surface
+    evolve_extension: ["admin"],
+    evolve_skill: ["admin"],
+    evolve_list: ["user"],
+    // Sprint 9 audit
+    oauth_get_access_token: ["admin"],
+    credentials_get_auth_header: ["admin"],
+    // Sprint 8 scheduler addition
+    trigger_scheduled_task_now: ["admin"],
 };
 
 const FALLBACK_DEFAULT: string[] = ["admin"];
