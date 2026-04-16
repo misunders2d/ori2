@@ -18,8 +18,9 @@ The bootstrap will:
 1. Verify Node ≥ 18, git, npm
 2. Clone the repo (or pull if present)
 3. Run `npm install`
-4. Launch the first-run wizard (asks for bot name, optional admin IDs, primary AI provider key)
-5. Optionally install a systemd user unit for headless deployment
+4. Run `npm test` — halts the install if any baseline test fails. To override (NOT recommended), `export ORI2_SKIP_TESTS=1` before re-running.
+5. Launch the first-run wizard (asks for bot name, optional admin IDs, primary AI provider key)
+6. Optionally install a systemd user unit (Linux) or launchd LaunchAgent (macOS) for headless deployment
 
 ## Manual install
 

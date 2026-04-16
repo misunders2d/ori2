@@ -90,6 +90,22 @@ fi
 step "Installing npm dependencies"
 npm install --no-fund --no-audit
 
+# Run the test suite before any first-run setup so a broken baseline never
+# reaches the wizard or systemd unit. Halt loudly on failure — never silently
+# proceed to register a service unit pointing at code that fails its own
+# regression suite.
+step "Running baseline test suite"
+if ! npm test --silent; then
+    echo
+    echo "❌ Baseline tests failed. Aborting bootstrap."
+    echo "   Inspect the failures above. Re-run the bootstrap once they are green."
+    echo "   To skip (NOT recommended; bypasses the safety net): export ORI2_SKIP_TESTS=1"
+    if [[ "${ORI2_SKIP_TESTS:-0}" != "1" ]]; then
+        exit 1
+    fi
+    echo "   ORI2_SKIP_TESTS=1 set — proceeding despite failures (you've been warned)."
+fi
+
 step "First-run setup"
 if [[ -f ".env" ]] && [[ -f "data/${BOT_NAME:-Test_bot}/vault.json" ]]; then
     echo "Already configured (vault + .env present). Skipping wizard."

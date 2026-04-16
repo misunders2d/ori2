@@ -1,0 +1,64 @@
+# ori2 CI — runs on push + PR to master.
+#
+# This is the upstream guard for the multi-VPS divergent-fork model: every
+# department's bot is built from this baseline, so a regression here ripples
+# to N forks. Don't merge red.
+#
+# Matrix: Node 20, 22, 24. Pi SDK requires Node ≥ 18 but we exercise the
+# realistic deployment range.
+#
+# Security note: this workflow takes no untrusted input from PR/issue bodies
+# or commit messages, so the standard injection vectors don't apply. If you
+# add a step that does (e.g. echoing a PR title), bind it through env: and
+# quote — see https://github.blog/security/vulnerability-research/how-to-catch-github-actions-workflow-injections-before-attackers-do/
+
+name: test
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["20", "22", "24"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install
+        run: npm ci --no-fund --no-audit
+
+      # AgentFactory.ts has a documented pre-existing carryover error (the Pi
+      # SDK type shifted under it). Block on any OTHER type error. When that
+      # file is deleted or fixed, simplify this to `npx tsc --noEmit`.
+      - name: Type-check (allow AgentFactory carryover)
+        shell: bash
+        run: |
+          set -o pipefail
+          out=$(npx tsc --noEmit 2>&1 || true)
+          echo "$out"
+          new_errors=$(echo "$out" | grep "error TS" | grep -v "AgentFactory.ts" || true)
+          if [ -n "$new_errors" ]; then
+            echo "::error::tsc reported errors outside the known AgentFactory carryover"
+            exit 1
+          fi
+
+      - name: Run tests
+        run: npm test
