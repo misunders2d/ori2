@@ -45,20 +45,8 @@ jobs:
       - name: Install
         run: npm ci --no-fund --no-audit
 
-      # AgentFactory.ts has a documented pre-existing carryover error (the Pi
-      # SDK type shifted under it). Block on any OTHER type error. When that
-      # file is deleted or fixed, simplify this to `npx tsc --noEmit`.
-      - name: Type-check (allow AgentFactory carryover)
-        shell: bash
-        run: |
-          set -o pipefail
-          out=$(npx tsc --noEmit 2>&1 || true)
-          echo "$out"
-          new_errors=$(echo "$out" | grep "error TS" | grep -v "AgentFactory.ts" || true)
-          if [ -n "$new_errors" ]; then
-            echo "::error::tsc reported errors outside the known AgentFactory carryover"
-            exit 1
-          fi
+      - name: Type-check
+        run: npx tsc --noEmit
 
       - name: Run tests
         run: npm test

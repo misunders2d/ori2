@@ -91,6 +91,7 @@ const DEFAULTS: Record<string, string[]> = {
     web_fetch: ["user"],
     memory_save: ["user"],
     memory_search: ["user"],
+    memory_reset: ["admin"],
     // Sprint 9 evolution surface
     evolve_extension: ["admin"],
     evolve_skill: ["admin"],

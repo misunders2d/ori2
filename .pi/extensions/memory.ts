@@ -182,6 +182,34 @@ export default function (pi: ExtensionAPI) {
     });
 
     pi.registerTool({
+        name: "memory_reset",
+        label: "Reset Memory (wipe all)",
+        description:
+            "Wipe ALL long-term memories. Admin-only and irreversible — there is no undo. " +
+            "Use sparingly: when the user explicitly says 'forget everything', when starting " +
+            "a fresh deployment, or when memory has been polluted with bad data. The agent " +
+            "should ALWAYS confirm with the user before invoking this. Returns the number of " +
+            "records deleted. Requires the boolean parameter `confirm: true` to actually run; " +
+            "any other value is a no-op so the agent can't fire it accidentally.",
+        parameters: Type.Object({
+            confirm: Type.Boolean({ description: "Must be literally true to proceed. Any other value is a no-op." }),
+        }),
+        async execute(_id, params) {
+            if (params.confirm !== true) {
+                return {
+                    content: [{ type: "text", text: "memory_reset NOT executed: pass `confirm: true` to wipe." }],
+                    details: { reset: false, deleted: 0 },
+                };
+            }
+            const n = memory.clear();
+            return {
+                content: [{ type: "text", text: `Wiped ${n} memor${n === 1 ? "y" : "ies"}. Long-term memory is now empty.` }],
+                details: { reset: true, deleted: n },
+            };
+        },
+    });
+
+    pi.registerTool({
         name: "memory_list_tags",
         label: "List Memory Tags",
         description: "List all distinct tags in the memory store with counts. Use to discover what tags exist before a tag-filtered search.",
@@ -259,12 +287,13 @@ function doHelp(ctx: ExtensionContext): void {
         "    verbatim. Use the vault or /credentials for those.",
         "",
         "WHAT THE LLM CAN DO",
-        "  Five tools, all role-gated via /tool-acl:",
+        "  Six tools, all role-gated via /tool-acl:",
         "    memory_save       — save a fact            (default: user)",
         "    memory_search     — semantic search         (default: user)",
         "    memory_get        — fetch by id             (default: user)",
         "    memory_list_tags  — enumerate tags          (default: user)",
         "    memory_delete     — delete by id            (default: admin)",
+        "    memory_reset      — wipe ALL memory         (default: admin, requires confirm:true)",
         "  The persona prompt should encourage the agent to search BEFORE",
         "  asking questions whose answers might already be remembered.",
         "",

@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import { strict as assert } from "node:assert";
-import { evaluate, globMatch, type EvaluatorContext, type PolicyEntry } from "./policy.ts";
+import { evaluate, globMatch, type EvaluatorContext, type PolicyEntry } from "./policy.js";
 
 // Tiny helpers so each test reads as one assertion.
 const ctx = (overrides: Partial<EvaluatorContext> = {}): EvaluatorContext => ({
