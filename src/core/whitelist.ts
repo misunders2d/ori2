@@ -188,6 +188,12 @@ export class Whitelist {
     // ------------- queries -------------
 
     isAdmin(platform: string, senderId: string): boolean {
+        // CLI is implicitly admin — the terminal operator owns the process,
+        // the vault, the data dir, and can `vim` any file the bot reads.
+        // Gating CLI tool calls would be security theater that creates
+        // confusing failure modes (CLI can chat with bot but can't run bash).
+        // Treat the operator as the trust root they actually are.
+        if (platform === "cli") return true;
         this.load();
         // 1. Bootstrap admins from vault — always honored.
         const admins = this.vaultAdmins();

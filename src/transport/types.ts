@@ -142,7 +142,31 @@ export interface AdapterStatus {
     details?: Record<string, string | number | boolean>;
 }
 
-/** Contract every transport adapter implements. */
+/**
+ * Contract every transport adapter implements.
+ *
+ * SECURITY MODEL — read this before writing a new adapter:
+ *
+ *   - `platform` MUST be a hardcoded class constant (or constructor-set
+ *     constant). It MUST NOT be derived from any user-controlled input.
+ *     The dispatcher verifies on every dispatch that `msg.platform`
+ *     matches `adapter.platform` and refuses mismatches.
+ *
+ *   - `platform === "cli"` is RESERVED for the bundled CliAdapter. The
+ *     dispatcher rejects registrations with that platform name from any
+ *     other adapter. (CLI is implicit-admin; no network adapter should
+ *     inherit that status.)
+ *
+ *   - ALL inbound traffic MUST flow through `dispatcher.dispatch()` (which
+ *     adapters trigger via the handler installed by `setHandler`). Pushing
+ *     directly into the Pi session via `pi.sendUserMessage(...)` from an
+ *     extension BYPASSES the entire whitelist + ACL gate AND falls back to
+ *     the CLI implicit-admin identity. Never do this for traffic that
+ *     originated externally.
+ *
+ *   - Adapters MUST NOT honor `Message.platform` from inbound payloads —
+ *     they construct it themselves from the hardcoded constant.
+ */
 export interface TransportAdapter {
     /** Stable platform identifier — must match `Message.platform` of inbound. */
     readonly platform: string;

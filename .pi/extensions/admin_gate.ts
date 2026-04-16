@@ -74,11 +74,36 @@ export default function (pi: ExtensionAPI) {
     // ---------------- Dispatcher pre-dispatch hook ----------------
 
     dispatcher.addPreDispatchHook((msg) => {
-        // Always let CLI through — the terminal operator is trusted by the
-        // very fact that they started the process. Adding them to the
-        // whitelist via CLI would be circular; the ADMIN_USER_IDS env/vault
-        // handles the intended admin identity anyway.
-        if (msg.platform === "cli") return { block: false };
+        // Special case 1: /init <passcode> — chat-based admin claim.
+        // Handled BEFORE the whitelist gate (the caller is unauthenticated
+        // by definition) AND before pushing into Pi (the passcode must
+        // never enter the LLM's context).
+        const initMatch = msg.text.trim().match(/^\/init\s+(\S+)\s*$/i);
+        if (initMatch) {
+            const passcode = initMatch[1]!;
+            if (isPasscodeConsumed()) {
+                return { block: true, reason: "Init passcode already used. Ask an existing admin to add you via /whitelist." };
+            }
+            const ok = consumeInitPasscode(passcode);
+            if (!ok) {
+                console.log(
+                    `[admin_gate] /init failed (bad passcode) from ${msg.platform}:${msg.senderId} (${msg.senderDisplayName})`,
+                );
+                return { block: true, reason: "Invalid init passcode." };
+            }
+            whitelist.add(msg.platform, msg.senderId, {
+                roles: ["admin"],
+                ...(msg.senderDisplayName ? { displayName: msg.senderDisplayName } : {}),
+                addedBy: "init-passcode",
+            });
+            console.log(
+                `[admin_gate] /init SUCCEEDED from ${msg.platform}:${msg.senderId} (${msg.senderDisplayName}) — promoted to admin`,
+            );
+            return { block: true, reason: `✅ You are now admin (${msg.platform}:${msg.senderId}).` };
+        }
+
+        // CLI is implicit admin (Whitelist.isAdmin → isAllowed short-circuits).
+        // No explicit bypass needed here.
 
         if (whitelist.isBlacklisted(msg.platform, msg.senderId)) {
             console.log(
@@ -107,9 +132,15 @@ export default function (pi: ExtensionAPI) {
     // Pi's command router handles /whitelist, /role, /tool-acl, /staging.
 
     pi.on("input", async (event, ctx) => {
-        const text = event.text.trim();
+        // Strip transport_bridge's metadata header so user-typed "/init" or
+        // "Approve ACT-..." at the start of the actual body still matches.
+        // For terminal input (no header) this is a no-op.
+        const text = stripMetadataHeader(event.text).trim();
 
-        // /init passcode flow.
+        // /init for the CLI operator: dispatcher pre-hook only sees inbound
+        // through registered adapters, and InteractiveMode bypasses that.
+        // Keep a terminal-only /init handler here so the operator can run
+        // /init at the TUI just like a chat user would.
         const initMatch = text.match(/^\s*\/init\s+(\S+)\s*$/i);
         if (initMatch) {
             const passcode = initMatch[1]!;
@@ -500,6 +531,18 @@ export default function (pi: ExtensionAPI) {
 }
 
 // -------------- helpers --------------
+
+/**
+ * transport_bridge prepends inbound chat messages with a metadata header:
+ *   `[Inbound | platform: ... | from: ... | ...]\n\n<actual body>`
+ * Strip it so admin_gate's input handlers can match user-typed prefixes
+ * (/init, Approve ACT-...) at the body's start. CLI input has no header,
+ * so this is a no-op for terminal users.
+ */
+function stripMetadataHeader(text: string): string {
+    const m = text.match(/^\[Inbound \|[^\]]*\]\s*\n\n([\s\S]*)$/);
+    return m ? m[1]! : text;
+}
 
 /** Synthesise an InboundOrigin for the CLI operator. Used when no chat origin is persisted. */
 function inferOriginFromCli(_ctx: unknown): InboundOrigin | null {

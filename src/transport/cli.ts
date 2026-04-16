@@ -32,6 +32,12 @@ export const CLI_DEFAULT_CHANNEL = "cli:default";
 
 export class CliAdapter implements TransportAdapter {
     readonly platform = CLI_PLATFORM;
+    /**
+     * Sentinel checked by the dispatcher to verify this is the bundled
+     * CliAdapter and not a third-party adapter trying to claim platform="cli".
+     * The dispatcher rejects platform="cli" registrations missing this marker.
+     */
+    readonly __isOriCliAdapter = true;
     private state: AdapterStatus["state"] = "stopped";
     private connectedAt?: number;
     // Handler is reserved for future: if we ever want to capture user input

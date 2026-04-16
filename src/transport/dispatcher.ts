@@ -1,5 +1,8 @@
 import type { AdapterStatus, AgentResponse, Message, TransportAdapter } from "./types.js";
 
+/** Reserved platform name — see CliAdapter for the matching sentinel. */
+export const CLI_RESERVED_NAME = "cli";
+
 // =============================================================================
 // TransportDispatcher — singleton hub between adapters and the Pi runtime.
 //
@@ -70,7 +73,36 @@ export class TransportDispatcher {
                 `[transport] adapter for platform "${adapter.platform}" already registered`,
             );
         }
-        adapter.setHandler((msg) => this.dispatch(msg));
+
+        // SECURITY: reserve "cli" for the bundled CliAdapter only. Any other
+        // adapter trying to claim platform="cli" would inherit the
+        // implicit-admin status (Whitelist.isAdmin returns true for cli)
+        // and bypass all gates. The CliAdapter constructor sets a sentinel;
+        // we check the prototype chain rather than an instanceof check (which
+        // would create a circular dep at the dispatcher).
+        if (adapter.platform === CLI_RESERVED_NAME) {
+            const looksLikeCli = (adapter as { __isOriCliAdapter?: boolean }).__isOriCliAdapter === true;
+            if (!looksLikeCli) {
+                throw new Error(
+                    `[transport] platform "${CLI_RESERVED_NAME}" is reserved for the built-in CliAdapter — refusing to register a different adapter under this name`,
+                );
+            }
+        }
+
+        // SECURITY: verify the adapter's hardcoded platform matches the
+        // platform field on every Message it dispatches. A buggy or
+        // malicious adapter could otherwise spoof the platform field
+        // (e.g. set msg.platform = "cli" while its own .platform = "telegram")
+        // to inherit implicit-admin status. Refuse such messages loudly.
+        adapter.setHandler((msg) => {
+            if (msg.platform !== adapter.platform) {
+                console.error(
+                    `[transport] SECURITY: adapter "${adapter.platform}" attempted to dispatch a message with platform="${msg.platform}" — refusing`,
+                );
+                return Promise.resolve();
+            }
+            return this.dispatch(msg);
+        });
         this.adapters.set(adapter.platform, adapter);
     }
 

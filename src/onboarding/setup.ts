@@ -64,9 +64,24 @@ export async function runOnboardingFlow(): Promise<void> {
     const botNameRaw = await rl.question("1. What would you like to name this assistant? (e.g. MarketingBot): ");
     const safeBotName = botNameRaw.trim().replace(/[^a-zA-Z0-9_-]/g, "_") || "Platform_Controller";
 
-    console.log("\n2. The assistant needs a 'Boss'. Enter your unique User ID.");
-    console.log("   (If using Slack/Telegram later, this will be your platform user ID. For now, any name works.)");
-    const adminIds = (await rl.question("   Enter Admin ID(s), comma-separated for multiple: ")).trim();
+    console.log("\n2. ADMIN identity for chat platforms");
+    console.log("");
+    console.log("   The terminal operator (you, right now) is ALWAYS admin —");
+    console.log("   you own the process and the vault, no setup needed for CLI access.");
+    console.log("");
+    console.log("   For chat platforms (Telegram/Slack/etc.), the recommended path is");
+    console.log("   to claim admin AFTER install via `/init <passcode>` from chat. The");
+    console.log("   passcode is shown ONCE in this boot's log, your chat ID is captured");
+    console.log("   automatically, and the passcode is consumed on first successful claim.");
+    console.log("");
+    console.log("   You can ALSO pre-register chat IDs here in <platform>:<id> format,");
+    console.log("   comma-separated. Examples:");
+    console.log("     telegram:123456789");
+    console.log("     telegram:123456789,slack:U0ABC123XYZ");
+    console.log("   (Telegram numeric ID: message @userinfobot. Slack: profile → More → Copy member ID.)");
+    console.log("");
+    console.log("   Press ENTER to skip — you'll claim admin via /init from chat after install.");
+    const adminIds = (await rl.question("   Pre-registered admin IDs (or ENTER to skip): ")).trim();
 
     console.log("\n3. Choose your primary AI brain. (You can add others later)");
     console.log("   [1] Google Gemini  (Recommended for embeddings)");
@@ -96,7 +111,8 @@ export async function runOnboardingFlow(): Promise<void> {
 
     // Write secrets to vault — atomic, mode 0600.
     const vault = getVault();
-    const secrets: Record<string, string> = { ADMIN_USER_IDS: adminIds };
+    const secrets: Record<string, string> = {};
+    if (adminIds) secrets["ADMIN_USER_IDS"] = adminIds;
     if (googleKey) secrets["GOOGLE_API_KEY"] = googleKey;
     if (anthropicKey) secrets["ANTHROPIC_API_KEY"] = anthropicKey;
     if (openaiKey) secrets["OPENAI_API_KEY"] = openaiKey;
