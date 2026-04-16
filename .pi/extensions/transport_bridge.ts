@@ -203,10 +203,15 @@ export default function (pi: ExtensionAPI) {
             if (status.state === "running") {
                 ctx.ui.notify(
                     `✅ Telegram bot ${username} connected.\n` +
-                    `⚠️ Stopgap whitelist active until Sprint 5: nobody can talk to the bot until you set\n` +
-                    `   TELEGRAM_ALLOWED_USERS=<your_telegram_user_id>,<other_user_ids>\n` +
-                    `   in the vault. (Use the vault tools or edit data/<bot>/vault.json directly, then /reload.)\n` +
-                    `   Send the bot a message and check the logs to see your user_id.`,
+                    `Next steps:\n` +
+                    `  1. DM the bot from your Telegram account. The message will be blocked\n` +
+                    `     and your user_id will be logged. Check the bot logs for a line:\n` +
+                    `       [admin_gate] BLOCKED unlisted inbound from telegram:<your_id> ...\n` +
+                    `  2. If you haven't claimed admin yet, run at the terminal:\n` +
+                    `       /init-status   (shows your one-time passcode if still live)\n` +
+                    `     Then DM the bot:  /init <passcode>\n` +
+                    `  3. Or, if already admin at the terminal, run:\n` +
+                    `       /whitelist add telegram <your_id> admin\n`,
                     "info",
                 );
             } else {

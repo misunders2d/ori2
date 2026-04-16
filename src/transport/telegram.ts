@@ -21,11 +21,9 @@ import type {
 //        (a) `/connect-telegram <token>` from any active session (validates +
 //            stores in vault + restarts adapter), OR
 //        (b) Direct vault edit: set TELEGRAM_BOT_TOKEN and restart bot.
-//   3. (Until Sprint 5 lands the proper whitelist) set vault entry
-//      TELEGRAM_ALLOWED_USERS=<comma-separated user_ids> to allow inbound
-//      messages. Default empty → ALL inbound is rejected. Blocked attempts
-//      are logged with the rejected user_id so the admin can see who tried
-//      and add them.
+//   3. The admin_gate extension's pre-dispatch hook enforces the whitelist
+//      on every inbound message (Sprint 5). This adapter no longer does
+//      its own allowlist — rejection happens uniformly for all adapters.
 //
 // Inbound:
 //   getUpdates long-poll loop (timeout=30s). offset persisted to
@@ -219,7 +217,6 @@ export class TelegramAdapter implements TransportAdapter {
                 offset: this.offset,
                 bot_username: this.botInfo?.username ?? "(unknown)",
                 bot_id: this.botInfo?.id ?? 0,
-                allowed_users: getVault().get("TELEGRAM_ALLOWED_USERS") || "(none — all inbound blocked)",
             },
         };
         if (this.lastError !== undefined) status.lastError = this.lastError;
@@ -262,18 +259,8 @@ export class TelegramAdapter implements TransportAdapter {
         if (!sender) return; // channel posts without a sender — ignore for now
         if (sender.is_bot) return; // ignore other bots
 
-        // Stopgap whitelist. Sprint 5 replaces with real allowlist + admin claim.
-        const allowedRaw = getVault().get("TELEGRAM_ALLOWED_USERS") ?? "";
-        const allowed = new Set(
-            allowedRaw.split(",").map((s) => s.trim()).filter(Boolean),
-        );
-        if (allowed.size === 0 || !allowed.has(String(sender.id))) {
-            console.log(
-                `[telegram] BLOCKED inbound from user_id=${sender.id} (${sender.username ?? sender.first_name}) chat=${m.chat.id} — add to TELEGRAM_ALLOWED_USERS to permit`,
-            );
-            // Don't reply — silent block to avoid spam-amplifying probes.
-            return;
-        }
+        // Whitelist is enforced by the dispatcher's pre-dispatch hook
+        // (admin_gate.ts). This adapter just normalizes and forwards.
 
         const text = m.text ?? m.caption ?? "";
         const attachments = await this.collectAttachments(token, m);

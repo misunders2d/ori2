@@ -15,6 +15,7 @@ import { getVault } from "./core/vault.js";
 import { getDispatcher } from "./transport/dispatcher.js";
 import { CliAdapter } from "./transport/cli.js";
 import { TelegramAdapter } from "./transport/telegram.js";
+import { ensureInitPasscode, isPasscodeConsumed } from "./core/passcode.js";
 
 // .env carries non-secret runtime config only (BOT_NAME, PRIMARY_PROVIDER,
 // REQUIRE_2FA, GUARDRAIL_EMBEDDINGS). Secrets live in the vault.
@@ -83,8 +84,30 @@ async function bootstrap() {
 
     console.log(`✅ Platform Ready. Bot Name: [${botName}]`);
     console.log(`📂 Data Storage: ${storagePath}`);
-    console.log(`🔐 Vault Entries: ${getVault().list().length} (keys-only enumeration; values not logged)`);
     console.log(`📡 Transport: ${startResult.started.length} adapter${startResult.started.length === 1 ? "" : "s"} registered (${startResult.started.join(", ") || "none"})`);
+
+    // Init passcode — one-time chat-based admin claim. Only generated on fresh
+    // installs (see passcode.ts for semantics). Printed ONCE to the terminal
+    // so the operator sees it. If missed, /init-status from the terminal
+    // re-displays it until consumed.
+    if (!isPasscodeConsumed()) {
+        const passcode = ensureInitPasscode();
+        if (passcode) {
+            console.log("");
+            console.log("=================================================================");
+            console.log("🔑 Admin claim passcode (ONE-TIME, save it if using remotely):");
+            console.log(`   ${passcode}`);
+            console.log("");
+            console.log("   From any configured chat platform (Telegram/Slack/…) send:");
+            console.log(`     /init ${passcode}`);
+            console.log("   to promote yourself to admin. The passcode is consumed on first");
+            console.log("   successful claim. Run /init-status at the terminal to re-display.");
+            console.log("=================================================================");
+            console.log("");
+        }
+    }
+
+    console.log(`🔐 Vault Entries: ${getVault().list().length} (keys-only enumeration; values not logged)`);
 
     // Graceful shutdown — stop adapters before exit.
     const shutdown = async () => {
