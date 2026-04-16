@@ -285,9 +285,9 @@ export default function (pi: ExtensionAPI) {
      * Emits `plan:report` on the Pi event bus AND writes the report to disk
      * as a hard fallback so nothing is lost even if no transport is wired.
      *
-     * FUTURE WIRING — the inbound chat bridge (Slack / Telegram / etc., to
-     * be implemented in src/communication/bus.ts and a per-platform adapter)
-     * MUST do the following on receiving a `plan:report` event:
+     * FUTURE WIRING — the inbound chat bridge (Slack / Telegram / etc.,
+     * implemented as adapters under `src/transport/` registering with the
+     * dispatcher) MUST do the following on receiving a `plan:report` event:
      *
      *   1. If `report.originChannel` is set and the channel still exists:
      *        - Format the plan summary (title, mode, per-step results,
@@ -664,9 +664,9 @@ export default function (pi: ExtensionAPI) {
     /**
      * PLACEHOLDER — Admin Override Option C: reply-in-channel admin override.
      *
-     * The inbound chat bridge (Slack / Telegram / etc., to be implemented in
-     * src/communication/bus.ts and per-platform adapters) MUST emit
-     * `plan:admin-action` events on `pi.events` with this shape:
+     * The inbound chat bridge (Slack / Telegram / etc., implemented as
+     * adapters under `src/transport/` and routed via the dispatcher) MUST
+     * emit `plan:admin-action` events on `pi.events` with this shape:
      *
      *     {
      *       sessionId: string,   // target plan's session id
@@ -713,8 +713,8 @@ export default function (pi: ExtensionAPI) {
     /**
      * PLACEHOLDER — Admin Override Option A: Synapse A2A admin command.
      *
-     * Once .pi/extensions/synapse_a2a.ts is fully wired and src/communication/bus.ts
-     * is listening for inbound Synapse traffic, an admin from any agent on the
+     * Once `synapse_a2a.ts` is rewritten as a proper TransportAdapter (Sprint 9)
+     * and inbound Synapse traffic flows through the dispatcher, an admin from any agent on the
      * Synapse network can run:
      *     synapse send <bot> "/plan-abort <sessionId> <reason>"
      *

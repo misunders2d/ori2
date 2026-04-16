@@ -1,12 +1,13 @@
 import { AuthStorage, ModelRegistry, SessionManager, createAgentSession } from "@mariozechner/pi-coding-agent";
-import { CommunicationBus } from "../communication/bus.js";
 
+// STUB — placeholder for in-process sub-agent spawning (Sprint 4/9 work).
+// Currently never instantiated. The pre-existing `runtime` type error below
+// is intentional carryover; the spawn shape will change when this is wired up.
 export class AgentFactory {
     constructor(
         private sessionManager: SessionManager,
         private authStorage: AuthStorage,
         private modelRegistry: ModelRegistry,
-        private commsBus: CommunicationBus
     ) {}
 
     /**

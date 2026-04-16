@@ -9,10 +9,11 @@ import {
 } from "@mariozechner/pi-coding-agent";
 import dotenv from "dotenv";
 import { runOnboardingFlow, isSystemConfigured } from "./onboarding/setup.js";
-import { CommunicationBus } from "./communication/bus.js";
 import { acquireInstanceLock } from "./core/instanceLock.js";
 import { botDir, ensureDir, getBotName } from "./core/paths.js";
 import { getVault } from "./core/vault.js";
+import { getDispatcher } from "./transport/dispatcher.js";
+import { CliAdapter } from "./transport/cli.js";
 
 // .env carries non-secret runtime config only (BOT_NAME, PRIMARY_PROVIDER,
 // REQUIRE_2FA, GUARDRAIL_EMBEDDINGS). Secrets live in the vault.
@@ -63,12 +64,29 @@ async function bootstrap() {
     // sessions/vault/memory.
     acquireInstanceLock(storagePath, botName);
 
-    const commsBus = new CommunicationBus();
-    await commsBus.initialize();
+    // Transport dispatcher — singleton hub between adapters and Pi runtime.
+    // CLI adapter is the only built-in baseline adapter; Telegram (Sprint 4),
+    // Slack (future), and Synapse-A2A (Sprint 9) register the same way.
+    const dispatcher = getDispatcher();
+    dispatcher.register(new CliAdapter());
+    const startResult = await dispatcher.startAll();
+    if (startResult.failed.length > 0) {
+        for (const f of startResult.failed) {
+            console.error(`❌ Transport adapter [${f.platform}] failed to start: ${f.error}`);
+        }
+    }
 
     console.log(`✅ Platform Ready. Bot Name: [${botName}]`);
     console.log(`📂 Data Storage: ${storagePath}`);
     console.log(`🔐 Vault Entries: ${getVault().list().length} (keys-only enumeration; values not logged)`);
+    console.log(`📡 Transport: ${startResult.started.length} adapter${startResult.started.length === 1 ? "" : "s"} registered (${startResult.started.join(", ") || "none"})`);
+
+    // Graceful shutdown — stop adapters before exit.
+    const shutdown = async () => {
+        await dispatcher.stopAll();
+    };
+    process.on("SIGINT", () => { void shutdown(); });
+    process.on("SIGTERM", () => { void shutdown(); });
 
     // Guardrails: defaults to local fastembed (no API key required). The
     // .pi/extensions/guardrails.ts extension does the actual embed/check.
