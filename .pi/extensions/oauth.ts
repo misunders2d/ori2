@@ -136,21 +136,20 @@ async function runPoll(flow: PendingDeviceFlow): Promise<void> {
 export default function (pi: ExtensionAPI) {
     pi.registerCommand("oauth", {
         description:
-            "OAuth integration management. Subcommands: list | register <id> <client_id> [<client_secret>] | " +
-            "register-custom <id> <flow> <token_url> <client_id> [...] | connect <id> [scope1 scope2 ...] | " +
-            "callback <full_redirect_url> | disconnect <id> | status <id> | scopes <id>",
+            "OAuth integration management. Run /oauth help for full subcommand reference + examples.",
         handler: async (args, ctx) => {
             const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
-            const sub = (parts[0] ?? "list").toLowerCase();
+            const sub = (parts[0] ?? "help").toLowerCase();
 
-            // All mutations require admin. `list` and `status` are read-only — let any caller see them.
-            const mutating = !["list", "status", "scopes"].includes(sub);
+            // All mutations require admin. `list`, `status`, `scopes`, `help` are read-only.
+            const mutating = !["list", "status", "scopes", "help"].includes(sub);
             if (mutating && !isAdminCaller(ctx)) {
                 ctx.ui.notify("Only admins can run /oauth " + sub + ".", "error");
                 return;
             }
 
             switch (sub) {
+                case "help":      return doHelp(ctx);
                 case "list":      return doList(ctx);
                 case "register":  return doRegister(ctx, parts);
                 case "register-custom": return doRegisterCustom(ctx, parts);
@@ -160,7 +159,7 @@ export default function (pi: ExtensionAPI) {
                 case "status":    return doStatus(ctx, parts);
                 case "scopes":    return doScopes(ctx, parts);
                 default:
-                    ctx.ui.notify(`Unknown /oauth subcommand: ${sub}. Try /oauth list.`, "error");
+                    ctx.ui.notify(`Unknown /oauth subcommand: ${sub}. Run /oauth help.`, "error");
             }
         },
     });
@@ -194,6 +193,127 @@ export default function (pi: ExtensionAPI) {
 }
 
 // ---------- subcommand handlers ----------
+
+function doHelp(ctx: import("@mariozechner/pi-coding-agent").ExtensionContext): void {
+    const builtins = Object.keys(BUILTIN_TEMPLATES);
+    const lines = [
+        "═════════════════════════════════════════════════════════════",
+        "  OAuth integration help",
+        "═════════════════════════════════════════════════════════════",
+        "",
+        "WHAT THIS DOES",
+        "  Connects ori2 to OAuth-protected services (Google, GitHub,",
+        "  etc.) so evolved tools can call APIs on your behalf. Tokens",
+        "  are stored encrypted-at-rest-by-permission (mode 0600) under",
+        "  data/<bot>/oauth_tokens.json and auto-refreshed on use.",
+        "",
+        "DO I NEED TO CREATE AN OAUTH APP MYSELF?",
+        "  Yes for now — OAuth providers (Google/GitHub/etc.) require",
+        "  the requesting app to be registered. ori2 is open-source and",
+        "  can't ship shared client credentials.",
+        "",
+        "  Workarounds:",
+        "    • Personal Access Tokens (PATs): many services support",
+        "      simple paste-a-token auth — GitHub PATs, ClickUp tokens,",
+        "      Slack bot tokens, Notion integration tokens, Linear keys,",
+        "      Stripe keys, Mailgun/SendGrid keys. No OAuth dance needed.",
+        "      A `/credentials` slash command for managing these is",
+        "      planned for a follow-up sprint. Until then, store them",
+        "      in the vault directly: vault entries are read by tools",
+        "      via the existing getVault() API.",
+        "    • Google specifically requires a Google Cloud project. The",
+        "      project is free, one-time, and takes ~5 minutes:",
+        "        1. https://console.cloud.google.com → Create project",
+        "        2. APIs & Services → Credentials → Create Credentials",
+        "           → OAuth client ID → Desktop App",
+        "        3. Copy the client_id (and client_secret if shown).",
+        "    • GitHub: https://github.com/settings/developers → New OAuth",
+        "      App. Tick 'Enable Device Flow'. ~2 minutes.",
+        "",
+        "TWO OAUTH FLOWS SUPPORTED",
+        "",
+        "  1. DEVICE CODE flow (default, recommended for headless VPS)",
+        "     • Bot prints a code + URL.",
+        "     • You open the URL on any device (phone, laptop) and enter",
+        "       the code. No browser needed on the bot's machine.",
+        "     • Bot polls in the background until you complete consent.",
+        "     • Used automatically when the platform's `flow` is",
+        "       'device_code' (Google + GitHub built-in templates use this).",
+        "",
+        "  2. AUTHORIZATION CODE + PKCE flow (fallback)",
+        "     • Bot prints an auth URL.",
+        "     • You open it in any browser, sign in, approve.",
+        "     • You get redirected to a URL (may show 'page not found' —",
+        "       that's expected for the paste-back redirect_uri).",
+        "     • Copy the FULL redirect URL from the address bar and run",
+        "       /oauth callback <full_url>.",
+        "     • Bot extracts the code and exchanges it for tokens.",
+        "     • No callback server, no Cloudflare tunnel needed.",
+        "",
+        "BUILT-IN PLATFORM TEMPLATES",
+        `  Available: ${builtins.join(", ")}`,
+        "  Each template has the endpoint URLs + default scopes baked in,",
+        "  so you only supply credentials. For other providers, edit",
+        "  data/<BOT>/oauth_platforms.json directly (full schema in",
+        "  src/core/oauth.ts:OAuthPlatformConfig).",
+        "",
+        "QUICK START — GOOGLE GMAIL + DRIVE",
+        "  1. Create a Google Cloud OAuth Desktop App (link above), copy",
+        "     client_id + client_secret.",
+        "  2. /oauth register google <client_id> <client_secret>",
+        "  3. /oauth connect google \\",
+        "       https://www.googleapis.com/auth/gmail.send \\",
+        "       https://www.googleapis.com/auth/drive.file",
+        "  4. Bot prints: 'Visit https://www.google.com/device, code WXYZ-ABCD'.",
+        "     Open it on your phone, sign in to your Google account, approve.",
+        "  5. Bot posts confirmation in this channel when authorization completes.",
+        "  6. Future evolved tools (gmail_send, drive_upload) call",
+        "     getOAuth().getAccessToken('google') internally — auto-refresh.",
+        "",
+        "QUICK START — GITHUB",
+        "  1. Create a GitHub OAuth App at github.com/settings/developers,",
+        "     tick 'Enable Device Flow'. Copy client_id (+ secret if shown).",
+        "  2. /oauth register github <client_id> [<client_secret>]",
+        "  3. /oauth connect github repo workflow",
+        "  4. Bot prints: 'Visit https://github.com/login/device, code XXXX-XXXX'.",
+        "  5. Approve, bot posts confirmation.",
+        "",
+        "QUICK START — CUSTOM PROVIDER",
+        "  Edit data/<BOT>/oauth_platforms.json directly (a slash form is",
+        "  planned but not yet implemented). Required fields:",
+        "    id, name, flow ('device_code' or 'auth_code_pkce'), client_id,",
+        "    token_endpoint, default_scope: [...], refresh_supported: bool,",
+        "  Plus one of:",
+        "    device_authorization_endpoint  (for device_code flow)",
+        "    authorization_endpoint         (for auth_code_pkce flow)",
+        "  Optional: client_secret, redirect_uri, note.",
+        "  After saving: /reload then /oauth connect <id>.",
+        "",
+        "ALL SUBCOMMANDS",
+        "  /oauth help                                — this message",
+        "  /oauth list                                — show registered platforms + connection state",
+        "  /oauth register <id> <client_id> [<secret>] — register from a built-in template",
+        "  /oauth register-custom                     — placeholder; edit JSON directly today",
+        "  /oauth connect <id> [scope1 scope2 ...]    — start the platform's flow",
+        "  /oauth callback <full_redirect_url>        — paste back for Auth Code flow",
+        "  /oauth disconnect <id>                     — clear tokens (keeps registration)",
+        "  /oauth status <id>                         — flow type, expiry, scope, refresh state",
+        "  /oauth scopes <id>                         — list granted scopes",
+        "",
+        "WHO CAN RUN WHAT",
+        "  Read-only (anyone whitelisted can run): list, status, scopes, help.",
+        "  Mutations (admin only): register, register-custom, connect,",
+        "    callback, disconnect.",
+        "",
+        "TOKEN STORAGE",
+        "  data/<BOT>/oauth_platforms.json — registrations (mode 0600)",
+        "  data/<BOT>/oauth_tokens.json    — tokens (mode 0600)",
+        "  Both atomic-write, fail-loud on corruption. Both gitignored.",
+        "",
+        "═════════════════════════════════════════════════════════════",
+    ];
+    ctx.ui.notify(lines.join("\n"), "info");
+}
 
 function doList(ctx: import("@mariozechner/pi-coding-agent").ExtensionContext): void {
     const platforms = oauth.listStatus();
