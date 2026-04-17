@@ -139,13 +139,25 @@ export async function maybeStartHealthServer(): Promise<HealthServerHandle | und
         const server: Server = app.listen(port, bindAddress, () => {
             const addr = server.address();
             const actualPort = typeof addr === "object" && addr ? addr.port : port;
-            console.log(`🫀 Health endpoint: http://${bindAddress}:${actualPort}/health`);
+            console.log(`[health-server] listening on http://${bindAddress}:${actualPort}/health`);
             resolve({
                 port: actualPort,
                 bindAddress,
-                close: () => new Promise<void>((res, rej) => server.close((err) => err ? rej(err) : res())),
+                close: async () => {
+                    // closeIdleConnections + closeAllConnections sever any
+                    // lingering keep-alive sockets that would otherwise keep
+                    // the event loop alive past close(). Without this, Node's
+                    // test runner IPC can hang waiting for the worker to exit.
+                    server.closeIdleConnections();
+                    server.closeAllConnections();
+                    await new Promise<void>((res, rej) => server.close((err) => err ? rej(err) : res()));
+                },
             });
         });
+        // Short keep-alive so a straggling client can't hold the server open
+        // for the default 5-second timeout after close.
+        server.keepAliveTimeout = 100;
+        server.headersTimeout = 500;
         server.on("error", reject);
     });
 }

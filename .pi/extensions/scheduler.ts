@@ -205,35 +205,29 @@ function makeRunsDir(): string {
 // stored in meta.origin_session_file (captured at schedule time) rather
 // than this reference, so rehydrated jobs still target the correct session
 // even if the TUI is on a different session when they fire.
-// Pi's ExtensionContext exposes `sessionManager: ReadonlySessionManager` —
-// a Pick<> of read-only methods at COMPILE time. At RUNTIME the underlying
-// object is the full SessionManager instance (Pi constructs one, then
-// exposes it via a narrowed type at the extension boundary).
+// LIVE-TUI delivery plumbing.
 //
-// We need two things from this reference:
-//   - getSessionFile() — read-only, always safe.
-//   - appendCustomMessageEntry() — needed for LIVE-TUI delivery. If we
-//     SessionManager.open(file) from a stale disk read, we get a fresh
-//     instance the TUI's event subscribers don't know about — writes
-//     persist to disk but the live TUI never rerenders. Writing via the
-//     SAME SessionManager instance the TUI owns does trigger rerender.
-//     The type narrowing is there to discourage random write access; the
-//     cast here is intentional and documented.
+// Previous approach (cast ReadonlySessionManager to writable, call
+// appendCustomMessageEntry directly) was wrong — the write DID land on
+// disk, but Pi's TUI render pipeline doesn't observe direct SessionManager
+// writes. Pi's InteractiveMode subscribes to AgentSession event streams
+// (message_update, turn_end, ...); a bare SessionManager write doesn't go
+// through AgentSession → TUI never gets notified → the screen doesn't
+// refresh even though the file has the new entry.
 //
-// Runtime-shape verified: pi-coding-agent/dist/core/session-manager.js
-// exports SessionManager; ReadonlySessionManager (line 136) is literally
-// `Pick<SessionManager, "getCwd" | ... | "getSessionName">` — same object,
-// fewer visible methods.
+// Correct path: `pi.sendMessage` (types.d.ts:751). Routes through
+// AgentSession, emits the events the TUI listens on, supports
+// `triggerTurn: false` for passive-notification semantics (adds the
+// CustomMessageEntry without firing an LLM turn).
+//
+// Captured at factory invocation so module-level fireJob/deliverAndAppend
+// can reach it without threading ExtensionAPI through every call.
+let livePi: ExtensionAPI | null = null;
+
+// Narrow structural type — we only need getSessionFile() from the live
+// handle now; pi.sendMessage does the actual writing.
 interface LiveSessionHandle {
     getSessionFile(): string | undefined;
-    /** Runtime-only — ReadonlySessionManager narrows this out at compile
-     *  time, but the underlying object has it. See module header. */
-    appendCustomMessageEntry?: <T = unknown>(
-        customType: string,
-        content: string,
-        display: boolean,
-        details?: T,
-    ) => string;
 }
 let liveSessionManager: LiveSessionHandle | null = null;
 
@@ -337,19 +331,26 @@ async function deliverAndAppend(meta: JobMeta, responseText: string): Promise<vo
         target: target ?? null,
     };
 
-    // Live TUI session case — append via the operator's own SessionManager.
-    if (liveFile === resolvedFile && typeof liveSessionManager?.appendCustomMessageEntry === "function") {
+    // Live TUI session case — deliver via pi.sendMessage so the TUI sees
+    // the event and rerenders. triggerTurn: false means we add the entry
+    // without firing an LLM turn (passive notification — the agent doesn't
+    // need to "respond to" its own reminder; the subprocess already
+    // produced the reminder text and this is just delivery).
+    if (liveFile === resolvedFile && livePi) {
         try {
-            liveSessionManager.appendCustomMessageEntry(
-                "scheduler-delivery",
-                responseText,
-                true, // display=true → the TUI renders this entry visibly
-                details,
+            livePi.sendMessage(
+                {
+                    customType: "scheduler-delivery",
+                    content: responseText,
+                    display: true,
+                    details,
+                },
+                { triggerTurn: false },
             );
             return;
         } catch (e) {
             // Fall through to disk-open path — at least the entry persists.
-            logWarning("scheduler", "live-session append failed, falling back to disk", {
+            logWarning("scheduler", "pi.sendMessage failed, falling back to disk append", {
                 err: e instanceof Error ? e.message : String(e),
                 job_id: meta.job_id,
             });
@@ -608,6 +609,11 @@ function isAdminCaller(ctx: ExtensionContext): boolean {
 // =============================================================================
 
 export default function (pi: ExtensionAPI) {
+    // Capture for fire-time live delivery. livePi is used by deliverAndAppend
+    // to call pi.sendMessage so the TUI gets an event-stream notification
+    // (plain SessionManager writes don't trigger a TUI rerender).
+    livePi = pi;
+
     // On load: rehydrate persisted jobs + capture the live SessionManager
     // for fire-time history-append. liveSessionManager is updated on every
     // session_start so a new TUI session (after /new) still gets reminders
