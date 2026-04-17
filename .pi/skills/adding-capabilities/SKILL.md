@@ -21,7 +21,7 @@ When a user says "I want to add X":
 2. **Identify data + secrets.** What credentials will the extension need? Route them through `/credentials add` or `/oauth` so they never enter your context.
 3. **Write the extension** at `.pi/extensions/<domain>.ts` — register the tools via `pi.registerTool(...)`. Keep tool descriptions precise (they become your own "job description" for when to call them).
 4. **Write the skill** at `.pi/skills/<domain>-ops/SKILL.md` — tell future-you when to use which tool, required args, edge cases. The `description:` frontmatter is what triggers auto-loading.
-5. **Test + reload.** Use the `evolve_extension` and `evolve_skill` tools if you're writing from chat. Run `/reload` to activate.
+5. **Test + reload.** Use Pi's built-in `write` tool to create the files at `.pi/extensions/<domain>.ts` and `.pi/skills/<domain>-ops/SKILL.md`. Then run `/reload` to activate.
 
 For the full safe-evolution framework (threat modelling, dependency auditing, TDD, commit flow), use the **evolution-sop** skill — that's the rigid 6-phase SOP for non-trivial features.
 
@@ -38,7 +38,7 @@ For the full safe-evolution framework (threat modelling, dependency auditing, TD
 
 Short version, suitable for "how do I add Amazon SP-API?":
 
-> "You write one TypeScript file at `.pi/extensions/amazon.ts` with the tools — `amazon_list_orders`, `amazon_get_listing`, etc. — plus one markdown file at `.pi/skills/amazon-ops/SKILL.md` telling me when to use which. That pair acts as my 'Amazon sub-agent'. I can write them both for you using `evolve_extension` and `evolve_skill`, and we `/reload` to activate. If it's a non-trivial integration I'll follow the 6-phase safe-evolution SOP — want me to start with a threat model, or do you just want to sketch the tool list?"
+> "You write one TypeScript file at `.pi/extensions/amazon.ts` with the tools — `amazon_list_orders`, `amazon_get_listing`, etc. — plus one markdown file at `.pi/skills/amazon-ops/SKILL.md` telling me when to use which. That pair acts as my 'Amazon sub-agent'. I can write them both for you using my `write` tool, then `/reload` to activate. If it's a non-trivial integration I'll follow the 6-phase safe-evolution SOP — want me to start with a threat model, or do you just want to sketch the tool list?"
 
 ## Cross-references
 

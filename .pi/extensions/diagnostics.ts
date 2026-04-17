@@ -294,7 +294,7 @@ export default function (pi: ExtensionAPI) {
                 };
             }
             const RELEVANT_PREFIXES = [
-                "BOT_NAME", "ORI2_", "PRIMARY_PROVIDER", "REQUIRE_2FA",
+                "BOT_NAME", "ORI2_", "REQUIRE_2FA",
                 "ADMIN_USER_IDS",
                 "ANTHROPIC_", "OPENAI_", "GOOGLE_", "GEMINI_", "VERTEX_",
                 "TELEGRAM_",
@@ -392,7 +392,7 @@ export default function (pi: ExtensionAPI) {
                 const wantValues = parts.includes("--values") || parts.includes("--show");
                 if (wantValues && !isAdminCaller(ctx)) { ctx.ui.notify("`--values` requires admin.", "error"); return; }
                 const keys = Object.keys(process.env)
-                    .filter((k) => /^(BOT_NAME|ORI2_|PRIMARY_PROVIDER|REQUIRE_2FA|ADMIN_USER_IDS|ANTHROPIC_|OPENAI_|GOOGLE_|GEMINI_|VERTEX_|TELEGRAM_|A2A_|AGENT_RPM|GUARDRAIL_|PI_CODING_AGENT_DIR|FASTEMBED_)/.test(k))
+                    .filter((k) => /^(BOT_NAME|ORI2_|REQUIRE_2FA|ADMIN_USER_IDS|ANTHROPIC_|OPENAI_|GOOGLE_|GEMINI_|VERTEX_|TELEGRAM_|A2A_|AGENT_RPM|GUARDRAIL_|PI_CODING_AGENT_DIR|FASTEMBED_)/.test(k))
                     .sort();
                 if (keys.length === 0) { ctx.ui.notify("No ori2-relevant env vars set.", "info"); return; }
                 const lines = ["Env vars (ori2-relevant):", ""];

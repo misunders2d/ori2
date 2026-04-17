@@ -10,7 +10,7 @@ Ori2 is a **platform** — a minimal, evolvable foundation built on the [Pi SDK]
 
 Ori2 is designed to be raised. Out of the box she is a capable assistant; her true form is determined by how you chat with her and which skills you let her develop.
 
-*   **Evolutionary Engineering:** Describe a new capability in natural language. Ori2's `evolve_extension` tool writes the file, types-checks, test-suites, and — with your one-tap approval — `/reload`s into her live brain.
+*   **Evolutionary Engineering:** Describe a new capability in natural language. Ori2 writes the extension with Pi's built-in `write` tool, runs the tests, and — with your one-tap approval — `/reload`s into her live brain.
 *   **DNA Exchange Between Bots:** Feature-grain sharing over A2A. Register a proven extension + skill as a DNA feature, mark it public, and any friend bot can `/dna pull AmazonBot clickup-integration`, stage it, run tests, snapshot + apply. Test fails → auto-rollback from snapshot. Her immune system protects both sides.
 *   **Friend Network:** Ori2 speaks the official [Google A2A protocol](https://github.com/a2aproject/a2a-spec). Two operators swap a single invitation token and their bots now chat peer-to-peer with asymmetric per-friend bearer keys. No central authority.
 *   **Living Skills:** The `.pi/skills/` directory is how Ori2 teaches herself new behaviours — read by the agent like a cookbook. She can write and rewrite her own.
@@ -108,7 +108,7 @@ Ori knows how she's doing and tells you when something drifts — you shouldn't 
 ## ⚡ Feature Showcase (Ability Tree)
 
 *   **[SYSTEM PERK] Tactical Silence:** Interrupt her mid-thought. Pi's TUI surfaces `/abort` to stop off-track reasoning instantly and save tokens.
-*   **[SYSTEM PERK] Autonomous Self-Refinement:** `evolve_extension(name, content)` writes a new extension to `.pi/extensions/`. Tell her "reload" → the organ is alive.
+*   **[SYSTEM PERK] Autonomous Self-Refinement:** Ori writes a new extension to `.pi/extensions/` via Pi's built-in `write` tool. Tell her "reload" → the organ is alive.
 *   **[SYSTEM PERK] Snapshot-and-Rollback Evolution:** Every DNA apply auto-snapshots `.pi/`. `npm test` fails → the new organ is excised and she reverts to the last healthy body.
 *   **[SYSTEM PERK] The Chronos Scheduler:** Recurring cron jobs, reminders, one-shot firings. Per-fire fresh sessions — a scheduled autonomous run can't corrupt the interactive session.
 *   **[SYSTEM PERK] Per-Fire Plan Enforcement:** Scheduled autonomous runs execute a pre-defined `steps[]` plan with no ability to self-cancel. Admin override from chat or A2A peer.
@@ -130,7 +130,7 @@ Ori knows how she's doing and tells you when something drifts — you shouldn't 
 
 ### 1. Claiming an Egg
 
-You **do not need to fork on GitHub first**. The one-liner installer (above) clones the canonical repo, then immediately detaches — wipes `.git`, starts a fresh commit history, drops a `.ori2-baseline` marker so future upstream-sync calls know where she hatched from. From that moment on, your bot's code belongs to *you*, not to the upstream repo. Evolution lives on your own timeline with zero risk of an `evolve_extension` call ever trying to push to someone else's GitHub.
+You **do not need to fork on GitHub first**. The one-liner installer (above) clones the canonical repo, then immediately detaches — wipes `.git`, starts a fresh commit history, drops a `.ori2-baseline` marker so future upstream-sync calls know where she hatched from. From that moment on, your bot's code belongs to *you*, not to the upstream repo. Evolution lives on your own timeline with zero risk of any self-evolution writing to someone else's GitHub.
 
 When you're ready to publish your evolved bot somewhere — your own private repo, a team-shared repo, a public fork:
 
@@ -202,8 +202,8 @@ You: "I want a ClickUp integration. Tasks: list, create, comment. Store the API 
 Ori2:  Researches ClickUp API.
        Stages /credentials add (intercepted pre-LLM — your token never
        enters context).
-       evolve_extension(name=clickup, content=<TS code>)
-       evolve_skill(name=clickup-usage, content=<SKILL.md>)
+       write(path=.pi/extensions/clickup.ts, content=<TS code>)
+       write(path=.pi/skills/clickup-usage/SKILL.md, content=<markdown>)
        "Extension written. Run /reload to enable."
 
 You: /reload
@@ -219,7 +219,7 @@ Ori2 is organised around **two primitives** that together act like a sub-agent i
 
 **Extension + skill ≈ sub-agent.** Same practical effect as ADK's sub-agent pattern without the multi-agent coordination tax. One bot, many specialisations.
 
-Just ask her in chat — *"how do I add an Amazon SP-API integration?"* — and she'll walk you through it. She's equipped with a dedicated skill (`adding-capabilities`) that explains the mental model, and the rigid 6-phase SOP (`evolution-sop`) for anything non-trivial: threat modelling → doc research → secure dependency audit → scaffolding → TDD → verify + commit. She writes and tests both files for you via `evolve_extension` and `evolve_skill`; `/reload` makes them live in the current session.
+Just ask her in chat — *"how do I add an Amazon SP-API integration?"* — and she'll walk you through it. She's equipped with a dedicated skill (`adding-capabilities`) that explains the mental model, and the rigid 6-phase SOP (`evolution-sop`) for anything non-trivial: threat modelling → doc research → secure dependency audit → scaffolding → TDD → verify + commit. She writes both files for you using Pi's built-in `write` tool; `/reload` makes them live in the current session.
 
 **Scaling pattern, in order:** one instance with multiple extensions → mode switching inside one instance when the tool list bloats → separate Ori2 instances per role communicating over A2A when teams need independent evolution paths.
 

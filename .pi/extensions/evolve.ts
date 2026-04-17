@@ -2,75 +2,44 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { Type } from "@sinclair/typebox";
 import fs from "node:fs";
 import path from "node:path";
-import { currentOrigin } from "../../src/core/identity.js";
-import { getWhitelist } from "../../src/core/whitelist.js";
 
 // =============================================================================
-// evolve — chat-driven extension/skill authoring with hot reload.
+// evolve — discoverability + diff surface for the operator.
 //
-// The platform's "raise it your way" promise lives here. The agent (under
-// admin direction) writes new TypeScript extensions or markdown skills into
-// the project directory, then triggers /reload so they take effect without
-// a process restart.
+// The heavy lifting of "write a new extension" / "write a new skill" is done
+// by Pi's built-in `write` / `edit` tools (default-registered — see
+// pi-coding-agent/docs §Tool Options: read, bash, edit, write). The agent
+// writes `.pi/extensions/<name>.ts` or `.pi/skills/<name>/SKILL.md` the same
+// way it writes any other file, then calls `/reload` (pi-coding-agent native)
+// to make the new code/skill live in the current session — no restart.
 //
-// Tools:
-//   evolve_extension(name, content) — write .pi/extensions/<name>.ts
-//   evolve_skill(name, content)     — write .pi/skills/<name>/SKILL.md
-//   evolve_list                      — what extensions/skills exist now
+// This extension adds operator-facing sugar on top of Pi's built-ins:
 //
-// Slash commands:
-//   /evolve help
-//   /evolve list
-//   /evolve diff   — git diff vs HEAD (uses git, falls back gracefully)
+//   evolve_list     — read-only tool so the agent can enumerate what's
+//                     installed when asked "what extensions do you have?"
+//                     without shelling out to bash ls.
+//   /evolve help    — documents the Pi-native evolve-by-write workflow.
+//   /evolve list    — operator version of evolve_list.
+//   /evolve diff    — `git diff --stat HEAD -- .pi/` — what have we evolved
+//                     this session? Valuable before `git commit`.
+//
+// Why no custom write-extension tool:
+//   Earlier versions had evolve_extension / evolve_skill tools. They were
+//   thin wrappers over an atomic file write, which is exactly what Pi's
+//   built-in `write` tool already does. Removing duplication — see the
+//   pi-alignment-plan.md Phase 3 audit for the reasoning.
 //
 // Safety:
-//   - All mutating tools require admin (default ACL).
-//   - Names are sanitised (alphanumerics + dashes/underscores only).
-//   - Files written ATOMICALLY (tmp + rename) so /reload never sees half-written code.
-//   - On reload failure, the bot stays alive — the bad extension is just
-//     reported as a load error in the logs. Operator can `git restore`
-//     to roll back.
-//   - The agent's persona prompt should reinforce: write tests, use the
-//     `evolution-sop` skill (.pi/skills/evolution-sop.md is bundled).
-//
-// What we DON'T do here:
-//   - Syntax-check / typecheck the code before writing. tsc is available
-//     via npx but adds ~5s per evolution. The agent should write code that
-//     compiles; if not, /reload reports the error. (Future enhancement:
-//     optional pre-write typecheck.)
-//   - Auto-commit. The agent can call git via the bash tool when ready.
-//     Auto-commit on every evolution is too aggressive (false starts,
-//     experimentation).
-//   - Backup. Git history is the backup.
+//   Path-allowlist protection (the agent may write anywhere Pi's `write`
+//   tool allows) is handled by admin_gate + tool_acl for the `write` tool
+//   itself. If you need to restrict writes to `.pi/extensions/` specifically,
+//   add a policy.ts rule (deny `write` when path is outside allowed prefixes).
+//   See pi-coding-agent examples/extensions/protected-paths.ts for reference.
 // =============================================================================
 
 const EXTENSIONS_DIR = path.resolve(process.cwd(), ".pi/extensions");
 const SKILLS_DIR = path.resolve(process.cwd(), ".pi/skills");
-const PROMPTS_DIR = path.resolve(process.cwd(), ".pi/prompts");
-
-// Sanitise a name: keep alphanumerics, underscores, dashes. Reject anything
-// that looks like a path traversal attempt.
-const SAFE_NAME = /^[a-zA-Z0-9_-]{1,64}$/;
-
-function isAdminCaller(ctx: ExtensionContext): boolean {
-    const origin = currentOrigin(ctx.sessionManager);
-    if (!origin) return true;
-    return getWhitelist().isAdmin(origin.platform, origin.senderId);
-}
-
-function atomicWriteText(file: string, content: string): void {
-    const dir = path.dirname(file);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    const tmp = `${file}.tmp`;
-    const fd = fs.openSync(tmp, "w", 0o644);
-    try {
-        fs.writeSync(fd, content);
-        fs.fsyncSync(fd);
-    } finally {
-        fs.closeSync(fd);
-    }
-    fs.renameSync(tmp, file);
-}
+const APPEND_SYSTEM_FILE = path.resolve(process.cwd(), ".pi/APPEND_SYSTEM.md");
 
 function listFiles(dir: string, suffix: string): string[] {
     if (!fs.existsSync(dir)) return [];
@@ -80,126 +49,50 @@ function listFiles(dir: string, suffix: string): string[] {
 function listSkillDirs(dir: string): string[] {
     if (!fs.existsSync(dir)) return [];
     return fs.readdirSync(dir, { withFileTypes: true })
-        .filter((d) => d.isDirectory() || d.name.endsWith(".md"))
+        .filter((d) => d.isDirectory())
         .map((d) => d.name)
         .sort();
 }
 
 export default function (pi: ExtensionAPI) {
-    // ----- LLM tools (admin-only via Sprint 5 ACL — not in defaults yet, see below) -----
-
-    pi.registerTool({
-        name: "evolve_extension",
-        label: "Evolve: Write Extension",
-        description:
-            "Write a new (or replace existing) Pi extension at .pi/extensions/<name>.ts. " +
-            "The file is written atomically. Caller MUST follow up with /reload to load it. " +
-            "Admin-only. The extension MUST export a default function that receives " +
-            "ExtensionAPI and registers tools/commands/event handlers. See bundled examples " +
-            "(memory.ts, oauth.ts, scheduler.ts, etc.) and follow the evolution-sop skill: " +
-            "research the API, write tests, use secure_npm_install for any new deps, then " +
-            "verify_and_commit when done.",
-        parameters: Type.Object({
-            name: Type.String({ description: "Extension name (alphanumeric, _ or -). Becomes <name>.ts in .pi/extensions/." }),
-            content: Type.String({ description: "Full file content. Should start with `import type { ExtensionAPI } from \"@mariozechner/pi-coding-agent\";` and `export default function (pi: ExtensionAPI) { ... }`." }),
-        }),
-        async execute(_id, params) {
-            if (!SAFE_NAME.test(params.name)) {
-                throw new Error(`evolve_extension: invalid name "${params.name}". Allowed: a-z A-Z 0-9 _ - (1-64 chars).`);
-            }
-            if (!params.content || !params.content.includes("export default")) {
-                throw new Error("evolve_extension: content missing required `export default function (pi: ExtensionAPI)`.");
-            }
-            const file = path.join(EXTENSIONS_DIR, `${params.name}.ts`);
-            const existed = fs.existsSync(file);
-            atomicWriteText(file, params.content);
-            return {
-                content: [{
-                    type: "text",
-                    text:
-                        `${existed ? "Replaced" : "Created"} extension at ${file} (${params.content.length} chars).\n` +
-                        `Now run /reload to activate it. If reload reports a TypeScript error, ` +
-                        `read the message and either fix the code (call evolve_extension again with the corrected content) ` +
-                        `or revert with: git restore ${path.relative(process.cwd(), file)}.`,
-                }],
-                details: { file, name: params.name, replaced: existed, bytes: params.content.length },
-            };
-        },
-    });
-
-    pi.registerTool({
-        name: "evolve_skill",
-        label: "Evolve: Write Skill",
-        description:
-            "Write a new (or replace existing) skill at .pi/skills/<name>/SKILL.md. Skills are " +
-            "markdown instruction sets the agent loads on demand via /skill:<name>. Admin-only.",
-        parameters: Type.Object({
-            name: Type.String({ description: "Skill name (alphanumeric, _ or -)." }),
-            content: Type.String({ description: "Full SKILL.md content. Should start with YAML frontmatter (name, description, type)." }),
-        }),
-        async execute(_id, params) {
-            if (!SAFE_NAME.test(params.name)) {
-                throw new Error(`evolve_skill: invalid name "${params.name}". Allowed: a-z A-Z 0-9 _ - (1-64 chars).`);
-            }
-            const dir = path.join(SKILLS_DIR, params.name);
-            const file = path.join(dir, "SKILL.md");
-            const existed = fs.existsSync(file);
-            atomicWriteText(file, params.content);
-            return {
-                content: [{
-                    type: "text",
-                    text:
-                        `${existed ? "Replaced" : "Created"} skill at ${file} (${params.content.length} chars).\n` +
-                        `Run /reload to make it discoverable. The skill becomes invokable as ` +
-                        `/skill:${params.name} after reload.`,
-                }],
-                details: { file, name: params.name, replaced: existed },
-            };
-        },
-    });
-
     pi.registerTool({
         name: "evolve_list",
         label: "Evolve: List Extensions and Skills",
-        description: "List all currently-installed extensions, skills, and prompts in this project's .pi/ directory.",
+        description:
+            "List installed extensions (.pi/extensions/*.ts) and skills (.pi/skills/<name>/SKILL.md) " +
+            "plus whether .pi/APPEND_SYSTEM.md is present. Use when the user asks what capabilities " +
+            "are installed or available to evolve. To CREATE or MODIFY an extension/skill, use Pi's " +
+            "built-in `write` tool + then `/reload` — not a separate evolve tool.",
         parameters: Type.Object({}),
         async execute() {
-            const extensions = listFiles(EXTENSIONS_DIR, ".ts");
+            const extensions = listFiles(EXTENSIONS_DIR, ".ts").filter((f) => !f.endsWith(".test.ts"));
             const skills = listSkillDirs(SKILLS_DIR);
-            const prompts = listFiles(PROMPTS_DIR, ".md");
+            const appendSystem = fs.existsSync(APPEND_SYSTEM_FILE);
             const lines = [
                 `Extensions (.pi/extensions/): ${extensions.length}`,
                 ...extensions.map((f) => `  ${f}`),
                 ``,
                 `Skills (.pi/skills/): ${skills.length}`,
-                ...skills.map((f) => `  ${f}`),
+                ...skills.map((f) => `  ${f}/SKILL.md`),
                 ``,
-                `Prompts (.pi/prompts/): ${prompts.length}`,
-                ...prompts.map((f) => `  ${f}`),
+                `.pi/APPEND_SYSTEM.md: ${appendSystem ? "present" : "(not set)"}`,
             ];
             return {
                 content: [{ type: "text", text: lines.join("\n") }],
-                details: { extensions, skills, prompts },
+                details: { extensions, skills, appendSystem },
             };
         },
     });
-
-    // ----- slash commands -----
 
     pi.registerCommand("evolve", {
         description: "Evolution surface. Run /evolve help.",
         handler: async (args, ctx) => {
             const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
             const sub = (parts[0] ?? "help").toLowerCase();
-            const mutating = sub === "reload-now"; // future: explicit reload trigger
-            if (mutating && !isAdminCaller(ctx)) {
-                ctx.ui.notify(`Only admins can run /evolve ${sub}.`, "error");
-                return;
-            }
             switch (sub) {
-                case "help":      return doHelp(ctx);
-                case "list":      return doList(ctx);
-                case "diff":      return await doDiff(ctx);
+                case "help": return doHelp(ctx);
+                case "list": return doList(ctx);
+                case "diff": return await doDiff(ctx);
                 default:
                     ctx.ui.notify(`Unknown /evolve subcommand: ${sub}. Run /evolve help.`, "error");
             }
@@ -214,20 +107,17 @@ function doHelp(ctx: ExtensionContext): void {
         "═════════════════════════════════════════════════════════════",
         "",
         "WHAT THIS DOES",
-        "  Lets the agent (under admin direction) write new Pi extensions",
-        "  (.pi/extensions/<name>.ts) and skills (.pi/skills/<name>/SKILL.md).",
-        "  After write, run /reload to load the new code WITHOUT restarting",
-        "  the bot. If reload reports an error, fix-and-retry or git restore.",
+        "  Ori2's evolution model uses Pi's native building blocks:",
+        "    Pi's built-in `write` tool → writes the file",
+        "    Pi's `/reload` slash command → loads it without restart",
+        "  This slash command gives you the surface to discover state",
+        "  (list, diff) and tells the agent the workflow. The actual",
+        "  write + reload mechanics are Pi-native, no custom tool.",
         "",
-        "  Bundled skill `evolution-sop` documents the recommended workflow:",
-        "    research → threat model → secure_npm_install → write code →",
-        "    write tests → verify_and_commit. Always invoke /skill:evolution-sop",
+        "  Bundled skill `evolution-sop` documents the safe 6-phase flow:",
+        "    threat model → research docs → secure_npm_install → write →",
+        "    tests → verify_and_commit. Always invoke /skill:evolution-sop",
         "    before significant evolution work.",
-        "",
-        "TOOLS THE AGENT CAN CALL (admin-only)",
-        "  evolve_extension(name, content)  — write a new Pi extension",
-        "  evolve_skill(name, content)      — write a new skill",
-        "  evolve_list                       — enumerate current extensions/skills",
         "",
         "WORKFLOW EXAMPLE",
         "  Operator: \"Build a tool that posts to my SendGrid mailing list.\"",
@@ -235,24 +125,33 @@ function doHelp(ctx: ExtensionContext): void {
         "    1. /skill:evolution-sop",
         "    2. web_search(\"SendGrid API send email\")",
         "    3. web_fetch(<docs URL>)",
-        "    4. /credentials help → asks operator to add SENDGRID_KEY via",
+        "    4. /credentials help → have operator add SENDGRID_KEY via",
         "       /credentials add sendgrid <key> --provider sendgrid",
-        "    5. evolve_extension(name=\"sendgrid_send\", content=<the new code>)",
+        "    5. write(path=\".pi/extensions/sendgrid_send.ts\", content=<code>)",
         "    6. /reload",
         "    7. test the new tool",
-        "    8. verify_and_commit if appropriate",
+        "    8. verify_and_commit when green",
+        "",
+        "SKILLS (markdown, read lazily by the agent)",
+        "  Write `.pi/skills/<name>/SKILL.md` with YAML frontmatter",
+        "  (`name`, `description`). Pi auto-discovers on next `/reload`.",
+        "",
+        "SYSTEM-PROMPT CUSTOMISATION (persona / static directives)",
+        "  Edit `.pi/APPEND_SYSTEM.md` — Pi appends it to the default",
+        "  system prompt automatically. No reload needed; applies to the",
+        "  next new session (or /new).",
         "",
         "ALL SUBCOMMANDS",
-        "  /evolve help          — this message",
-        "  /evolve list          — current extensions, skills, prompts",
-        "  /evolve diff          — git diff against HEAD (what's been evolved this session)",
+        "  /evolve help   — this message",
+        "  /evolve list   — current extensions + skills + APPEND_SYSTEM state",
+        "  /evolve diff   — git diff --stat HEAD -- .pi/",
         "",
         "ROLLBACK",
-        "  Every evolution is just a file write — git is the source of truth.",
-        "    git status           — see what was added/changed",
+        "  Every evolution is just a file write — git is the source of truth:",
+        "    git status           — what's changed",
         "    git diff             — review",
         "    git restore <path>   — undo a single file",
-        "    git restore .pi/     — undo all evolution changes",
+        "    git restore .pi/     — undo all .pi/ changes in this session",
         "",
         "═════════════════════════════════════════════════════════════",
     ];
@@ -260,18 +159,17 @@ function doHelp(ctx: ExtensionContext): void {
 }
 
 function doList(ctx: ExtensionContext): void {
-    const extensions = listFiles(EXTENSIONS_DIR, ".ts");
+    const extensions = listFiles(EXTENSIONS_DIR, ".ts").filter((f) => !f.endsWith(".test.ts"));
     const skills = listSkillDirs(SKILLS_DIR);
-    const prompts = listFiles(PROMPTS_DIR, ".md");
+    const appendSystem = fs.existsSync(APPEND_SYSTEM_FILE);
     const lines = [
         `Extensions (${extensions.length}):`,
         ...extensions.map((f) => `  ${f}`),
         ``,
         `Skills (${skills.length}):`,
-        ...skills.map((f) => `  ${f}`),
+        ...skills.map((f) => `  ${f}/SKILL.md`),
         ``,
-        `Prompts (${prompts.length}):`,
-        ...prompts.map((f) => `  ${f}`),
+        `APPEND_SYSTEM.md: ${appendSystem ? "present" : "(not set)"}`,
     ];
     ctx.ui.notify(lines.join("\n"), "info");
 }

@@ -30,8 +30,10 @@ import {
     ensurePiSettingsJsonSeeded as _ensurePiSettingsJsonSeeded,
 } from "./core/piSeed.js";
 
-// .env carries non-secret runtime config only (BOT_NAME, PRIMARY_PROVIDER,
-// REQUIRE_2FA, GUARDRAIL_EMBEDDINGS). Secrets live in the vault.
+// .env carries non-secret runtime config only (BOT_NAME, REQUIRE_2FA,
+// GUARDRAIL_EMBEDDINGS). Secrets live in the vault. Pi settings
+// (defaultProvider/defaultModel/etc.) live in Pi's settings.json at
+// <PI_CODING_AGENT_DIR>/settings.json — NOT in .env.
 dotenv.config();
 
 // Daemon mode detection — production VPS deploys run with no TTY (systemd /

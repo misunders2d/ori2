@@ -181,10 +181,22 @@ async function fireJob(meta: JobMeta, manualTrigger = false): Promise<void> {
         ? `[SCHEDULED ${meta.job_id}] Begin executing the seeded plan ("${meta.task}"). Report results when complete.`
         : `[SCHEDULED ${meta.job_id}] Task: ${meta.task}\n\nExecute and report when done.`;
 
-    // Spawn the runner subprocess.
+    // Spawn Pi's native print-mode runner (pi -p <kickoff> --session <file>).
+    // Pi auto-discovers .pi/extensions/ (transport_bridge, plan_enforcer,
+    // persona, guardrails, …), resolves auth via PI_CODING_AGENT_DIR/auth.json
+    // (seeded by index.ts on parent boot), and exits after the prompt
+    // settles — exactly what a scheduled run needs.
+    //
+    // Plan reports surface via pi.events.emit("plan:report", ...) + disk
+    // fallback at data/<bot>/plan-reports/. No transport adapter is needed
+    // in this subprocess (no inbound chat → no origin → no routing).
+    //
+    // env: process.env carries PI_CODING_AGENT_DIR, BOT_NAME, and hydrated
+    // API key env vars into the child so auth.json lookup hits the right
+    // per-bot state dir.
     const proc = spawn(
         "npx",
-        ["tsx", "scripts/scheduled-run.ts", sessionFile, kickoff],
+        ["pi", "-p", kickoff, "--session", sessionFile],
         {
             cwd: process.cwd(),
             env: process.env,

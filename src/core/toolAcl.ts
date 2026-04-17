@@ -107,9 +107,9 @@ const DEFAULTS: Record<string, string[]> = {
     // call_agent, update_friend_address, update_friend_key,
     // broadcast_address_update, register_dna_feature, unregister_dna_feature,
     // pull_dna, apply_dna, rollback_dna.
-    // Sprint 9 evolution surface
-    evolve_extension: ["admin"],
-    evolve_skill: ["admin"],
+    // Evolution surface — evolve_extension / evolve_skill retired in favour
+    // of Pi's built-in `write` + `/reload` (pi-alignment-plan.md Phase 3).
+    // `write` inherits Pi's default ACL; restrict via policy.ts if needed.
     evolve_list: ["user"],
     // Sprint 9 audit
     oauth_get_access_token: ["admin"],
