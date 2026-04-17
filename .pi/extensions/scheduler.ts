@@ -8,6 +8,7 @@ import path from "node:path";
 import { botSubdir, ensureDir } from "../../src/core/paths.js";
 import { currentOrigin } from "../../src/core/identity.js";
 import { getWhitelist } from "../../src/core/whitelist.js";
+import { getKVCache } from "../../src/core/kvCache.js";
 import { getDispatcher } from "../../src/transport/dispatcher.js";
 import { seedPlan, recordPlanThread, type OriginChannel } from "./plan_enforcer.js";
 import { logError, logWarning } from "../../src/core/errorLog.js";
@@ -63,7 +64,7 @@ interface DeliverTarget {
     sessionFile?: string;
 }
 
-type JobType = "reminder" | "task";
+type JobType = "reminder" | "task" | "poll";
 
 interface JobMeta {
     job_id: string;
@@ -72,6 +73,13 @@ interface JobMeta {
      *              not execute it. No `steps` (would be ignored).
      * "task"     — fire-time LLM is told to EXECUTE the instruction.
      *              Optional `steps` enter plan-enforcement mode.
+     * "poll"     — fire-time LLM RUNS THE CHECK and decides whether to
+     *              terminate (mark_poll_done) or continue (next cron fire).
+     *              `poll_max_attempts` caps runaway polls; `poll_attempts`
+     *              tracks completed fires. Control-channel is kvCache
+     *              namespace "poll-control" — subprocess's mark_poll_done
+     *              writes `{done, result}` there; parent's next fire reads
+     *              it, delivers, and cancels.
      * Default when missing on legacy job files: "task" (back-compat).
      */
     job_type: JobType;
@@ -89,6 +97,10 @@ interface JobMeta {
      * conversation history (lets "thanks just watched it" resolve context).
      */
     origin_session_file?: string;
+    /** Poll-only: give up after N fires. Defaults to 120 (1h at 30s cadence). */
+    poll_max_attempts?: number;
+    /** Poll-only: count of fires so far. Persisted so restarts don't reset. */
+    poll_attempts?: number;
     created_at: number;
     created_by: string;
 }
@@ -131,9 +143,13 @@ function loadAllJobMeta(): JobMeta[] {
                     ? "reminder"
                     : parsed.job_type === "task"
                         ? "task"
-                        : parsed.job_id.startsWith("reminder_")
-                            ? "reminder"
-                            : "task";
+                        : parsed.job_type === "poll"
+                            ? "poll"
+                            : parsed.job_id.startsWith("reminder_")
+                                ? "reminder"
+                                : parsed.job_id.startsWith("poll_")
+                                    ? "poll"
+                                    : "task";
                 out.push({
                     job_id: parsed.job_id,
                     job_type,
@@ -143,6 +159,8 @@ function loadAllJobMeta(): JobMeta[] {
                     ...(parsed.originChannel ? { originChannel: parsed.originChannel } : {}),
                     ...(parsed.deliverTarget ? { deliverTarget: parsed.deliverTarget } : {}),
                     ...(typeof parsed.origin_session_file === "string" ? { origin_session_file: parsed.origin_session_file } : {}),
+                    ...(typeof parsed.poll_max_attempts === "number" ? { poll_max_attempts: parsed.poll_max_attempts } : {}),
+                    ...(typeof parsed.poll_attempts === "number" ? { poll_attempts: parsed.poll_attempts } : {}),
                     created_at: typeof parsed.created_at === "number" ? parsed.created_at : Date.now(),
                     created_by: typeof parsed.created_by === "string" ? parsed.created_by : "unknown",
                 });
@@ -217,6 +235,24 @@ function buildKickoff(meta: JobMeta): string {
             `"I'll remind you now:", no tool calls unless the task demands it.`,
         ].join("\n");
     }
+    if (meta.job_type === "poll") {
+        const attempt = (meta.poll_attempts ?? 0) + 1;
+        const max = meta.poll_max_attempts ?? 120;
+        return [
+            `[SCHEDULED POLL — ${meta.job_id}, attempt ${attempt} of ${max}]`,
+            `Check task:`,
+            ``,
+            `  ${meta.task}`,
+            ``,
+            `Instructions:`,
+            `- Run the check.`,
+            `- If the condition is MET, call mark_poll_done("${meta.job_id}", "<concise final result>") THEN exit. The user will receive your final result.`,
+            `- If the condition has DEFINITIVELY FAILED (error, not-found, invalid), call mark_poll_done("${meta.job_id}", "FAILED: <reason>") and exit — don't keep polling.`,
+            `- If the condition is STILL PENDING (not done yet, "in progress", etc.), just exit quietly. You will be invoked again automatically. DO NOT call mark_poll_done in this case.`,
+            ``,
+            `Keep the final result short (1–3 sentences) — it becomes the user-facing message.`,
+        ].join("\n");
+    }
     if (meta.steps && meta.steps.length > 0) {
         return `[SCHEDULED ${meta.job_id}] Begin executing the seeded plan ("${meta.task}"). Report results when complete.`;
     }
@@ -289,12 +325,85 @@ function originChannelToTarget(origin: OriginChannel | undefined): DeliverTarget
     return t;
 }
 
+// ----- Poll control (kvCache-backed) -----
+//
+// Polls terminate via a done-flag in kvCache, written by the subprocess's
+// mark_poll_done tool. The parent reads it at the start of each fire AND
+// after each subprocess exit — whichever sees the flag first delivers +
+// cancels. Cross-process visibility works because kvCache is backed by a
+// SQLite DB file with WAL mode; multiple processes opening the same file
+// observe each other's committed writes.
+
+const POLL_CONTROL_NS = "poll-control";
+const POLL_CONTROL_TTL_SEC = 3600; // 1 hour — parent reads within seconds.
+
+interface PollDoneSignal {
+    done: true;
+    result: string;
+    markedAt: number;
+}
+
+function readPollDone(jobId: string): PollDoneSignal | undefined {
+    return getKVCache().get<PollDoneSignal>(POLL_CONTROL_NS, jobId);
+}
+
+function clearPollControl(jobId: string): void {
+    getKVCache().delete(POLL_CONTROL_NS, jobId);
+}
+
+/** Internal — called from mark_poll_done tool inside the subprocess. */
+function writePollDone(jobId: string, result: string): void {
+    getKVCache().set<PollDoneSignal>(
+        POLL_CONTROL_NS,
+        jobId,
+        { done: true, result, markedAt: Date.now() },
+        POLL_CONTROL_TTL_SEC,
+    );
+}
+
+/** Finalize a completed poll: deliver, cancel its schedule, clean up state. */
+async function finalizePoll(meta: JobMeta, finalText: string, reason: "done" | "timeout"): Promise<void> {
+    const prefix = reason === "timeout" ? "[Poll timed out] " : "";
+    await deliverAndAppend(meta, prefix + finalText);
+    const rj = activeJobs.get(meta.job_id);
+    if (rj) {
+        rj.job.cancel();
+        activeJobs.delete(meta.job_id);
+    }
+    deleteJobMeta(meta.job_id);
+    clearPollControl(meta.job_id);
+}
+
 // ----- Cron fire handler -----
 
 async function fireJob(meta: JobMeta, manualTrigger = false): Promise<void> {
     const stamp = new Date().toISOString().replace(/[:.]/g, "-");
     const trigger = manualTrigger ? "manual" : "cron";
     console.log(`[scheduler] [${trigger}] fire ${meta.job_id} at ${stamp}`);
+
+    // Poll pre-check: done-flag already set → finalize without spawning.
+    if (meta.job_type === "poll") {
+        const doneSignal = readPollDone(meta.job_id);
+        if (doneSignal) {
+            await finalizePoll(meta, doneSignal.result, "done");
+            return;
+        }
+        // Attempt cap: give up without spawning if we've already hit the limit.
+        const attempts = meta.poll_attempts ?? 0;
+        const max = meta.poll_max_attempts ?? 120;
+        if (attempts >= max) {
+            await finalizePoll(
+                meta,
+                `Exhausted ${max} poll attempt${max === 1 ? "" : "s"} for "${meta.task}" without the check signalling completion.`,
+                "timeout",
+            );
+            return;
+        }
+        // Increment attempts and persist BEFORE spawning so a crash leaves
+        // the counter accurate for next boot.
+        meta.poll_attempts = attempts + 1;
+        saveJobMeta(meta);
+    }
 
     let sm: SessionManager;
     try {
@@ -379,6 +488,26 @@ async function fireJob(meta: JobMeta, manualTrigger = false): Promise<void> {
             logWarning("scheduler", `${meta.job_id} subprocess non-zero exit`, { code, job_id: meta.job_id });
             return;
         }
+
+        // Polls use a different delivery model: mark_poll_done writes to
+        // kvCache from inside the subprocess. The subprocess's stdout is
+        // NOT delivered to the user — it's just status chatter ("still
+        // pending..."). Delivery happens only when the done-flag is set,
+        // either by THIS subprocess's mark_poll_done call or by a prior
+        // fire that's caught up asynchronously. Check immediately after
+        // exit so the user gets their result without waiting for the next
+        // cron tick.
+        if (meta.job_type === "poll") {
+            const signal = readPollDone(meta.job_id);
+            if (signal) {
+                void finalizePoll(meta, signal.result, "done");
+            }
+            // If no done-flag: silent. The subprocess told the user's future
+            // self "still pending" via its stdout (which we ignore). Next
+            // cron fire will try again.
+            return;
+        }
+
         const text = extractAgentResponse(capturedStdout);
         if (!text) {
             logWarning("scheduler", `${meta.job_id} produced no agent response`, { job_id: meta.job_id });
@@ -573,6 +702,115 @@ export default function (pi: ExtensionAPI) {
             return {
                 content: [{ type: "text", text: `Reminder ${meta.job_id} set. Will fire at ${fireAt.toISOString()}.` }],
                 details: { job_id: meta.job_id, fire_at: fireAt.toISOString(), deliver_to: meta.deliverTarget ?? null },
+            };
+        },
+    });
+
+    pi.registerTool({
+        name: "schedule_poll",
+        label: "Schedule Poll",
+        description:
+            "Schedule a RECURRING CHECK that terminates when a condition is met. Each fire " +
+            "spawns a fresh subprocess that runs `check_instruction`; that subprocess's agent " +
+            "decides whether the condition is met and calls `mark_poll_done` to stop the poll " +
+            "and deliver the final result. " +
+            "\n\n" +
+            "Use for async external work the user shouldn't have to watch manually — SP-API " +
+            "report jobs, 'ping me when this PR is green', 'notify me when the listing becomes " +
+            "active'. Different from schedule_recurring_task because polls self-terminate; " +
+            "different from schedule_reminder because the fire-time agent ACTIVELY runs the " +
+            "check, it's not just a delivery. " +
+            "\n\n" +
+            "Write `check_instruction` as a self-contained instruction for the fire-time agent " +
+            "(no prior conversation context — include every detail the check needs: ASINs, " +
+            "report ids, URLs, expected states). The final delivered message is whatever text " +
+            "the agent passes to mark_poll_done.",
+        parameters: Type.Object({
+            poll_id: Type.String({ description: "Unique id for this poll. Used by mark_poll_done to terminate. Convention: 'poll_<domain>_<timestamp>'." }),
+            every_seconds: Type.Integer({
+                description: "How often to re-run the check, in seconds. Min 10 (avoid tight loops), max 3600 (1h).",
+                minimum: 10,
+                maximum: 3600,
+            }),
+            check_instruction: Type.String({ description: "What the fire-time agent should check. Self-contained — no conversation context available." }),
+            max_attempts: Type.Optional(Type.Integer({
+                description: "Give up after N fires. Default 120 (= 1 hour at 30s cadence). Hard cap to prevent runaway polls.",
+                minimum: 1,
+                maximum: 10000,
+            })),
+            deliver_to: Type.Optional(Type.Object({
+                platform: Type.String({ description: "Platform: 'telegram', 'slack', 'a2a', 'cli'." }),
+                channelId: Type.String({ description: "Platform-specific channel id." }),
+                threadId: Type.Optional(Type.String({ description: "Optional reply-to / thread id." })),
+            }, { description: "Optional override for WHERE the final result is delivered. Defaults to the chat that scheduled the poll." })),
+        }),
+        async execute(_id, params, _signal, _onUpdate, ctx) {
+            if (activeJobs.has(params.poll_id)) {
+                throw new Error(`Poll '${params.poll_id}' already active. Cancel it first or use a different id.`);
+            }
+            // node-schedule supports 6-field cron with seconds in the first
+            // position. "*/<n> * * * * *" fires every n seconds.
+            const cron = `*/${params.every_seconds} * * * * *`;
+            const origin = currentOrigin(ctx.sessionManager);
+            const meta: JobMeta = {
+                job_id: params.poll_id,
+                job_type: "poll",
+                cron,
+                task: params.check_instruction,
+                poll_max_attempts: params.max_attempts ?? 120,
+                poll_attempts: 0,
+                created_at: Date.now(),
+                created_by: origin ? `${origin.platform}:${origin.senderId}` : "cli",
+            };
+            if (params.deliver_to) {
+                meta.deliverTarget = {
+                    platform: params.deliver_to.platform,
+                    channelId: params.deliver_to.channelId,
+                    ...(params.deliver_to.threadId !== undefined ? { threadId: params.deliver_to.threadId } : {}),
+                };
+            }
+            if (origin && origin.platform !== "cli") {
+                meta.originChannel = {
+                    platform: origin.platform,
+                    channelId: origin.channelId,
+                    scheduleId: params.poll_id,
+                };
+            }
+            const sessionFile = ctx.sessionManager.getSessionFile();
+            if (sessionFile) meta.origin_session_file = sessionFile;
+
+            const job = scheduleJob(meta);
+            if (!job) throw new Error(`Invalid cron expression derived from every_seconds=${params.every_seconds}: "${cron}"`);
+            saveJobMeta(meta);
+            const next = job.nextInvocation()?.toString() ?? "(no future invocations)";
+            return {
+                content: [{ type: "text", text: `Poll '${params.poll_id}' scheduled. First check: ${next}. Max ${meta.poll_max_attempts} attempts at ${params.every_seconds}s cadence (= ~${Math.round((meta.poll_max_attempts! * params.every_seconds) / 60)} min). Will terminate when the fire-time agent calls mark_poll_done.` }],
+                details: { poll_id: params.poll_id, cron, every_seconds: params.every_seconds, max_attempts: meta.poll_max_attempts, next_check: next, deliver_to: meta.deliverTarget ?? null },
+            };
+        },
+    });
+
+    pi.registerTool({
+        name: "mark_poll_done",
+        label: "Mark Poll Done",
+        description:
+            "Call this FROM WITHIN a scheduled poll fire when the check's condition is met " +
+            "(or definitively failed). Writes a termination signal the parent scheduler reads " +
+            "on its next tick (usually within seconds). The `final_result` text becomes the " +
+            "user-facing delivered message. " +
+            "\n\n" +
+            "You should ONLY call this during a scheduled poll execution — you'll know because " +
+            "the kickoff message starts with '[SCHEDULED POLL — <poll_id>]'. Calling outside a " +
+            "poll context has no effect beyond writing a stale entry that gets swept.",
+        parameters: Type.Object({
+            poll_id: Type.String({ description: "Exact poll_id from the [SCHEDULED POLL — X] header in your kickoff." }),
+            final_result: Type.String({ description: "The message the user will receive. 1-3 sentences. Concise." }),
+        }),
+        async execute(_id, params) {
+            writePollDone(params.poll_id, params.final_result);
+            return {
+                content: [{ type: "text", text: `Poll ${params.poll_id} marked done. Parent scheduler will deliver "${params.final_result.slice(0, 80)}${params.final_result.length > 80 ? "..." : ""}" and cancel the schedule on its next tick.` }],
+                details: { poll_id: params.poll_id },
             };
         },
     });
