@@ -14,6 +14,7 @@ import { botDir, botSubdir, ensureDir, getBotName } from "./core/paths.js";
 import { getVault } from "./core/vault.js";
 import { getDispatcher } from "./transport/dispatcher.js";
 import { installChannelRouter } from "./transport/channelRouter.js";
+import { maybeStartHealthServer } from "./core/healthServer.js";
 import { CliAdapter } from "./transport/cli.js";
 import { TelegramAdapter } from "./transport/telegram.js";
 import { ensureInitPasscode, isPasscodeConsumed } from "./core/passcode.js";
@@ -191,6 +192,13 @@ async function bootstrap() {
     // chat reports the diagnosed state.
     await startA2A(botName).catch((e: unknown) => {
         logWarning("a2a-bootstrap", `A2A subsystem failed to start`, { err: e instanceof Error ? e.message : String(e) });
+    });
+
+    // External HTTP health endpoint. Opt-in via ORI2_HEALTH_PORT. No port,
+    // no bind — the normal deployment story. Non-fatal on failure: a bound-
+    // port conflict shouldn't crash the bot.
+    await maybeStartHealthServer().catch((e: unknown) => {
+        logWarning("health-server", "health endpoint failed to start", { err: e instanceof Error ? e.message : String(e) });
     });
 
     // Init passcode — one-time chat-based admin claim. Only generated on fresh
