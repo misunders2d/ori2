@@ -175,12 +175,23 @@ export default function (pi: ExtensionAPI) {
             }
 
             // Validate against configured models — reject typos and models
-            // the bot can't actually use (no API key).
+            // the bot can't actually use. Two-layer check:
+            //   1. find() — model exists in the registry at all (rejects typos).
+            //   2. hasConfiguredAuth() — auth is wired for this model, so the
+            //      next subprocess won't fail at runtime with "no API key".
+            //      Verified at pi-coding-agent/dist/core/model-registry.d.ts:64.
             const found = ctx.modelRegistry.find(params.provider, params.model_id);
             if (!found) {
                 throw new Error(
                     `Unknown model: ${params.provider}/${params.model_id}. ` +
                     `Call list_available_models first to see valid options.`,
+                );
+            }
+            if (!ctx.modelRegistry.hasConfiguredAuth(found)) {
+                throw new Error(
+                    `Model ${params.provider}/${params.model_id} exists in the registry but has no ` +
+                    `configured credentials. Add an API key (e.g. /login or set ${params.provider.toUpperCase()}_API_KEY) ` +
+                    `and call list_available_models to confirm it's listed as available.`,
                 );
             }
 

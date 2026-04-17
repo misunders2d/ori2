@@ -28,6 +28,7 @@ interface FakeCtx {
     modelRegistry: {
         find: (p: string, id: string) => { provider: string; id: string; name: string } | undefined;
         getAvailable: () => Array<{ provider: string; id: string; name: string; contextWindow: number; maxTokens: number; reasoning: boolean; input: string[] }>;
+        hasConfiguredAuth: (m: { provider: string; id: string }) => boolean;
     };
     model: undefined | { provider: string; id: string; name: string; contextWindow: number; maxTokens: number; reasoning: boolean; input: string[] };
     hasUI: boolean;
@@ -46,7 +47,11 @@ interface FakeCtx {
 function makeCtx(opts: {
     hasUI: boolean;
     origin?: { platform: string; senderId: string; senderDisplayName?: string; channelId: string };
+    /** Providers considered "authenticated" — hasConfiguredAuth returns true
+     *  for models under these. Defaults to ["anthropic", "google"]. */
+    authenticatedProviders?: string[];
 } = { hasUI: false }): FakeCtx {
+    const authProviders = new Set(opts.authenticatedProviders ?? ["anthropic", "google"]);
     const branch = opts.origin
         ? [{
             type: "custom",
@@ -66,11 +71,15 @@ function makeCtx(opts: {
             find: (p, id) => {
                 if (p === "anthropic" && id === "claude-opus-4-5") return { provider: p, id, name: "Claude Opus 4.5" };
                 if (p === "google" && id === "gemini-3.1-flash") return { provider: p, id, name: "Gemini 3.1 Flash" };
+                // openai model exists in the registry but isn't in authProviders
+                // by default — test fixture for the auth-missing case.
+                if (p === "openai" && id === "gpt-4o") return { provider: p, id, name: "GPT-4o" };
                 return undefined;
             },
             getAvailable: () => [
                 { provider: "anthropic", id: "claude-opus-4-5", name: "Claude Opus 4.5", contextWindow: 200000, maxTokens: 16000, reasoning: true, input: ["text", "image"] },
             ],
+            hasConfiguredAuth: (m) => authProviders.has(m.provider),
         },
         model: { provider: "anthropic", id: "claude-opus-4-5", name: "Claude Opus 4.5", contextWindow: 200000, maxTokens: 16000, reasoning: true, input: ["text", "image"] },
         hasUI: opts.hasUI,
@@ -249,6 +258,25 @@ describe("agent_introspection — set_channel_model target resolution", () => {
                 }, null, null, ctx);
             },
             /Unknown model/,
+        );
+    });
+
+    it("rejects a model that exists in the registry but has no configured credentials", async () => {
+        const tools = await loadTools();
+        const t = tools.find((x) => x.name === "set_channel_model")!;
+        // openai is NOT in authenticatedProviders — find() succeeds but
+        // hasConfiguredAuth() returns false.
+        const ctx = makeCtx({ hasUI: true, authenticatedProviders: ["anthropic", "google"] });
+        await assert.rejects(
+            async () => {
+                await t.execute("call", {
+                    provider: "openai",
+                    model_id: "gpt-4o",
+                    target_platform: "telegram",
+                    target_channel_id: "-100",
+                }, null, null, ctx);
+            },
+            /no configured credentials|OPENAI_API_KEY/i,
         );
     });
 
