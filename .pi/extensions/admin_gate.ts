@@ -111,11 +111,20 @@ export default function (pi: ExtensionAPI) {
 
         if (whitelist.isAllowed(msg.platform, msg.senderId)) return { block: false };
 
+        // Multi-user chat: allow PASSIVE context ingestion from unlisted
+        // senders IF the channel is allowlisted. That lets a group-chat
+        // summary pick up what everyone said without individually
+        // whitelisting every group member. Active mentions still require
+        // a whitelisted sender — random users can't trigger responses.
+        if (!msg.addressedToBot && whitelist.isChannelAllowed(msg.platform, msg.channelId)) {
+            return { block: false };
+        }
+
         // Unrecognized sender. Silent block — don't reply, don't even log
         // verbosely, to avoid amplifying probes. Just a single info log so
         // the admin can `/whitelist add` them later if intended.
         console.log(
-            `[admin_gate] BLOCKED unlisted inbound from ${msg.platform}:${msg.senderId} (${msg.senderDisplayName}) — use /whitelist add ${msg.platform} ${msg.senderId} to permit`,
+            `[admin_gate] BLOCKED unlisted inbound from ${msg.platform}:${msg.senderId} (${msg.senderDisplayName}) in ${msg.channelId} — use /whitelist add ${msg.platform} ${msg.senderId} to permit, or /channel-allow ${msg.platform} ${msg.channelId} for group context`,
         );
         return { block: true, reason: "" }; // empty reason → dispatcher logs but adapter's send-back will not be useful; we want silence here
     });
@@ -382,6 +391,68 @@ export default function (pi: ExtensionAPI) {
             }
 
             ctx.ui.notify("Usage: /whitelist list | add <platform> <senderId> [roles] | remove <platform> <senderId>", "info");
+        },
+    });
+
+    pi.registerCommand("channel-allow", {
+        description:
+            "Manage the channel allowlist for multi-user passive-context ingestion. " +
+            "Allowed channels have all speakers' messages absorbed into per-channel " +
+            "Pi sessions so future @mentions see the conversation. Does NOT grant " +
+            "random speakers the right to trigger responses — that's still per-user. " +
+            "Usage: /channel-allow list | add <platform> <channelId> [note...] | remove <platform> <channelId>",
+        handler: async (args, ctx) => {
+            const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
+            const sub = (parts[0] ?? "list").toLowerCase();
+            const origin = currentOrigin(ctx.sessionManager) ?? inferOriginFromCli(ctx);
+
+            if (sub === "list") {
+                const channels = whitelist.listChannels();
+                if (channels.length === 0) {
+                    ctx.ui.notify("No channels allowlisted. Group chats will be silently ignored until you /channel-allow add them.", "info");
+                    return;
+                }
+                const lines = ["Allowlisted channels (passive context only):", ""];
+                for (const c of channels) {
+                    const note = c.note ? `  (${c.note})` : "";
+                    lines.push(`  ${c.platform}:${c.channelId}${note}  added by ${c.addedBy}`);
+                }
+                ctx.ui.notify(lines.join("\n"), "info");
+                return;
+            }
+
+            if (origin && !whitelist.isAdmin(origin.platform, origin.senderId)) {
+                ctx.ui.notify("Only admins can modify the channel allowlist.", "error");
+                return;
+            }
+
+            if (sub === "add") {
+                const platform = parts[1];
+                const channelId = parts[2];
+                if (!platform || !channelId) {
+                    ctx.ui.notify("Usage: /channel-allow add <platform> <channelId> [note...]", "error");
+                    return;
+                }
+                const note = parts.slice(3).join(" ").trim();
+                const addedBy = origin ? `${origin.platform}:${origin.senderId}` : "unknown";
+                whitelist.allowChannel(platform, channelId, { addedBy, ...(note ? { note } : {}) });
+                ctx.ui.notify(`Allowed ${platform}:${channelId}${note ? ` (${note})` : ""}.`, "info");
+                return;
+            }
+
+            if (sub === "remove") {
+                const platform = parts[1];
+                const channelId = parts[2];
+                if (!platform || !channelId) {
+                    ctx.ui.notify("Usage: /channel-allow remove <platform> <channelId>", "error");
+                    return;
+                }
+                const ok = whitelist.removeChannel(platform, channelId);
+                ctx.ui.notify(ok ? `Removed ${platform}:${channelId}.` : `${platform}:${channelId} not found.`, "info");
+                return;
+            }
+
+            ctx.ui.notify("Usage: /channel-allow list | add <platform> <channelId> [note...] | remove <platform> <channelId>", "info");
         },
     });
 

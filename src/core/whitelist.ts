@@ -54,12 +54,32 @@ interface WhitelistFile {
     version: number;
     updated_at: number;
     users: UserRecord[];
+    /** Channels allowed for passive context ingestion. Optional for file
+     * backwards-compat — older whitelist.json files predate multi-user
+     * chat support. */
+    channels?: ChannelRecord[];
 }
 
 interface BlacklistFile {
     version: number;
     updated_at: number;
     users: BlacklistRecord[];
+}
+
+/**
+ * Per-channel allowlist record. Grants PASSIVE context ingestion to any
+ * speaker in the channel (so group-chat summarization works without
+ * whitelisting every member individually). Does NOT grant response rights
+ * — active mentions still require the sender to pass isAllowed(). See
+ * admin_gate's pre-dispatch hook for the routing matrix.
+ */
+interface ChannelRecord {
+    platform: string;
+    channelId: string;
+    addedBy: string;
+    addedAt: number;
+    /** Optional operator note — "marketing team group", "project X channel". */
+    note?: string;
 }
 
 const FILE_VERSION = 1;
@@ -92,6 +112,7 @@ function atomicWriteJson(file: string, data: unknown): void {
 export class Whitelist {
     private users: Map<string, UserRecord> = new Map();
     private blacklisted: Map<string, BlacklistRecord> = new Map();
+    private channels: Map<string, ChannelRecord> = new Map();
     private loaded = false;
 
     private load(): void {
@@ -119,6 +140,20 @@ export class Whitelist {
                         addedBy: typeof u.addedBy === "string" ? u.addedBy : "unknown",
                         addedAt: typeof u.addedAt === "number" ? u.addedAt : Date.now(),
                     });
+                }
+            }
+            // `channels` is optional (absent in pre-multi-chat files).
+            if (Array.isArray(file.channels)) {
+                for (const c of file.channels) {
+                    if (typeof c.platform === "string" && typeof c.channelId === "string") {
+                        this.channels.set(keyOf(c.platform, c.channelId), {
+                            platform: c.platform,
+                            channelId: c.channelId,
+                            addedBy: typeof c.addedBy === "string" ? c.addedBy : "unknown",
+                            addedAt: typeof c.addedAt === "number" ? c.addedAt : Date.now(),
+                            ...(typeof c.note === "string" ? { note: c.note } : {}),
+                        });
+                    }
                 }
             }
         }
@@ -157,6 +192,7 @@ export class Whitelist {
             version: FILE_VERSION,
             updated_at: Date.now(),
             users: Array.from(this.users.values()),
+            channels: Array.from(this.channels.values()),
         };
         atomicWriteJson(whitelistPath(), data);
     }
@@ -356,11 +392,56 @@ export class Whitelist {
         return removed;
     }
 
+    // ------------- channel allowlist -------------
+    //
+    // Channels allowed for PASSIVE context ingestion: the bot silently reads
+    // every message in the channel into the channel's session JSONL so future
+    // mentions have context. Channel allowance does NOT grant the right to
+    // trigger responses — that's still gated by the per-user whitelist.
+
+    isChannelAllowed(platform: string, channelId: string): boolean {
+        this.load();
+        return this.channels.has(keyOf(platform, channelId));
+    }
+
+    allowChannel(
+        platform: string,
+        channelId: string,
+        opts: { addedBy: string; note?: string },
+    ): ChannelRecord {
+        this.load();
+        const existing = this.channels.get(keyOf(platform, channelId));
+        const record: ChannelRecord = {
+            platform,
+            channelId,
+            addedBy: existing?.addedBy ?? opts.addedBy,
+            addedAt: existing?.addedAt ?? Date.now(),
+            ...(opts.note !== undefined ? { note: opts.note } :
+                existing?.note !== undefined ? { note: existing.note } : {}),
+        };
+        this.channels.set(keyOf(platform, channelId), record);
+        this.saveWhitelist();
+        return record;
+    }
+
+    removeChannel(platform: string, channelId: string): boolean {
+        this.load();
+        const removed = this.channels.delete(keyOf(platform, channelId));
+        if (removed) this.saveWhitelist();
+        return removed;
+    }
+
+    listChannels(): ChannelRecord[] {
+        this.load();
+        return Array.from(this.channels.values());
+    }
+
     /** Test-only. */
     reset(): void {
         this.loaded = false;
         this.users.clear();
         this.blacklisted.clear();
+        this.channels.clear();
     }
 }
 

@@ -261,3 +261,82 @@ describe("Whitelist allRoles", () => {
         assert.ok(r.includes("bigquery-readers"));
     });
 });
+
+describe("Whitelist channel allowlist", () => {
+    it("isChannelAllowed returns false for an unlisted channel", () => {
+        const w = new Whitelist();
+        assert.equal(w.isChannelAllowed("telegram", "-100abc"), false);
+    });
+
+    it("allowChannel then isChannelAllowed round-trips", () => {
+        const w = new Whitelist();
+        const rec = w.allowChannel("telegram", "-100abc", {
+            addedBy: "telegram:alice",
+            note: "marketing team group",
+        });
+        assert.equal(rec.platform, "telegram");
+        assert.equal(rec.channelId, "-100abc");
+        assert.equal(rec.note, "marketing team group");
+        assert.equal(w.isChannelAllowed("telegram", "-100abc"), true);
+    });
+
+    it("channel allowance is per-platform (same id on two platforms is two records)", () => {
+        const w = new Whitelist();
+        w.allowChannel("telegram", "chan-X", { addedBy: "t" });
+        assert.equal(w.isChannelAllowed("telegram", "chan-X"), true);
+        assert.equal(w.isChannelAllowed("slack", "chan-X"), false);
+    });
+
+    it("removeChannel returns true once, then false", () => {
+        const w = new Whitelist();
+        w.allowChannel("telegram", "-100", { addedBy: "t" });
+        assert.equal(w.removeChannel("telegram", "-100"), true);
+        assert.equal(w.removeChannel("telegram", "-100"), false);
+        assert.equal(w.isChannelAllowed("telegram", "-100"), false);
+    });
+
+    it("listChannels enumerates all allowed channels", () => {
+        const w = new Whitelist();
+        w.allowChannel("telegram", "-100", { addedBy: "t" });
+        w.allowChannel("slack", "C-123", { addedBy: "t", note: "ops" });
+        const list = w.listChannels();
+        assert.equal(list.length, 2);
+        const keys = list.map((c) => `${c.platform}:${c.channelId}`).sort();
+        assert.deepEqual(keys, ["slack:C-123", "telegram:-100"]);
+    });
+
+    it("allowChannel persists and is reloaded by a fresh instance", () => {
+        const w1 = new Whitelist();
+        w1.allowChannel("telegram", "-100", { addedBy: "t", note: "demo" });
+
+        const w2 = new Whitelist();
+        assert.equal(w2.isChannelAllowed("telegram", "-100"), true);
+        assert.equal(w2.listChannels()[0]!.note, "demo");
+    });
+
+    it("channel allowance is independent of user allowance", () => {
+        // Allowing a channel does NOT implicitly whitelist its members.
+        const w = new Whitelist();
+        w.allowChannel("telegram", "-100", { addedBy: "t" });
+        assert.equal(w.isChannelAllowed("telegram", "-100"), true);
+        assert.equal(w.isAllowed("telegram", "some-random-user"), false);
+    });
+
+    it("loading an old whitelist.json without 'channels' key does not throw", () => {
+        // Simulate pre-multi-chat file format: users array only.
+        const oldFile = {
+            version: 1,
+            updated_at: Date.now(),
+            users: [
+                { platform: "telegram", senderId: "alice", roles: ["admin"], addedBy: "t", addedAt: Date.now() },
+            ],
+        };
+        const path = `${TEST_DIR}/whitelist.json`;
+        fs.mkdirSync(TEST_DIR, { recursive: true });
+        fs.writeFileSync(path, JSON.stringify(oldFile));
+
+        const w = new Whitelist();
+        assert.equal(w.isAllowed("telegram", "alice"), true);
+        assert.deepEqual(w.listChannels(), []);
+    });
+});
