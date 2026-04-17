@@ -138,13 +138,33 @@ function toArray(v: unknown): number[] {
     return [];
 }
 
-class GuardrailEmbedder {
+export class GuardrailEmbedder {
     private backend: Backend;
     private corpusVectors: number[][] = [];
     private corpusReady = false;
     private initPromise: Promise<void> | null = null;
 
     constructor(backend: Backend) { this.backend = backend; }
+
+    /**
+     * Test-only: seed corpus vectors and force-ready state, bypassing the
+     * file/remote init that would otherwise require a 130MB fastembed model
+     * download. Callers supply the query-embedding stub via `queryEmbedStub`
+     * so tests don't need an embedding API at all.
+     */
+    static forTests(opts: {
+        corpusVectors: number[][];
+        queryEmbedStub: (text: string) => Promise<number[]>;
+    }): GuardrailEmbedder {
+        const e = new GuardrailEmbedder("local");
+        e.corpusVectors = opts.corpusVectors;
+        e.corpusReady = true;
+        e.initPromise = Promise.resolve();
+        // Override queryEmbed on this instance (not the prototype) so other
+        // instances in the same process are unaffected.
+        (e as unknown as { queryEmbed: (text: string) => Promise<number[]> }).queryEmbed = opts.queryEmbedStub;
+        return e;
+    }
 
     async ensureReady(): Promise<void> {
         if (this.corpusReady) return;
@@ -254,8 +274,18 @@ class GuardrailEmbedder {
     backendName(): Backend { return this.backend; }
 }
 
+/**
+ * Test-only: override the embedder the default-export factory will use.
+ * Set BEFORE invoking the factory, clear to null when done. Do NOT use in
+ * production code — this module isn't re-entrant-safe.
+ */
+let _embedderOverride: GuardrailEmbedder | null = null;
+export function __setEmbedderForTests(e: GuardrailEmbedder | null): void {
+    _embedderOverride = e;
+}
+
 export default function (pi: ExtensionAPI) {
-    const embedder = new GuardrailEmbedder(pickBackend());
+    const embedder = _embedderOverride ?? new GuardrailEmbedder(pickBackend());
 
     // Kick off corpus embedding eagerly on session start so the first user
     // message doesn't pay the model-download + corpus-embed cost. If init
