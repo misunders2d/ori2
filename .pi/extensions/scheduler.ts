@@ -206,14 +206,34 @@ function makeRunsDir(): string {
 // than this reference, so rehydrated jobs still target the correct session
 // even if the TUI is on a different session when they fire.
 // Pi's ExtensionContext exposes `sessionManager: ReadonlySessionManager` —
-// a Pick<> of read-only methods (getBranch, getSessionFile, ...) without
-// the write-side API (appendCustomMessageEntry etc.). ReadonlySessionManager
-// isn't re-exported from the package root (only SessionManager is), so we
-// use a structural type here — same trick src/core/identity.ts uses. We
-// only need the session FILE PATH from this reference; for writes we open
-// a SessionManager on that path.
+// a Pick<> of read-only methods at COMPILE time. At RUNTIME the underlying
+// object is the full SessionManager instance (Pi constructs one, then
+// exposes it via a narrowed type at the extension boundary).
+//
+// We need two things from this reference:
+//   - getSessionFile() — read-only, always safe.
+//   - appendCustomMessageEntry() — needed for LIVE-TUI delivery. If we
+//     SessionManager.open(file) from a stale disk read, we get a fresh
+//     instance the TUI's event subscribers don't know about — writes
+//     persist to disk but the live TUI never rerenders. Writing via the
+//     SAME SessionManager instance the TUI owns does trigger rerender.
+//     The type narrowing is there to discourage random write access; the
+//     cast here is intentional and documented.
+//
+// Runtime-shape verified: pi-coding-agent/dist/core/session-manager.js
+// exports SessionManager; ReadonlySessionManager (line 136) is literally
+// `Pick<SessionManager, "getCwd" | ... | "getSessionName">` — same object,
+// fewer visible methods.
 interface LiveSessionHandle {
     getSessionFile(): string | undefined;
+    /** Runtime-only — ReadonlySessionManager narrows this out at compile
+     *  time, but the underlying object has it. See module header. */
+    appendCustomMessageEntry?: <T = unknown>(
+        customType: string,
+        content: string,
+        display: boolean,
+        details?: T,
+    ) => string;
 }
 let liveSessionManager: LiveSessionHandle | null = null;
 
@@ -293,34 +313,61 @@ async function deliverAndAppend(meta: JobMeta, responseText: string): Promise<vo
     }
 
     // 2) Append to the session so next-turn LLM context has the event.
-    //    Priority: explicit target sessionFile > origin_session_file >
-    //    liveSessionManager.getSessionFile() (current running TUI session,
-    //    best-effort). All three paths resolve to a file path, then we open
-    //    a writable SessionManager on it — the ReadonlySessionManager we
-    //    get from ExtensionContext doesn't expose writes.
-    const sessionFile =
+    //    Priority: explicit target.sessionFile > origin_session_file >
+    //    liveSessionManager.getSessionFile().
+    //
+    //    KEY RULE: if the resolved file matches the TUI's CURRENT live
+    //    session, write via liveSessionManager (the TUI's own instance)
+    //    so the TUI's event subscribers see the append and rerender.
+    //    Pre-fix: we always did SessionManager.open(file).appendX, which
+    //    persists to disk but creates a FRESH instance the TUI never
+    //    observes — reminders landed in the jsonl but the user never saw
+    //    them pop up. Confirmed live 2026-04-17 with TUI reminders.
+    const resolvedFile =
         target?.sessionFile ??
         meta.origin_session_file ??
         liveSessionManager?.getSessionFile();
-    if (!sessionFile || !fs.existsSync(sessionFile)) return;
-    try {
-        const sm = SessionManager.open(sessionFile);
-        sm.appendCustomMessageEntry(
-            "scheduler-delivery",
-            responseText,
-            true, // display in TUI + participates in LLM context
-            {
+    if (!resolvedFile) return;
+
+    const liveFile = liveSessionManager?.getSessionFile();
+    const details = {
+        job_id: meta.job_id,
+        job_type: meta.job_type,
+        fired_at: Date.now(),
+        target: target ?? null,
+    };
+
+    // Live TUI session case — append via the operator's own SessionManager.
+    if (liveFile === resolvedFile && typeof liveSessionManager?.appendCustomMessageEntry === "function") {
+        try {
+            liveSessionManager.appendCustomMessageEntry(
+                "scheduler-delivery",
+                responseText,
+                true, // display=true → the TUI renders this entry visibly
+                details,
+            );
+            return;
+        } catch (e) {
+            // Fall through to disk-open path — at least the entry persists.
+            logWarning("scheduler", "live-session append failed, falling back to disk", {
+                err: e instanceof Error ? e.message : String(e),
                 job_id: meta.job_id,
-                job_type: meta.job_type,
-                fired_at: Date.now(),
-                target: target ?? null,
-            },
-        );
+            });
+        }
+    }
+
+    // Fallback: non-live or live-append failed. Append via a fresh
+    // SessionManager.open(file); contents persist but may not trigger a
+    // rerender if the target is a different in-memory session.
+    if (!fs.existsSync(resolvedFile)) return;
+    try {
+        const sm = SessionManager.open(resolvedFile);
+        sm.appendCustomMessageEntry("scheduler-delivery", responseText, true, details);
     } catch (e) {
         logError("scheduler", "session append failed", {
             err: e instanceof Error ? e.message : String(e),
             job_id: meta.job_id,
-            sessionFile,
+            sessionFile: resolvedFile,
         });
     }
 }
@@ -477,7 +524,9 @@ async function fireJob(meta: JobMeta, manualTrigger = false): Promise<void> {
         ["pi", "-p", kickoff, "--session", sessionFile],
         {
             cwd: process.cwd(),
-            env: process.env,
+            // ORI2_SCHEDULER_SUBPROCESS=1 tells the child's scheduler
+            // extension to skip rehydration (parent owns the jobs dir).
+            env: { ...process.env, ORI2_SCHEDULER_SUBPROCESS: "1" },
             stdio: ["ignore", "pipe", "pipe"],
             detached: false,
         },
@@ -566,6 +615,18 @@ export default function (pi: ExtensionAPI) {
     // longer exists, the fallback path uses the current live session.
     pi.on("session_start", async (_event, ctx) => {
         liveSessionManager = ctx.sessionManager;
+
+        // Subprocess guard: every `pi -p` child auto-loads .pi/extensions/
+        // including this scheduler, and without this check the subprocess
+        // would rehydrate the parent's jobs dir into its OWN node-schedule
+        // instance — wasted work + small risk of double-firing if the
+        // subprocess lives past a cron tick. Our scheduler.fireJob and
+        // channelRouter.realSpawnPiPrint both set ORI2_SCHEDULER_SUBPROCESS=1
+        // when spawning children so this branch fires.
+        if (process.env["ORI2_SCHEDULER_SUBPROCESS"] === "1") {
+            return;
+        }
+
         if (activeJobs.size > 0) return; // already loaded — don't double-register
         const all = loadAllJobMeta();
         for (const meta of all) {

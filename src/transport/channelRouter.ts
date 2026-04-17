@@ -239,7 +239,11 @@ const realSpawnPiPrint: SpawnPiPrint = (kickoff, sessionFile, extraArgs, signal)
             ["pi", "-p", kickoff, "--session", sessionFile, ...extraArgs],
             {
                 cwd: process.cwd(),
-                env: process.env,
+                // ORI2_SCHEDULER_SUBPROCESS=1 prevents the child's scheduler
+                // extension from rehydrating the parent's jobs dir into its
+                // own node-schedule. Parent owns job lifecycle; subprocesses
+                // are just transient executors. See scheduler.ts session_start.
+                env: { ...process.env, ORI2_SCHEDULER_SUBPROCESS: "1" },
                 stdio: ["ignore", "pipe", "pipe"],
                 detached: false,
             },
