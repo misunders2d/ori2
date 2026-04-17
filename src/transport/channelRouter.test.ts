@@ -197,6 +197,36 @@ describe("channelRouter — active path", () => {
         assert.equal(tg.sent.length, 1);
         assert.equal(tg.sent[0]!.response.replyToMessageId, "msg-321");
     });
+
+    it("seeds a transport-origin CustomEntry before spawning so subprocess sees the sender", async () => {
+        const d = TransportDispatcher.instance();
+        const tg = new FakeAdapter("telegram");
+        d.register(tg);
+
+        // Capture the session file state at the moment spawn is called —
+        // that's the frozen state the subprocess would load.
+        let sessionStateAtSpawn = "";
+        installChannelRouter(async (_kickoff, sessionFile) => {
+            if (fs.existsSync(sessionFile)) sessionStateAtSpawn = fs.readFileSync(sessionFile, "utf-8");
+            return { stdout: "ok", stderr: "", exitCode: 0 };
+        });
+
+        await tg.simulateInbound(baseMsg({
+            senderId: "42",
+            senderDisplayName: "Alice",
+            threadId: "msg-9",
+        }));
+        await __drainChannelLocksForTests();
+
+        assert.ok(sessionStateAtSpawn.length > 0, "session file must be written before spawn so subprocess can read origin");
+        const entries = sessionStateAtSpawn.trim().split("\n").map((l) => JSON.parse(l));
+        const originEntry = entries.find((e) => e.type === "custom" && e.customType === "transport-origin");
+        assert.ok(originEntry, "transport-origin CustomEntry should be appended");
+        assert.equal(originEntry.data.platform, "telegram");
+        assert.equal(originEntry.data.senderId, "42");
+        assert.equal(originEntry.data.senderDisplayName, "Alice");
+        assert.equal(originEntry.data.threadId, "msg-9");
+    });
 });
 
 describe("channelRouter — per-channel serialization", () => {

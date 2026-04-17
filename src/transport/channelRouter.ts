@@ -200,6 +200,37 @@ const realSpawnPiPrint: SpawnPiPrint = (kickoff, sessionFile) =>
 
 async function doActiveResponse(msg: Message, spawnFn: SpawnPiPrint): Promise<void> {
     const sessionFile = getChannelSessions().getOrCreateSessionFile(msg.platform, msg.channelId);
+
+    // Seed a transport-origin CustomEntry before spawning so that tools in
+    // the subprocess can call currentOrigin() and learn who this active turn
+    // came from (e.g. schedule_reminder needs deliverTarget; admin_gate
+    // checks msg origin against the whitelist). Without this, the channel
+    // session has only `chat-context` CustomMessageEntries with embedded
+    // sender attribution in text — not machine-readable, and not at the
+    // type the identity helper looks for (see src/core/identity.ts).
+    try {
+        const sm = SessionManager.open(sessionFile);
+        sm.appendCustomEntry("transport-origin", {
+            platform: msg.platform,
+            channelId: msg.channelId,
+            ...(msg.threadId !== undefined ? { threadId: msg.threadId } : {}),
+            senderId: msg.senderId,
+            senderDisplayName: msg.senderDisplayName,
+            timestamp: msg.timestamp,
+        });
+        persistSessionNow(sm, sessionFile);
+    } catch (e) {
+        // Seeding origin is best-effort — spawn proceeds even if it fails.
+        // Worst case: subprocess tools fall back to CLI origin, which still
+        // works for the common summarization path (no tools that need the
+        // per-message origin are invoked).
+        logWarning("channelRouter", "transport-origin seed failed — proceeding", {
+            err: e instanceof Error ? e.message : String(e),
+            platform: msg.platform,
+            channelId: msg.channelId,
+        });
+    }
+
     const kickoff = formatActiveKickoff(msg);
 
     const result = await spawnFn(kickoff, sessionFile);

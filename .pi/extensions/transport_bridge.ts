@@ -7,29 +7,39 @@ import { logError } from "../../src/core/errorLog.js";
 import { findPlanSessionByThread, writeAbortControlFile } from "./plan_enforcer.js";
 
 // =============================================================================
-// transport_bridge — Pi-side glue for the transport abstraction.
+// transport_bridge — CLI glue + admin plumbing for the transport abstraction.
 //
-// The dispatcher (src/transport/dispatcher.ts) is created during bootstrap
-// BEFORE Pi starts. It needs two Pi-only capabilities:
+// SCOPE (post multi-chat refactor):
+//   Dispatcher routes non-CLI inbound to channelRouter (subprocess-per-mention
+//   for active, SessionManager.open+appendCustomMessageEntry for passive).
+//   This bridge now only handles CLI messages — the TUI operator's session.
 //
-//   1. pushToPi(msg) — turn an inbound Message into something Pi will run.
-//      Done with `pi.sendUserMessage(text, { deliverAs: "followUp" })`.
-//      We embed sender/platform/timestamp metadata as a header so the agent
-//      knows who is talking even in single-session multi-user scenarios.
+// Responsibilities in this file:
 //
-//   2. originating-platform tracking — when an inbound message arrives from
-//      Telegram, the agent's response should go back to Telegram, not to
-//      the CLI. We tag the session with the originating (platform, channelId)
-//      via a custom session entry on each inbound, then on `agent_end` send
-//      the response back to the right adapter.
+//   1. pushToPi(msg) for CLI messages. Turns a CLI inbound Message into
+//      `pi.sendUserMessage(body, { deliverAs: "followUp" })`. The body
+//      includes a metadata header so the agent knows who is speaking even
+//      when the CLI has multiple OS-users SSHed in. Only called for
+//      msg.platform === "cli" (dispatcher enforces this — see
+//      src/transport/dispatcher.ts routing comment).
 //
-// SCOPE FOR SPRINT 3:
-//   - pushToPi: implemented. Uses a metadata-header convention.
-//   - originating-platform tracking: implemented as a closure variable
-//     (last-inbound-wins). This works because the CLI is the only inbound
-//     today and it always re-tags. Sprint 4 (Telegram + multi-session)
-//     will replace this with proper per-session tracking.
-//   - /transports slash command: implemented for admin visibility.
+//   2. transport-origin CustomEntry tagging for the CLI session. On each
+//      CLI inbound we append `{platform, channelId, senderId, ...}` via
+//      pi.appendEntry — src/core/identity.ts reads these to answer
+//      "who is talking right now?" for tool ACL and audit.
+//
+//   3. agent_end → dispatcher.send routing. When the CLI session finishes
+//      a turn, the TUI already rendered the response; we deliberately
+//      skip re-sending via the CliAdapter to avoid double-render. For
+//      non-CLI lastOrigin this branch is now dead (non-CLI never reaches
+//      pushToPi), kept as defensive skip.
+//
+//   4. abortDetectorHook — pre-dispatch hook catching admin "@bot abort"
+//      replies in plan threads. Runs for ALL inbound (including Telegram
+//      groups), BEFORE the routing branch, so a group-mention abort from
+//      an admin is intercepted and doesn't spawn a subprocess.
+//
+//   5. /transports and /connect-telegram slash commands.
 // =============================================================================
 
 const ENTRY_TYPE = "transport-origin";
