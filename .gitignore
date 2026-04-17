@@ -20,7 +20,7 @@ build/
 *.tsbuildinfo
 
 # Shared caches (fastembed model weights, etc.) — repo-local, not per-bot,
-# populated by scripts/postinstall-prewarm.js.
+# populated by scripts/postinstall-prewarm.cjs.
 .cache/
 
 # OS Files

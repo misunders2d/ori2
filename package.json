@@ -4,8 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "postinstall": "node scripts/postinstall-prewarm.js",
-    "prewarm": "node scripts/postinstall-prewarm.js",
+    "postinstall": "node scripts/postinstall-prewarm.cjs",
+    "prewarm": "node scripts/postinstall-prewarm.cjs",
     "test": "node --import tsx --test --test-reporter=spec $(find src -type f -name '*.test.ts')",
     "start": "tsx src/index.ts"
   },

@@ -12,7 +12,7 @@ import { ensureDir, sharedCacheDir } from "./paths.js";
 // On-disk model cache lives at <project>/.cache/fastembed/ — shared across
 // every bot in the same checkout (the model is identical regardless of bot
 // name) and across guardrails/memory within one process. `npm install` runs
-// scripts/postinstall-prewarm.js which pre-downloads the ~130MB ONNX weights
+// scripts/postinstall-prewarm.cjs which pre-downloads the ~130MB ONNX weights
 // here so the first chat message isn't blocked on the download. Skip the
 // prewarm with FASTEMBED_SKIP_PREWARM=1 at install time.
 //
