@@ -3,6 +3,7 @@ import { getDispatcher } from "../../src/transport/dispatcher.js";
 import type { Message } from "../../src/transport/types.js";
 import { getVault } from "../../src/core/vault.js";
 import { getWhitelist } from "../../src/core/whitelist.js";
+import { logError } from "../../src/core/errorLog.js";
 import { findPlanSessionByThread, writeAbortControlFile } from "./plan_enforcer.js";
 
 // =============================================================================
@@ -165,7 +166,7 @@ export default function (pi: ExtensionAPI) {
                 ...(lastOrigin.threadId !== undefined ? { replyToMessageId: lastOrigin.threadId } : {}),
             });
         } catch (e) {
-            console.error(`[transport_bridge] failed to send response back to ${lastOrigin.platform}:`, e);
+            logError("transport_bridge", `failed to send response back to ${lastOrigin.platform}`, { err: e instanceof Error ? e.message : String(e), platform: lastOrigin.platform, channelId: lastOrigin.channelId });
         }
     });
 

@@ -75,7 +75,11 @@ async function notifyOriginatingChannel(
     try {
         await dispatcher.send(originPlatform, originChannelId, { text });
     } catch (e) {
-        console.error(`[oauth] failed to notify ${originPlatform}:${originChannelId}:`, e);
+        // Use dynamic require — the oauth extension loads early and this is
+        // only reached at OAuth completion/failure, so no perf concern.
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const { logError } = require("../../src/core/errorLog.js") as typeof import("../../src/core/errorLog.js");
+        logError("oauth", `failed to notify ${originPlatform}:${originChannelId}`, { err: e instanceof Error ? e.message : String(e) });
     }
 }
 

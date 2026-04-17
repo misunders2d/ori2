@@ -180,6 +180,17 @@ export class OAuthSlowDown extends OAuthError {
 export class OAuthService {
     private platforms: Map<string, OAuthPlatformConfig> = new Map();
     private tokens: Map<string, OAuthTokens> = new Map();
+
+    /**
+     * Drop in-memory caches so the next public-method call re-reads from disk.
+     * Useful after `/reload` or when tests prime the data dir externally.
+     */
+    reload(): void {
+        this.platforms.clear();
+        this.tokens.clear();
+        this.platformsLoaded = false;
+        this.tokensLoaded = false;
+    }
     private platformsLoaded = false;
     private tokensLoaded = false;
 

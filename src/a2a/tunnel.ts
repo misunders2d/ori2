@@ -1,5 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { writeHeartbeat } from "../core/heartbeat.js";
+import { logError, logWarning } from "../core/errorLog.js";
 
 // =============================================================================
 // Cloudflared tunnel manager.
@@ -53,6 +55,7 @@ export class TunnelManager extends EventEmitter {
     private restartAttempt = 0;
     private restartTimer: NodeJS.Timeout | null = null;
     private stopped = true;
+    private heartbeatTimer: NodeJS.Timeout | null = null;
 
     constructor(opts: TunnelOptions) {
         super();
@@ -112,6 +115,7 @@ export class TunnelManager extends EventEmitter {
 
     async stop(): Promise<void> {
         this.stopped = true;
+        this.stopHeartbeatTimer();
         if (this.restartTimer) {
             clearTimeout(this.restartTimer);
             this.restartTimer = null;
@@ -157,9 +161,12 @@ export class TunnelManager extends EventEmitter {
             this.currentUrl = url;
             if (isFirst) {
                 this.restartAttempt = 0; // success — reset the backoff
+                writeHeartbeat("tunnel", `url=${url}`);
+                this.startHeartbeatTimer();
                 this.emit("url-ready", url);
             } else if (changed) {
                 this.restartAttempt = 0;
+                writeHeartbeat("tunnel", `url=${url} (rotated)`);
                 this.emit("url-changed", url);
             }
         };
@@ -173,7 +180,13 @@ export class TunnelManager extends EventEmitter {
         proc.stderr?.on("data", lineBuffer); // cloudflared logs to stderr too
         proc.once("exit", (code, signal) => {
             this.child = null;
+            this.stopHeartbeatTimer();
             if (this.stopped) return; // operator-initiated shutdown
+            logWarning("a2a-tunnel", "cloudflared exited unexpectedly", {
+                code: code ?? null,
+                signal: signal ?? null,
+                restartAttempt: this.restartAttempt + 1,
+            });
             this.emit(
                 "error",
                 new Error(`cloudflared exited (code=${code ?? "null"}, signal=${signal ?? "none"})`),
@@ -181,9 +194,31 @@ export class TunnelManager extends EventEmitter {
             this.scheduleRestart();
         });
         proc.once("error", (e) => {
+            logError("a2a-tunnel", "cloudflared process error", { err: e.message });
             this.emit("error", e);
             // exit will follow; restart scheduled there.
         });
+    }
+
+    private startHeartbeatTimer(): void {
+        if (this.heartbeatTimer) return;
+        // Periodic heartbeat while the tunnel is believed alive — lets the
+        // health aggregator distinguish "haven't polled yet" from "tunnel is
+        // wedged" for bots with no inbound traffic.
+        this.heartbeatTimer = setInterval(() => {
+            if (this.child && !this.stopped && this.currentUrl) {
+                writeHeartbeat("tunnel", `url=${this.currentUrl}`);
+            }
+        }, 30_000);
+        // Don't keep the event loop alive just for the heartbeat ticker.
+        this.heartbeatTimer.unref?.();
+    }
+
+    private stopHeartbeatTimer(): void {
+        if (this.heartbeatTimer) {
+            clearInterval(this.heartbeatTimer);
+            this.heartbeatTimer = null;
+        }
     }
 
     private scheduleRestart(): void {

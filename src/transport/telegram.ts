@@ -2,6 +2,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { botSubdir, ensureDir } from "../core/paths.js";
 import { getVault } from "../core/vault.js";
+import { writeHeartbeat } from "../core/heartbeat.js";
+import { logError, logWarning } from "../core/errorLog.js";
 import { fileToPayload, type MediaSaveContext } from "./media.js";
 import type {
     AdapterStatus,
@@ -234,6 +236,9 @@ export class TelegramAdapter implements TransportAdapter {
                     timeout: POLL_TIMEOUT_SECS,
                     allowed_updates: ["message", "edited_message"],
                 }, signal);
+                // Successful long-poll cycle — heartbeat regardless of update
+                // count, so an idle bot still proves liveness every ~30s.
+                writeHeartbeat("telegram", `offset=${this.offset} updates=${updates.length}`);
                 for (const update of updates) {
                     if (update.update_id >= this.offset) this.offset = update.update_id + 1;
                     const msg = update.message ?? update.edited_message;
@@ -241,13 +246,13 @@ export class TelegramAdapter implements TransportAdapter {
                     try {
                         await this.handleIncoming(token, msg);
                     } catch (e) {
-                        console.error("[telegram] handleIncoming failed:", e);
+                        logError("telegram", "handleIncoming failed", { err: e instanceof Error ? e.message : String(e) });
                     }
                 }
                 this.saveOffset();
             } catch (e) {
                 if (signal.aborted) return;
-                console.error("[telegram] poll error (will retry):", e instanceof Error ? e.message : e);
+                logWarning("telegram", "poll error (will retry)", { err: e instanceof Error ? e.message : String(e) });
                 // Short backoff before retry.
                 await sleep(2000, signal);
             }

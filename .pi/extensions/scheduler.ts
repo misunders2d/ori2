@@ -9,6 +9,7 @@ import { botSubdir, ensureDir } from "../../src/core/paths.js";
 import { currentOrigin } from "../../src/core/identity.js";
 import { getWhitelist } from "../../src/core/whitelist.js";
 import { seedPlan, recordPlanThread, type OriginChannel } from "./plan_enforcer.js";
+import { logError, logWarning } from "../../src/core/errorLog.js";
 
 // =============================================================================
 // scheduler — per-fire fresh-session model.
@@ -94,7 +95,7 @@ function loadAllJobMeta(): JobMeta[] {
                 });
             }
         } catch (e) {
-            console.error(`[scheduler] corrupt job file ${f}: ${e instanceof Error ? e.message : String(e)}`);
+            logWarning("scheduler", `corrupt job file ${f}`, { err: e instanceof Error ? e.message : String(e) });
         }
     }
     return out;
@@ -131,12 +132,12 @@ async function fireJob(meta: JobMeta, manualTrigger = false): Promise<void> {
     try {
         sm = SessionManager.create(makeRunsDir());
     } catch (e) {
-        console.error(`[scheduler] failed to create session for ${meta.job_id}: ${e instanceof Error ? e.message : String(e)}`);
+        logError("scheduler", `failed to create session for ${meta.job_id}`, { err: e instanceof Error ? e.message : String(e), job_id: meta.job_id });
         return;
     }
     const sessionFile = sm.getSessionFile();
     if (!sessionFile) {
-        console.error(`[scheduler] SessionManager.create() returned no file path for ${meta.job_id}`);
+        logError("scheduler", `SessionManager.create() returned no file path`, { job_id: meta.job_id });
         return;
     }
 
@@ -169,7 +170,7 @@ async function fireJob(meta: JobMeta, manualTrigger = false): Promise<void> {
                 ...(origin.scheduleId !== undefined ? { scheduleId: origin.scheduleId } : {}),
             });
         } catch (e) {
-            console.error(`[scheduler] seedPlan failed for ${meta.job_id}: ${e instanceof Error ? e.message : String(e)}`);
+            logError("scheduler", `seedPlan failed for ${meta.job_id}`, { err: e instanceof Error ? e.message : String(e), job_id: meta.job_id });
             return;
         }
     }
@@ -205,7 +206,7 @@ async function fireJob(meta: JobMeta, manualTrigger = false): Promise<void> {
         console.log(`[scheduler] [${trigger}] ${meta.job_id} subprocess exit code=${code} session=${sessionFile}`);
     });
     proc.on("error", (e) => {
-        console.error(`[scheduler] [${trigger}] ${meta.job_id} subprocess error: ${e.message}`);
+        logError("scheduler", `${meta.job_id} subprocess error (${trigger})`, { err: e.message, job_id: meta.job_id, trigger });
     });
 }
 
@@ -237,7 +238,7 @@ export default function (pi: ExtensionAPI) {
             if (job) {
                 console.log(`[scheduler] rehydrated ${meta.job_id} (cron="${meta.cron}", next=${job.nextInvocation()?.toString() ?? "n/a"})`);
             } else {
-                console.error(`[scheduler] failed to rehydrate ${meta.job_id} — invalid cron "${meta.cron}"?`);
+                logWarning("scheduler", `failed to rehydrate job — invalid cron?`, { job_id: meta.job_id, cron: meta.cron });
             }
         }
         if (all.length > 0) {

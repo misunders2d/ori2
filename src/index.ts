@@ -21,6 +21,8 @@ import { getA2AAdapter } from "./a2a/adapter.js";
 import { setA2AServerHandle, startA2AServer, type A2AServerHandle } from "./a2a/server.js";
 import { TunnelManager, type TunnelMode } from "./a2a/tunnel.js";
 import { broadcastAddressUpdate } from "./a2a/broadcaster.js";
+import { logError, logWarning } from "./core/errorLog.js";
+import { startProactiveDiagnostics } from "./core/proactiveDiagnostics.js";
 
 // .env carries non-secret runtime config only (BOT_NAME, PRIMARY_PROVIDER,
 // REQUIRE_2FA, GUARDRAIL_EMBEDDINGS). Secrets live in the vault.
@@ -114,7 +116,7 @@ async function bootstrap() {
     const startResult = await dispatcher.startAll();
     if (startResult.failed.length > 0) {
         for (const f of startResult.failed) {
-            console.error(`❌ Transport adapter [${f.platform}] failed to start: ${f.error}`);
+            logError("bootstrap", `Transport adapter [${f.platform}] failed to start`, { platform: f.platform, err: f.error });
         }
     }
 
@@ -126,7 +128,7 @@ async function bootstrap() {
     // here logs loudly but never kills the rest of the bot. /a2a status from
     // chat reports the diagnosed state.
     await startA2A(botName).catch((e: unknown) => {
-        console.error(`⚠️  A2A subsystem failed to start: ${e instanceof Error ? e.message : String(e)}`);
+        logWarning("a2a-bootstrap", `A2A subsystem failed to start`, { err: e instanceof Error ? e.message : String(e) });
     });
 
     // Init passcode — one-time chat-based admin claim. Only generated on fresh
@@ -151,6 +153,11 @@ async function bootstrap() {
     }
 
     console.log(`🔐 Vault Entries: ${getVault().list().length} (keys-only enumeration; values not logged)`);
+
+    // Proactive diagnostics — periodic health checks with admin DM on
+    // degradation. Non-fatal if misconfigured.
+    try { startProactiveDiagnostics(); }
+    catch (e) { logWarning("bootstrap", "failed to start proactive diagnostics", { err: e instanceof Error ? e.message : String(e) }); }
 
     // Guardrails: defaults to local fastembed (no API key required). The
     // .pi/extensions/guardrails.ts extension does the actual embed/check.
@@ -352,7 +359,7 @@ async function startA2A(botName: string): Promise<void> {
         void broadcastAddressUpdate({ senderName: botName, newBaseUrl: url });
     });
     tunnel.on("error", (e: Error) => {
-        console.warn(`🛰  A2A tunnel: ${e.message}`);
+        logWarning("a2a-tunnel", e.message);
     });
 
     // Process shutdown — stop the tunnel and the server before the dispatcher.

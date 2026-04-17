@@ -261,7 +261,15 @@ export default function (pi: ExtensionAPI) {
     pi.on("session_start", async (_event, ctx) => {
         embedder.ensureReady().catch((e) => {
             const msg = e instanceof Error ? e.message : String(e);
-            console.error("[guardrails] CRITICAL init failure:", e);
+            // Import synchronously via dynamic require to avoid a top-of-file
+            // import cycle with guardrails loading early in the extension chain.
+            try {
+                // eslint-disable-next-line @typescript-eslint/no-require-imports
+                const { logError } = require("../../src/core/errorLog.js") as typeof import("../../src/core/errorLog.js");
+                logError("guardrails", "CRITICAL init failure — protection NOT active", { err: msg });
+            } catch {
+                console.error("[guardrails] CRITICAL init failure:", e);
+            }
             ctx.ui.notify(
                 `⚠️ GUARDRAIL OFFLINE: ${msg}\nProtection is NOT active until this is fixed. Restart the bot once corrected.`,
                 "error",
