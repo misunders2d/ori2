@@ -4,7 +4,45 @@
 
 **Rubric:** DELETE / REPLACE / SIMPLIFY / KEEP. Every verdict has a Pi-source citation.
 
-**Status:** awaiting operator approval before any code change. See §3 for the phased execution plan.
+**Status: COMPLETE** — all 7 phases shipped on `master`. See §0 below for commit map + current state before clearing the session.
+
+---
+
+## 0. Execution status (living)
+
+All phases in the original plan (§3 below) landed, plus two phases added during execution (Phases 6 + 7) that surfaced while verifying:
+
+| Phase | Goal | Commit | Landed |
+|---|---|---|---|
+| 1 | Auth path: `GEMINI_API_KEY` rename + vault migration + seed Pi's `auth.json`/`settings.json` | `8112d4f` | ✅ |
+| 2 | Move static persona directives → `.pi/APPEND_SYSTEM.md`; trim `persona.ts` to dynamic-only; delete dead `Platform_Controller.md` | `c655aa0` | ✅ |
+| 3 | Retire `evolve_extension` / `evolve_skill` tools; agent uses Pi's built-in `write` + `/reload`. `evolve.ts` shrunk from 303→185 LoC. | `c655aa0` | ✅ |
+| 4 | Scheduler spawns `npx pi -p` instead of `tsx scripts/scheduled-run.ts`; delete the 125-LoC scheduled-run script. | `c655aa0` | ✅ |
+| 5 | `PRIMARY_PROVIDER` retired; Pi reads `defaultProvider` from `settings.json`. | `c655aa0` | ✅ |
+| **6** (added) | **globalThis-backed singletons** — Pi loads `.pi/extensions/*.ts` via jiti (separate module graph from tsx), so every `getXxx()` singleton was instantiated twice. Root cause of `/health` reporting "no transport adapters registered" despite bootstrap registering three. Fixed via `src/core/singletons.ts` registry on `globalThis`. 14 singletons migrated. | `6ea8d07` | ✅ |
+| **7** (added) | **Context-aware reminders + targetable delivery.** Discovered by the user's "remind me to drink coffee" test: the fresh-subprocess agent took "drink coffee" as a task to EXECUTE ("Done, I've had my coffee"), not a reminder to DELIVER, and the response never reached the TUI. Fix: add `job_type: "reminder" \| "task"` + `deliverTarget` to `JobMeta`; reminder kickoff explicitly tells the LLM to deliver not execute; post-subprocess, parent captures stdout, routes via `dispatcher.send()` to the target adapter, AND appends as `scheduler-delivery` custom entry to the origin session file so "thanks just watched it"-style references resolve. Both tools gain optional `deliver_to: {platform, channelId, threadId?}`. | `3f33925` | ✅ |
+
+**Test suite:** 369 → 386 tests. Net +17 (includes singletons, scheduler Phase 7 schema, piSeed updates). CI green on Node 22 + 24 at every commit.
+
+### Net LoC effect
+
+Roughly −300 LoC across phases 2-5, +200 LoC for phases 6-7 (new primitives + tests). Total diff on the repo is neutral; the distribution moved code that duplicated Pi natives into new primitives that Pi doesn't provide (singleton registry, reminder semantics, session-append delivery).
+
+### Still open (post-plan)
+
+Minor bugs §7 identified during the audit, not blocking:
+
+- §7.2 — dead `REQUIRE_2FA=true` in `.env` (no consumer). Plan: drop from wizard on next touch.
+- §7.5 — `tdd_enforcer.ts:29-30` `execAsync` with naive shell-escape on commit message. Plan: switch to `spawn("git", ["commit", "-m", msg])`.
+
+Both trivial one-liners. Not scheduled.
+
+### Where to resume (instructions for a fresh session)
+
+1. Read this file top to bottom.
+2. `git log --oneline -12` — HEAD should be `3f33925` (Phase 7) with the chain back to `988df3d`.
+3. The live-verification step user still needs to run: in the TUI, `remind me to drink coffee in 1 minute`. Expected: a conversational reminder (emoji prefix + short text) appears in the conversation after ~60s, NOT "done, I drank coffee". No subprocess stdout spam.
+4. If the user wants to work on Phase 6 follow-ups or start a new phase: the open items are §7.2 and §7.5 above.
 
 ---
 
@@ -170,7 +208,7 @@ Provider-name mapping (from `dist/env-api-keys.js` lines 86–103 + `docs/provid
 
 Each phase is independently shippable. Early phases unblock later ones; don't reorder.
 
-### Phase 1 — Auth path (correctness + unblock)
+### Phase 1 — Auth path (correctness + unblock) ✅ `8112d4f`
 
 **Goal:** Fix Gemini key name; stop duplicating Pi's credential resolution.
 
@@ -189,7 +227,7 @@ Each phase is independently shippable. Early phases unblock later ones; don't re
 
 **Risk:** LOW. This is a rename + migration, not a behaviour change.
 
-### Phase 2 — SYSTEM prompt (`persona.ts`)
+### Phase 2 — SYSTEM prompt (`persona.ts`) ✅ `c655aa0`
 
 **Goal:** Move static global directives into `.pi/APPEND_SYSTEM.md`; shrink `persona.ts` to dynamic-only injection.
 
@@ -206,7 +244,7 @@ Each phase is independently shippable. Early phases unblock later ones; don't re
 
 **Dependency:** None.
 
-### Phase 3 — Evolve extension (`evolve.ts`)
+### Phase 3 — Evolve extension (`evolve.ts`) ✅ `c655aa0`
 
 **Goal:** Replace `evolve_extension`/`evolve_skill` tools with documentation that says "use `write` + `/reload`".
 
@@ -222,7 +260,7 @@ Each phase is independently shippable. Early phases unblock later ones; don't re
 
 **Dependency:** None (can run parallel with Phase 2).
 
-### Phase 4 — Scheduled-run (`scripts/scheduled-run.ts`)
+### Phase 4 — Scheduled-run (`scripts/scheduled-run.ts`) ✅ `c655aa0`
 
 **Goal:** Drop hand-rolled subprocess bootstrap in favour of `pi -p` (or in-process SDK).
 
@@ -238,7 +276,7 @@ Each phase is independently shippable. Early phases unblock later ones; don't re
 
 **Dependency:** Phase 1 (auth path) must be correct first or the scheduled subprocess won't find credentials either.
 
-### Phase 5 — `settings.json` alignment (housekeeping)
+### Phase 5 — `settings.json` alignment (housekeeping) ✅ `c655aa0`
 
 **Goal:** Retire `PRIMARY_PROVIDER` in `.env`; use Pi's `defaultProvider` in `settings.json`.
 
@@ -251,6 +289,40 @@ Each phase is independently shippable. Early phases unblock later ones; don't re
 **Risk:** LOW.
 
 **Dependency:** Phase 1.
+
+### Phase 6 — globalThis-backed singletons ✅ `6ea8d07` (added during execution)
+
+**Goal:** Fix module duplication across tsx (main bootstrap) and jiti (Pi's extension loader) module graphs. All 14 `getXxx()` singletons — `Vault`, `Whitelist`, `RateLimiter`, `OAuthService`, `Credentials`, `Memory`, `ChannelLog`, `Staging`, `ToolAcl`, `TransportDispatcher`, `A2AAdapter`, `Friends`, `DnaCatalog`, `a2aServerHandle` — were instantiated twice (once per graph). Symptom: `/health` reported "no transport adapters registered" despite bootstrap registering three. Closures captured in-adapter kept the telegram/A2A inbound paths working, which masked the bug until the observability tool exposed it.
+
+**Changes:**
+1. New `src/core/singletons.ts` — `getOrCreate<T>(key, factory)` / `setSingleton` / `getSingleton` / `clearRegistryForTests`. Uses `globalThis[__ori2_singletons_v1__]` so both module graphs observe the same instance.
+2. All 14 callers migrated — module-local `let _instance: X | null = null` patterns replaced.
+3. +9 tests including dynamic-re-import scenario that proves cross-graph consistency.
+
+**Verification:** After push, `/health` in the TUI should show the adapters bootstrap actually registered, not empty arrays.
+
+**Risk:** LOW. Behaviour-preserving; just moves the storage location. 369 → 378 tests.
+
+**Dependency:** None.
+
+### Phase 7 — Context-aware reminders + targetable delivery ✅ `3f33925` (added during execution)
+
+**Goal:** Fix the reminder bug surfaced by the user's "drink coffee" test (fresh-session LLM interpreted "drink coffee" as a task to execute, responded "done I drank coffee", and the response never reached the TUI). Add structured `deliver_to` so reminders and tasks can target arbitrary chats.
+
+**Changes:**
+1. `JobMeta` extended with `job_type: "reminder" | "task"`, `deliverTarget: {platform, channelId, threadId?}`, `origin_session_file: string`. Back-compat on load: `job_id.startsWith("reminder_")` → inferred reminder; else task.
+2. `buildKickoff(meta)` — reminder-flavored kickoff tells the LLM "DELIVER, not execute"; task kickoff unchanged.
+3. Post-subprocess: parent captures stdout (no longer spams console), calls `dispatcher.send(target.platform, target.channelId, {text})` for the delivery, and `SessionManager.open(sessionFile).appendCustomMessageEntry("scheduler-delivery", text, display=true, …)` to append the event to the originating session. `display=true` means it appears in the TUI AND participates in next-turn LLM context — so "thanks just watched it" resolves.
+4. `schedule_reminder` and `schedule_recurring_task` tools gain optional `deliver_to: {platform, channelId, threadId?}`. Default = origin chat (preserves today's behaviour).
+5. Side-quest: dropped `GEMINI_API_KEY → GOOGLE_API_KEY` env mirror. `guardrails.ts` now reads `GEMINI_API_KEY` first (with `GOOGLE_API_KEY` fallback for legacy). Kills the "Both X and Y are set. Using X." noise subprocesses emitted.
+6. Vault housekeeping in `migrateLegacyVaultKeys()` — when both `GEMINI_API_KEY` and `GOOGLE_API_KEY` exist, drop the legacy copy.
+7. +8 scheduler tests (JobMeta migration, deliverTarget shapes, kickoff semantics).
+
+**Verification (live, still pending operator):** in the TUI, *"remind me to drink coffee in 1 minute"* → 60s later a conversational reminder appears in-conversation, NOT "done, I drank coffee", NO subprocess stdout spam.
+
+**Risk:** LOW. Back-compat path tested; existing scheduled jobs keep working.
+
+**Dependency:** Phase 1 (auth); benefits from Phase 6 (the live-session-manager capture and dispatcher singleton are now shared correctly).
 
 ---
 
@@ -361,4 +433,14 @@ No structural refactors; every phase is 1-2-day scope. After Phase 1+2, the bot 
 
 **Audit performed:** 2026-04-17 by superpowers:code-reviewer agent, against ori2 HEAD `ff14b36`.
 
-**Next action:** operator reviews this file; on approval, execute Phase 1 then open a PR.
+**Execution:** 2026-04-17 same day. All 7 phases landed, master HEAD is `3f33925`. See §0 (top of this file) for the commit map.
+
+---
+
+## Appendix — Memory updates written during execution
+
+A few feedback notes were saved to `~/.claude/projects/-media-misunderstood-DATA-projects-ori2/memory/` so future sessions resume cleanly:
+
+- **`feedback_read_pi_sdk_docs_first.md`** — always consult `node_modules/@mariozechner/pi-coding-agent/docs/` before touching Pi-integration code. Don't rely on vendor-convention assumptions for env var names or auth storage shape.
+- **`feedback_invoke_writing_skills.md`** — invoke `superpowers:writing-skills` before authoring or editing any `SKILL.md`, including Pi's `.pi/skills/*/SKILL.md`.
+- **`reference_pi_docs_location.md`** — curated Pi skill set at `~/.agents/pi-docs-reference/` (not `~/.agents/skills/` — Pi auto-scans the latter and rejects the upstream `@mariozechner/...` YAML).
