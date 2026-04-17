@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Pre-commit gate for ori2. Install with:
+#   git config core.hooksPath .githooks
+#
+# Runs fast local checks so PRs don't land broken on master:
+#   1. tsc --noEmit (fails on any type error).
+#   2. npm test (fails on any test, including pinned security + arch
+#      invariants).
+#
+# Design notes:
+#   - Engine-neutral. Works from Claude Code / Cursor / manual git CLI —
+#     anything that commits triggers this.
+#   - No network calls. Entirely local. Tests that need external state
+#     should mock or skip themselves via setup (we never .skip pinned
+#     tests).
+#   - Fast path: if no .ts file is staged, skip entirely. Avoids slowing
+#     down docs-only / config-only commits.
+#   - Bypass: `git commit --no-verify` as usual. Reserve for genuine
+#     emergencies; the hook is cheap (< 10s on warm cache).
+
+set -euo pipefail
+
+# Detect whether any TypeScript or test file is staged.
+if ! git diff --cached --name-only | grep -qE '\.(ts|js|tsx|cjs|mjs)$|package(-lock)?\.json$'; then
+    exit 0
+fi
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+echo "[pre-commit] typecheck..."
+if ! npx tsc --noEmit; then
+    echo ""
+    echo "[pre-commit] ✖ TypeScript errors above. Fix, then commit."
+    echo "[pre-commit]   (emergency bypass: git commit --no-verify)"
+    exit 1
+fi
+
+echo "[pre-commit] tests..."
+if ! timeout 120 npm test > /tmp/ori2-pre-commit.log 2>&1; then
+    echo ""
+    echo "[pre-commit] ✖ Tests failed. Tail of /tmp/ori2-pre-commit.log:"
+    tail -30 /tmp/ori2-pre-commit.log
+    echo ""
+    echo "[pre-commit]   (emergency bypass: git commit --no-verify)"
+    exit 1
+fi
+
+echo "[pre-commit] ✓ clean"
