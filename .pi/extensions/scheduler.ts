@@ -205,7 +205,17 @@ function makeRunsDir(): string {
 // stored in meta.origin_session_file (captured at schedule time) rather
 // than this reference, so rehydrated jobs still target the correct session
 // even if the TUI is on a different session when they fire.
-let liveSessionManager: SessionManager | null = null;
+// Pi's ExtensionContext exposes `sessionManager: ReadonlySessionManager` —
+// a Pick<> of read-only methods (getBranch, getSessionFile, ...) without
+// the write-side API (appendCustomMessageEntry etc.). ReadonlySessionManager
+// isn't re-exported from the package root (only SessionManager is), so we
+// use a structural type here — same trick src/core/identity.ts uses. We
+// only need the session FILE PATH from this reference; for writes we open
+// a SessionManager on that path.
+interface LiveSessionHandle {
+    getSessionFile(): string | undefined;
+}
+let liveSessionManager: LiveSessionHandle | null = null;
 
 // ----- Kickoff prompts differ by job type -----
 //
@@ -284,31 +294,28 @@ async function deliverAndAppend(meta: JobMeta, responseText: string): Promise<vo
 
     // 2) Append to the session so next-turn LLM context has the event.
     //    Priority: explicit target sessionFile > origin_session_file >
-    //    liveSessionManager (current running TUI session, best-effort).
-    const sessionFile = target?.sessionFile ?? meta.origin_session_file;
+    //    liveSessionManager.getSessionFile() (current running TUI session,
+    //    best-effort). All three paths resolve to a file path, then we open
+    //    a writable SessionManager on it — the ReadonlySessionManager we
+    //    get from ExtensionContext doesn't expose writes.
+    const sessionFile =
+        target?.sessionFile ??
+        meta.origin_session_file ??
+        liveSessionManager?.getSessionFile();
+    if (!sessionFile || !fs.existsSync(sessionFile)) return;
     try {
-        if (sessionFile && fs.existsSync(sessionFile)) {
-            const sm = SessionManager.open(sessionFile);
-            sm.appendCustomMessageEntry(
-                "scheduler-delivery",
-                responseText,
-                true, // display in TUI + participates in LLM context
-                {
-                    job_id: meta.job_id,
-                    job_type: meta.job_type,
-                    fired_at: Date.now(),
-                    target: target ?? null,
-                },
-            );
-        } else if (liveSessionManager) {
-            // Fallback: no recorded session file, but we have a live one.
-            liveSessionManager.appendCustomMessageEntry(
-                "scheduler-delivery",
-                responseText,
-                true,
-                { job_id: meta.job_id, job_type: meta.job_type, fired_at: Date.now() },
-            );
-        }
+        const sm = SessionManager.open(sessionFile);
+        sm.appendCustomMessageEntry(
+            "scheduler-delivery",
+            responseText,
+            true, // display in TUI + participates in LLM context
+            {
+                job_id: meta.job_id,
+                job_type: meta.job_type,
+                fired_at: Date.now(),
+                target: target ?? null,
+            },
+        );
     } catch (e) {
         logError("scheduler", "session append failed", {
             err: e instanceof Error ? e.message : String(e),
