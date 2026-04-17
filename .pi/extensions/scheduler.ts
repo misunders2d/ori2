@@ -205,27 +205,31 @@ function makeRunsDir(): string {
 // stored in meta.origin_session_file (captured at schedule time) rather
 // than this reference, so rehydrated jobs still target the correct session
 // even if the TUI is on a different session when they fire.
-// LIVE-TUI delivery plumbing.
+// TUI-delivery design note:
+//   For reminders scheduled FROM the TUI, we persist the delivery as a
+//   `scheduler-delivery` CustomMessageEntry on the session file. This
+//   MAKES IT AVAILABLE IN CONTEXT on the next LLM turn — if the user
+//   sends another message after the reminder fires, the agent sees the
+//   event in its session history and can reference it ("you asked about
+//   that movie earlier; I watched it").
 //
-// Previous approach (cast ReadonlySessionManager to writable, call
-// appendCustomMessageEntry directly) was wrong — the write DID land on
-// disk, but Pi's TUI render pipeline doesn't observe direct SessionManager
-// writes. Pi's InteractiveMode subscribes to AgentSession event streams
-// (message_update, turn_end, ...); a bare SessionManager write doesn't go
-// through AgentSession → TUI never gets notified → the screen doesn't
-// refresh even though the file has the new entry.
+//   It does NOT, however, appear as a live-rendered bubble in the TUI
+//   at fire time. Pi's InteractiveMode binds its render pipeline to the
+//   AgentSession event stream; a cron-fired write from an extension
+//   callback doesn't flow through AgentSession, so the live TUI misses
+//   it. We experimented with pi.sendMessage (routes through AgentSession)
+//   but it brought significant complexity for a marginal path — TUI is
+//   for local operator tinkering; the real reminder target is chat
+//   platforms (Telegram, Slack) where dispatcher.send reaches adapter.send
+//   reaches the user as a real message.
 //
-// Correct path: `pi.sendMessage` (types.d.ts:751). Routes through
-// AgentSession, emits the events the TUI listens on, supports
-// `triggerTurn: false` for passive-notification semantics (adds the
-// CustomMessageEntry without firing an LLM turn).
-//
-// Captured at factory invocation so module-level fireJob/deliverAndAppend
-// can reach it without threading ExtensionAPI through every call.
-let livePi: ExtensionAPI | null = null;
+//   Tradeoff explicitly accepted: TUI operators see reminders next turn,
+//   not real-time. Chat platforms see them live. If TUI real-time
+//   becomes critical later, the path is pi.sendMessage + potentially a
+//   registerMessageRenderer for styling.
 
 // Narrow structural type — we only need getSessionFile() from the live
-// handle now; pi.sendMessage does the actual writing.
+// handle for the fallback path.
 interface LiveSessionHandle {
     getSessionFile(): string | undefined;
 }
@@ -306,64 +310,32 @@ async function deliverAndAppend(meta: JobMeta, responseText: string): Promise<vo
         }
     }
 
-    // 2) Append to the session so next-turn LLM context has the event.
-    //    Priority: explicit target.sessionFile > origin_session_file >
-    //    liveSessionManager.getSessionFile().
-    //
-    //    KEY RULE: if the resolved file matches the TUI's CURRENT live
-    //    session, write via liveSessionManager (the TUI's own instance)
-    //    so the TUI's event subscribers see the append and rerender.
-    //    Pre-fix: we always did SessionManager.open(file).appendX, which
-    //    persists to disk but creates a FRESH instance the TUI never
-    //    observes — reminders landed in the jsonl but the user never saw
-    //    them pop up. Confirmed live 2026-04-17 with TUI reminders.
+    // 2) Append to the session JSONL so next-turn LLM context has the
+    //    event. Priority: explicit target.sessionFile > origin_session_file
+    //    > liveSessionManager.getSessionFile(). Opens a fresh
+    //    SessionManager on the file — persistence is reliable; live-TUI
+    //    rendering is best-effort (see module header note). The real
+    //    user-visible delivery for chat platforms already happened in
+    //    step (1) via dispatcher.send → adapter.send.
     const resolvedFile =
         target?.sessionFile ??
         meta.origin_session_file ??
         liveSessionManager?.getSessionFile();
-    if (!resolvedFile) return;
+    if (!resolvedFile || !fs.existsSync(resolvedFile)) return;
 
-    const liveFile = liveSessionManager?.getSessionFile();
-    const details = {
-        job_id: meta.job_id,
-        job_type: meta.job_type,
-        fired_at: Date.now(),
-        target: target ?? null,
-    };
-
-    // Live TUI session case — deliver via pi.sendMessage so the TUI sees
-    // the event and rerenders. triggerTurn: false means we add the entry
-    // without firing an LLM turn (passive notification — the agent doesn't
-    // need to "respond to" its own reminder; the subprocess already
-    // produced the reminder text and this is just delivery).
-    if (liveFile === resolvedFile && livePi) {
-        try {
-            livePi.sendMessage(
-                {
-                    customType: "scheduler-delivery",
-                    content: responseText,
-                    display: true,
-                    details,
-                },
-                { triggerTurn: false },
-            );
-            return;
-        } catch (e) {
-            // Fall through to disk-open path — at least the entry persists.
-            logWarning("scheduler", "pi.sendMessage failed, falling back to disk append", {
-                err: e instanceof Error ? e.message : String(e),
-                job_id: meta.job_id,
-            });
-        }
-    }
-
-    // Fallback: non-live or live-append failed. Append via a fresh
-    // SessionManager.open(file); contents persist but may not trigger a
-    // rerender if the target is a different in-memory session.
-    if (!fs.existsSync(resolvedFile)) return;
     try {
         const sm = SessionManager.open(resolvedFile);
-        sm.appendCustomMessageEntry("scheduler-delivery", responseText, true, details);
+        sm.appendCustomMessageEntry(
+            "scheduler-delivery",
+            responseText,
+            true,
+            {
+                job_id: meta.job_id,
+                job_type: meta.job_type,
+                fired_at: Date.now(),
+                target: target ?? null,
+            },
+        );
     } catch (e) {
         logError("scheduler", "session append failed", {
             err: e instanceof Error ? e.message : String(e),
@@ -609,11 +581,6 @@ function isAdminCaller(ctx: ExtensionContext): boolean {
 // =============================================================================
 
 export default function (pi: ExtensionAPI) {
-    // Capture for fire-time live delivery. livePi is used by deliverAndAppend
-    // to call pi.sendMessage so the TUI gets an event-stream notification
-    // (plain SessionManager writes don't trigger a TUI rerender).
-    livePi = pi;
-
     // On load: rehydrate persisted jobs + capture the live SessionManager
     // for fire-time history-append. liveSessionManager is updated on every
     // session_start so a new TUI session (after /new) still gets reminders

@@ -205,15 +205,23 @@ spring into existence and silently diverge.
 Good: `getOrCreate("vault", () => new Vault())` — cross-graph singleton
 via `globalThis`. See Phase 6 of the alignment plan.
 
-### Don't write to the session file bypassing AgentSession
+### Background-fired extensions and TUI rendering: understand the tradeoff
 
-Bad: opening a fresh SessionManager on disk and calling
-`appendCustomMessageEntry` — the entry persists but the live TUI doesn't
-observe the write. User sees nothing even though the file has the entry.
+If an extension fires from a node-schedule cron or similar
+background-callback (outside an agent turn), a direct
+`SessionManager.open(file).appendCustomMessageEntry(...)` **persists to
+disk** but the live TUI **does NOT rerender** — Pi's InteractiveMode
+subscribes to AgentSession event streams, and a bare SessionManager write
+doesn't go through AgentSession. Real-time rendering would require
+`pi.sendMessage` (routes through AgentSession), but that only works while
+pi is loaded in the same process as the TUI, and has subtleties.
 
-Good: `pi.sendMessage({ customType, content, display: true }, {
-triggerTurn: false })` — routes through AgentSession's event stream; TUI
-rerenders.
+Accepted tradeoff in the baseline: background extensions (scheduler,
+future delivery hooks) persist to disk for context-carry-over (next agent
+turn sees it), and rely on chat-platform delivery via `dispatcher.send`
+for real-time visibility. The TUI is for operator tinkering; real users
+live in Telegram/Slack. See `scheduler.ts` deliverAndAppend for the
+canonical pattern.
 
 ## Where to find things
 
