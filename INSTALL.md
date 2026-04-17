@@ -17,10 +17,15 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/misunders2d/ori2/master/
 The bootstrap will:
 1. Verify Node ≥ 22, git, npm
 2. Clone the repo (or pull if present)
-3. Run `npm install` (postinstall pre-warms the fastembed model into `.cache/fastembed/`)
-4. Run `npm test` — halts the install if any baseline test fails. To override (NOT recommended), `export ORI2_SKIP_TESTS=1` before re-running.
-5. Launch the first-run wizard (asks for bot name, optional admin IDs, primary AI provider key)
-6. Optionally install a systemd user unit (Linux) or launchd LaunchAgent (macOS) for headless deployment
+3. **Detach from upstream** — wipe `.git`, re-init with a fresh history, write `.ori2-baseline` (records which ori2 version you forked from, so `scripts/sync-baseline.sh` can show future updates). Skip with `--keep-upstream` if you're the upstream maintainer.
+4. Run `npm install` (postinstall pre-warms the fastembed model into `.cache/fastembed/`)
+5. Run `npm test` — halts the install if any baseline test fails. To override (NOT recommended), `export ORI2_SKIP_TESTS=1` before re-running.
+6. Launch the first-run wizard (asks for bot name, optional admin IDs, primary AI provider key)
+7. Optionally install a systemd user unit (Linux) or launchd LaunchAgent (macOS) for headless deployment
+
+### Forking the one-liner
+
+The canonical one-liner installs from `misunders2d/ori2` and then detaches — so the resulting bot is yours, independent of the upstream repo. If you want to publish a *modified* one-liner under your own name (e.g., your department mirrors the repo with pre-loaded skills), edit `bootstrap.sh` line 24 (`REPO=...`) and host the script from your fork's `master/bootstrap.sh` raw URL. One line, no rewiring.
 
 ## Manual install
 
@@ -295,11 +300,44 @@ Full reference: `/dna help` and `/a2a help` from any chat session.
 
 ## Updating
 
+### Your own bot (detached — the default)
+
+After bootstrap, your bot lives on its own git timeline. `git pull` from upstream **does nothing** because there's no origin pointing at upstream anymore. That's by design — your evolutions are yours, no surprise merges overwriting them.
+
+To see and optionally pull in new features from the canonical ori2 baseline:
+
 ```bash
 cd /path/to/ori2
-git pull
-npm install                 # if package.json changed
-systemctl --user restart ori2-MyBot   # if running under systemd
-# OR
-launchctl kickstart -k gui/$(id -u)/dev.ori2.MyBot   # macOS
+./scripts/sync-baseline.sh
+# → temporarily adds ori2-upstream as a remote, fetches, prints the log/diff,
+#   drops the remote. Your repo stays detached.
+```
+
+The script never auto-merges. If you want to merge upstream changes:
+
+```bash
+./scripts/sync-baseline.sh --remote        # keeps the temporary remote
+git merge ori2-upstream/master             # or: git cherry-pick <sha>
+# resolve any conflicts with your evolutions
+./scripts/sync-baseline.sh --mark $(git rev-parse HEAD)   # update baseline marker
+git remote remove ori2-upstream            # optional — tidy up
+```
+
+### Publishing your bot to your own GitHub
+
+```bash
+cd /path/to/ori2
+git remote add origin git@github.com:YOU/YOUR-BOT.git
+git push -u origin master
+# from now on: git push to your fork is normal
+```
+
+Your `.ori2-baseline` marker travels with the commits — anyone who clones your fork can still run `./scripts/sync-baseline.sh` to see what's new upstream.
+
+### After an update — restart the bot
+
+```bash
+npm install                                            # if package.json changed
+systemctl --user restart ori2-MyBot                    # Linux / systemd
+launchctl kickstart -k gui/$(id -u)/dev.ori2.MyBot     # macOS / launchd
 ```

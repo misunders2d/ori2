@@ -116,15 +116,26 @@ Your Ori2 is no longer an island. With the **Agent-to-Agent (A2A) Protocol**, yo
 
 ## 🛠 Manual Installation
 
-### 1. Claiming an Egg (Forking)
+### 1. Claiming an Egg
 
-Because Ori2 manages her own source code and evolves by committing to a remote you control, **fork this repository** before deploying your own instance. Evolved extensions go back to *your* fork, not to this one.
+You **do not need to fork on GitHub first**. The one-liner installer (above) clones the canonical repo, then immediately detaches — wipes `.git`, starts a fresh commit history, drops a `.ori2-baseline` marker so future upstream-sync calls know where she hatched from. From that moment on, your bot's code belongs to *you*, not to the upstream repo. Evolution lives on your own timeline with zero risk of an `evolve_extension` call ever trying to push to someone else's GitHub.
 
-### 2. Incubation Setup
+When you're ready to publish your evolved bot somewhere — your own private repo, a team-shared repo, a public fork:
+
+```bash
+git remote add origin git@github.com:YOU/YOUR-BOT.git
+git push -u origin master
+```
+
+**If you're the upstream maintainer** (rare) and want the one-liner to preserve the upstream remote, pass `--keep-upstream`.
+
+### 2. Manual Incubation (if you prefer)
 
 ```bash
 git clone https://github.com/misunders2d/ori2.git MyBot
 cd MyBot
+# Manual detach (if you also want a fresh history):
+rm -rf .git && git init && git add -A && git commit -m "Initial snapshot"
 npm install
 npm start
 ```
@@ -211,6 +222,18 @@ Each bot lives in its own checkout. Zero shared mutable state:
 - OAuth is Device Code (no callback)
 
 Two bots with different Telegram tokens can run side-by-side under one OS user under systemd/launchd — no interference. See INSTALL.md for multi-instance systemd/launchd examples.
+
+## 🔄 Pulling Upstream Baseline Updates (optional)
+
+Because your bot is detached, `git pull` doesn't grab upstream changes. That's the point — your evolutions can't be clobbered by a background sync. To see what's new upstream when you want to:
+
+```bash
+./scripts/sync-baseline.sh             # prints log + diff since your baseline, drops the remote
+./scripts/sync-baseline.sh --remote    # keeps the remote so you can merge/cherry-pick
+./scripts/sync-baseline.sh --mark <sha>  # update the baseline marker after a merge
+```
+
+The script never auto-merges. You're in charge of what upstream features (if any) land in your bot.
 
 ## 🛡️ Deployment Resilience
 
