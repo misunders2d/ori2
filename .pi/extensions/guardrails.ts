@@ -55,7 +55,10 @@ type Backend = "local" | "google" | "openai";
 
 function pickBackend(): Backend {
     const v = (process.env["GUARDRAIL_EMBEDDINGS"] ?? "local").toLowerCase();
-    if (v === "google" && process.env["GOOGLE_API_KEY"]) return "google";
+    // Google AI Studio accepts GEMINI_API_KEY (Pi's canonical name) OR the
+    // older GOOGLE_API_KEY. Check both so operators on either convention
+    // keep working.
+    if (v === "google" && (process.env["GEMINI_API_KEY"] || process.env["GOOGLE_API_KEY"])) return "google";
     if (v === "openai" && process.env["OPENAI_API_KEY"]) return "openai";
     return "local";
 }
@@ -76,7 +79,7 @@ async function getRemoteEmbedding(text: string, backend: "google" | "openai"): P
     // (HTTP error, malformed response) throws so the caller can't pretend
     // a check succeeded when it didn't.
     if (backend === "google") {
-        const key = process.env["GOOGLE_API_KEY"];
+        const key = process.env["GEMINI_API_KEY"] ?? process.env["GOOGLE_API_KEY"];
         if (!key) return null;
         const res = await fetch(
             `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=${key}`,

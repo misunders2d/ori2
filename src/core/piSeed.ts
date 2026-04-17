@@ -24,6 +24,10 @@ export const VAULT_TO_PI_PROVIDER: Record<string, string> = {
  * One-shot vault key rename: GOOGLE_API_KEY → GEMINI_API_KEY. Safe to run on
  * every boot; no-op once complete. Pi SDK's @mariozechner/pi-ai env-api-keys
  * maps provider "google" to env var GEMINI_API_KEY (not GOOGLE_API_KEY).
+ *
+ * Also cleans up GOOGLE_API_KEY when BOTH keys exist — happened on
+ * installs migrated mid-Phase-1 where the migration ran but the wizard had
+ * also already seeded both. One copy of the secret in vault is enough.
  */
 export function migrateLegacyVaultKeys(): boolean {
     const vault = getVault();
@@ -31,6 +35,13 @@ export function migrateLegacyVaultKeys(): boolean {
     const canonical = vault.get("GEMINI_API_KEY");
     if (legacy && !canonical) {
         vault.set("GEMINI_API_KEY", legacy);
+        vault.delete("GOOGLE_API_KEY");
+        return true;
+    }
+    if (legacy && canonical) {
+        // Both present — drop the legacy copy. Same value (we wrote both from
+        // one wizard run, or hydrated a legacy→canonical migration on one
+        // boot and a fresh wizard on another).
         vault.delete("GOOGLE_API_KEY");
         return true;
     }

@@ -82,11 +82,11 @@ function hydrateEnvFromVault(): void {
         const v = vault.get(key);
         if (v !== undefined && v !== "") process.env[key] = v;
     }
-    // Alias: guardrails' Google-embed backend reads GOOGLE_API_KEY. The
-    // Google AI Studio API accepts either name for the same service, so
-    // mirror to satisfy both consumers without duplicating vault storage.
-    const gemini = process.env["GEMINI_API_KEY"];
-    if (gemini && !process.env["GOOGLE_API_KEY"]) process.env["GOOGLE_API_KEY"] = gemini;
+    // Note: we used to mirror GEMINI_API_KEY → GOOGLE_API_KEY here for
+    // guardrails' Google-embed backend. guardrails.ts now reads
+    // GEMINI_API_KEY directly (Pi's canonical name), so the mirror is gone.
+    // That also kills the "Both GOOGLE_API_KEY and GEMINI_API_KEY are set"
+    // noise `pi -p` subprocesses would emit when they saw both vars.
 }
 
 function ensurePiAuthJsonSeeded(): void {

@@ -8,6 +8,7 @@ import path from "node:path";
 import { botSubdir, ensureDir } from "../../src/core/paths.js";
 import { currentOrigin } from "../../src/core/identity.js";
 import { getWhitelist } from "../../src/core/whitelist.js";
+import { getDispatcher } from "../../src/transport/dispatcher.js";
 import { seedPlan, recordPlanThread, type OriginChannel } from "./plan_enforcer.js";
 import { logError, logWarning } from "../../src/core/errorLog.js";
 
@@ -44,12 +45,50 @@ import { logError, logWarning } from "../../src/core/errorLog.js";
 //   trigger_scheduled_task_now(job_id) — admin manual fire
 // =============================================================================
 
+/**
+ * Explicit target for where a scheduled job's output should be delivered.
+ * Independent of where the job was SCHEDULED from (that's origin_session_file +
+ * originChannel). Lets the caller say "schedule from my DM, but deliver to
+ * the #marketing Slack channel".
+ */
+interface DeliverTarget {
+    platform: string;          // "cli" | "telegram" | "slack" | "a2a" | …
+    channelId: string;
+    threadId?: string;
+    /** Optional — session file to append the delivered message to. Defaults
+     * to origin_session_file so the SCHEDULING session's history gets the
+     * reminder entry (preserving "watch this movie" → "thanks just watched it"
+     * context). Set explicitly to route history-append to a different
+     * per-chat session when that concept lands. */
+    sessionFile?: string;
+}
+
+type JobType = "reminder" | "task";
+
 interface JobMeta {
     job_id: string;
+    /**
+     * "reminder" — fire-time LLM is told to DELIVER the reminder to the user,
+     *              not execute it. No `steps` (would be ignored).
+     * "task"     — fire-time LLM is told to EXECUTE the instruction.
+     *              Optional `steps` enter plan-enforcement mode.
+     * Default when missing on legacy job files: "task" (back-compat).
+     */
+    job_type: JobType;
     cron: string;
     task: string;
     steps?: string[];
+    /** Where the scheduling request came from. Historical record. */
     originChannel?: OriginChannel;
+    /** Where deliveries should go. Defaults to origin if unset. */
+    deliverTarget?: DeliverTarget;
+    /**
+     * Absolute path to the session that scheduled the job. Used at fire time
+     * to append the reminder/task-result message as a `scheduler-delivery`
+     * custom entry, so when the user returns to that chat the event is in
+     * conversation history (lets "thanks just watched it" resolve context).
+     */
+    origin_session_file?: string;
     created_at: number;
     created_by: string;
 }
@@ -84,12 +123,26 @@ function loadAllJobMeta(): JobMeta[] {
             const raw = fs.readFileSync(path.join(jobsDir(), f), "utf-8");
             const parsed = JSON.parse(raw) as Partial<JobMeta>;
             if (typeof parsed.job_id === "string" && typeof parsed.cron === "string" && typeof parsed.task === "string") {
+                // Legacy job files didn't have job_type. A job id starting
+                // with "reminder_" is the convention schedule_reminder uses;
+                // everything else defaults to "task" (matches pre-Phase-7
+                // behaviour).
+                const job_type: JobType = parsed.job_type === "reminder"
+                    ? "reminder"
+                    : parsed.job_type === "task"
+                        ? "task"
+                        : parsed.job_id.startsWith("reminder_")
+                            ? "reminder"
+                            : "task";
                 out.push({
                     job_id: parsed.job_id,
+                    job_type,
                     cron: parsed.cron,
                     task: parsed.task,
                     ...(Array.isArray(parsed.steps) ? { steps: parsed.steps } : {}),
                     ...(parsed.originChannel ? { originChannel: parsed.originChannel } : {}),
+                    ...(parsed.deliverTarget ? { deliverTarget: parsed.deliverTarget } : {}),
+                    ...(typeof parsed.origin_session_file === "string" ? { origin_session_file: parsed.origin_session_file } : {}),
                     created_at: typeof parsed.created_at === "number" ? parsed.created_at : Date.now(),
                     created_by: typeof parsed.created_by === "string" ? parsed.created_by : "unknown",
                 });
@@ -119,6 +172,121 @@ function makeRunsDir(): string {
     const dir = botSubdir("scheduled-runs");
     ensureDir(dir);
     return dir;
+}
+
+// ----- Live session manager for fire-time history-append -----
+//
+// Captured on every session_start. fireJob uses it to
+// sm.appendCustomMessageEntry(...) on the scheduling session so the
+// delivered reminder/task-result ends up in conversation history. That's
+// what makes future references like "thanks, just watched it" resolve:
+// the reminder event is in the session transcript.
+//
+// The reference CAN go stale across /new — tracked by updating on every
+// session_start. Rehydration of persisted jobs uses the session file path
+// stored in meta.origin_session_file (captured at schedule time) rather
+// than this reference, so rehydrated jobs still target the correct session
+// even if the TUI is on a different session when they fire.
+let liveSessionManager: SessionManager | null = null;
+
+// ----- Kickoff prompts differ by job type -----
+//
+// Reminder: the fresh subprocess LLM is told to DELIVER, not execute. This
+// fixes the bug where "remind me to drink coffee" produced "Done, I've had
+// my coffee" — the fresh session took the task literally.
+//
+// Task: unchanged from pre-Phase-7 behaviour — execute the instruction and
+// report.
+
+function buildKickoff(meta: JobMeta): string {
+    if (meta.job_type === "reminder") {
+        const scheduledAt = new Date(meta.created_at).toISOString().replace("T", " ").slice(0, 16);
+        return [
+            `[SCHEDULED REMINDER — ${meta.job_id}]`,
+            `At ${scheduledAt} UTC, the user asked to be reminded of the following:`,
+            ``,
+            `  ${meta.task}`,
+            ``,
+            "Your job is to DELIVER the reminder, not execute it.",
+            "Compose a short (1–3 sentences) conversational reminder message",
+            "addressed to the user. Include enough context so it's self-contained",
+            "and they can pick up the thread. Start with a gentle prefix like",
+            `"⏰" or "📌".`,
+            "",
+            "Respond with ONLY the reminder text. No meta-commentary, no",
+            `"I'll remind you now:", no tool calls unless the task demands it.`,
+        ].join("\n");
+    }
+    if (meta.steps && meta.steps.length > 0) {
+        return `[SCHEDULED ${meta.job_id}] Begin executing the seeded plan ("${meta.task}"). Report results when complete.`;
+    }
+    return `[SCHEDULED ${meta.job_id}] Task: ${meta.task}\n\nExecute and report when done.`;
+}
+
+// ----- Delivery + history-append after the subprocess exits -----
+
+async function deliverAndAppend(meta: JobMeta, responseText: string): Promise<void> {
+    if (!responseText.trim()) return;
+
+    // 1) Deliver via the target's adapter. CLI gets skipped because the CLI
+    //    adapter's send() prints to stderr — irrelevant for a user who is
+    //    watching Pi's TUI; the session-append below is what they see.
+    //    Other platforms (telegram, slack, a2a) deliver via dispatcher.
+    const target = meta.deliverTarget ?? originChannelToTarget(meta.originChannel);
+    if (target && target.platform !== "cli") {
+        try {
+            const resp: { text: string; replyToMessageId?: string } = { text: responseText };
+            if (target.threadId) resp.replyToMessageId = target.threadId;
+            await getDispatcher().send(target.platform, target.channelId, resp);
+        } catch (e) {
+            logError("scheduler", `delivery to ${target.platform}:${target.channelId} failed`, {
+                err: e instanceof Error ? e.message : String(e),
+                job_id: meta.job_id,
+            });
+        }
+    }
+
+    // 2) Append to the session so next-turn LLM context has the event.
+    //    Priority: explicit target sessionFile > origin_session_file >
+    //    liveSessionManager (current running TUI session, best-effort).
+    const sessionFile = target?.sessionFile ?? meta.origin_session_file;
+    try {
+        if (sessionFile && fs.existsSync(sessionFile)) {
+            const sm = SessionManager.open(sessionFile);
+            sm.appendCustomMessageEntry(
+                "scheduler-delivery",
+                responseText,
+                true, // display in TUI + participates in LLM context
+                {
+                    job_id: meta.job_id,
+                    job_type: meta.job_type,
+                    fired_at: Date.now(),
+                    target: target ?? null,
+                },
+            );
+        } else if (liveSessionManager) {
+            // Fallback: no recorded session file, but we have a live one.
+            liveSessionManager.appendCustomMessageEntry(
+                "scheduler-delivery",
+                responseText,
+                true,
+                { job_id: meta.job_id, job_type: meta.job_type, fired_at: Date.now() },
+            );
+        }
+    } catch (e) {
+        logError("scheduler", "session append failed", {
+            err: e instanceof Error ? e.message : String(e),
+            job_id: meta.job_id,
+            sessionFile,
+        });
+    }
+}
+
+function originChannelToTarget(origin: OriginChannel | undefined): DeliverTarget | undefined {
+    if (!origin) return undefined;
+    const t: DeliverTarget = { platform: origin.platform, channelId: origin.channelId };
+    if (origin.threadId) t.threadId = origin.threadId;
+    return t;
 }
 
 // ----- Cron fire handler -----
@@ -175,25 +343,19 @@ async function fireJob(meta: JobMeta, manualTrigger = false): Promise<void> {
         }
     }
 
-    // Build kickoff message — include the task description so the agent
-    // sees it even when no plan was seeded.
-    const kickoff = meta.steps && meta.steps.length > 0
-        ? `[SCHEDULED ${meta.job_id}] Begin executing the seeded plan ("${meta.task}"). Report results when complete.`
-        : `[SCHEDULED ${meta.job_id}] Task: ${meta.task}\n\nExecute and report when done.`;
+    // Kickoff depends on job type — reminders tell the LLM to DELIVER a
+    // message to the user; tasks tell it to EXECUTE the instruction.
+    const kickoff = buildKickoff(meta);
 
     // Spawn Pi's native print-mode runner (pi -p <kickoff> --session <file>).
-    // Pi auto-discovers .pi/extensions/ (transport_bridge, plan_enforcer,
-    // persona, guardrails, …), resolves auth via PI_CODING_AGENT_DIR/auth.json
-    // (seeded by index.ts on parent boot), and exits after the prompt
-    // settles — exactly what a scheduled run needs.
+    // Pi auto-discovers .pi/extensions/, resolves auth via
+    // PI_CODING_AGENT_DIR/auth.json (seeded by index.ts), and exits after
+    // the prompt settles.
     //
-    // Plan reports surface via pi.events.emit("plan:report", ...) + disk
-    // fallback at data/<bot>/plan-reports/. No transport adapter is needed
-    // in this subprocess (no inbound chat → no origin → no routing).
-    //
-    // env: process.env carries PI_CODING_AGENT_DIR, BOT_NAME, and hydrated
-    // API key env vars into the child so auth.json lookup hits the right
-    // per-bot state dir.
+    // We CAPTURE stdout instead of streaming it to the parent console — the
+    // agent's response becomes the delivery text. stderr still streams (Pi
+    // warnings go there), but we suppress "Done, I drank the coffee" style
+    // noise from appearing in the TUI.
     const proc = spawn(
         "npx",
         ["pi", "-p", kickoff, "--session", sessionFile],
@@ -204,11 +366,8 @@ async function fireJob(meta: JobMeta, manualTrigger = false): Promise<void> {
             detached: false,
         },
     );
-    proc.stdout.on("data", (d: Buffer) => {
-        for (const line of d.toString().split("\n")) {
-            if (line.trim()) console.log(`[scheduler:${meta.job_id}] ${line}`);
-        }
-    });
+    let capturedStdout = "";
+    proc.stdout.on("data", (d: Buffer) => { capturedStdout += d.toString(); });
     proc.stderr.on("data", (d: Buffer) => {
         for (const line of d.toString().split("\n")) {
             if (line.trim()) console.error(`[scheduler:${meta.job_id}:stderr] ${line}`);
@@ -216,10 +375,34 @@ async function fireJob(meta: JobMeta, manualTrigger = false): Promise<void> {
     });
     proc.on("close", (code) => {
         console.log(`[scheduler] [${trigger}] ${meta.job_id} subprocess exit code=${code} session=${sessionFile}`);
+        if (code !== 0) {
+            logWarning("scheduler", `${meta.job_id} subprocess non-zero exit`, { code, job_id: meta.job_id });
+            return;
+        }
+        const text = extractAgentResponse(capturedStdout);
+        if (!text) {
+            logWarning("scheduler", `${meta.job_id} produced no agent response`, { job_id: meta.job_id });
+            return;
+        }
+        void deliverAndAppend(meta, text);
     });
     proc.on("error", (e) => {
         logError("scheduler", `${meta.job_id} subprocess error (${trigger})`, { err: e.message, job_id: meta.job_id, trigger });
     });
+}
+
+/**
+ * Extract the agent's textual response from captured `pi -p` stdout.
+ *
+ * Pi's print-mode format (docs/rpc.md §Print Mode): plain text of the final
+ * agent message, one blank line before. Startup banners / warnings go to
+ * stderr (which we ignore for delivery). A simple extraction: trim and
+ * strip the trailing newline.
+ *
+ * If Pi gains a structured print mode in the future, tighten this.
+ */
+function extractAgentResponse(stdout: string): string {
+    return stdout.trim();
 }
 
 function scheduleJob(meta: JobMeta): schedule.Job | null {
@@ -240,9 +423,13 @@ function isAdminCaller(ctx: ExtensionContext): boolean {
 // =============================================================================
 
 export default function (pi: ExtensionAPI) {
-    // On load: rehydrate persisted jobs. Replaces the stale-ctx bug from the
-    // old version (jobs survive /new and process restart).
-    pi.on("session_start", async () => {
+    // On load: rehydrate persisted jobs + capture the live SessionManager
+    // for fire-time history-append. liveSessionManager is updated on every
+    // session_start so a new TUI session (after /new) still gets reminders
+    // appended — even if the ORIGINAL session file (saved in meta) no
+    // longer exists, the fallback path uses the current live session.
+    pi.on("session_start", async (_event, ctx) => {
+        liveSessionManager = ctx.sessionManager;
         if (activeJobs.size > 0) return; // already loaded — don't double-register
         const all = loadAllJobMeta();
         for (const meta of all) {
@@ -264,18 +451,23 @@ export default function (pi: ExtensionAPI) {
         name: "schedule_recurring_task",
         label: "Schedule Recurring Task",
         description:
-            "Schedule a recurring autonomous task with a cron expression. Each fire spawns " +
-            "a fresh session (no context pollution). If `steps` is provided, the plan is " +
-            "seeded into that session via plan_enforcer's seedPlan, and the agent runs in " +
-            "Plan Enforcement Mode (no skipping, no hallucinating steps). Without `steps` " +
-            "the agent sees the task instruction as a kickoff message.",
+            "Schedule a recurring autonomous TASK with a cron expression. Each fire spawns " +
+            "a fresh session (no context pollution). The fresh-session agent EXECUTES the " +
+            "task_instruction and reports. If `steps` is provided, plan-enforcement mode " +
+            "activates (no skipping, no hallucinating steps). " +
+            "For gentle reminders that should NOT execute (e.g. 'remind me to drink coffee') " +
+            "use `schedule_reminder` instead — that path tells the fire-time agent to deliver " +
+            "a message rather than do the thing.",
         parameters: Type.Object({
             job_id: Type.String({ description: "Unique identifier (e.g. 'daily_inventory')" }),
             cron_expression: Type.String({ description: "Cron expression (e.g. '0 9 * * *' for 9 AM daily)" }),
-            task_instruction: Type.String({ description: "Description of what the task accomplishes" }),
-            steps: Type.Optional(Type.Array(Type.String(), { description: "Explicit ordered steps for plan-enforcement mode (optional but recommended for high-stakes tasks)" })),
-            origin_platform: Type.Optional(Type.String({ description: "Platform to report results to (e.g. 'telegram')" })),
-            origin_channel_id: Type.Optional(Type.String({ description: "Channel id to report results to" })),
+            task_instruction: Type.String({ description: "Description of what the task accomplishes. Write it as an instruction for your future self. Include enough context that an agent with no chat history can execute it correctly." }),
+            steps: Type.Optional(Type.Array(Type.String(), { description: "Explicit ordered steps for plan-enforcement mode (recommended for high-stakes tasks)" })),
+            deliver_to: Type.Optional(Type.Object({
+                platform: Type.String({ description: "Adapter platform to deliver to: 'telegram', 'slack', 'a2a', … Must match a registered adapter at fire time or delivery is skipped (history still appends)." }),
+                channelId: Type.String({ description: "Platform-specific channel id (Telegram chat_id, Slack channel/group id, A2A friend name, …)" }),
+                threadId: Type.Optional(Type.String({ description: "Optional reply-to / thread id. Telegram: message id to reply to. Slack: thread_ts." })),
+            }, { description: "Optional override for WHERE output is delivered. Defaults to the chat that scheduled the job. Use this to route a recurring job to a different channel (e.g. schedule from DM, post to a team channel)." })),
         }),
         async execute(_id, params, _signal, _onUpdate, ctx) {
             if (activeJobs.has(params.job_id)) {
@@ -284,32 +476,36 @@ export default function (pi: ExtensionAPI) {
             const origin = currentOrigin(ctx.sessionManager);
             const meta: JobMeta = {
                 job_id: params.job_id,
+                job_type: "task",
                 cron: params.cron_expression,
                 task: params.task_instruction,
                 created_at: Date.now(),
                 created_by: origin ? `${origin.platform}:${origin.senderId}` : "cli",
             };
             if (params.steps && params.steps.length > 0) meta.steps = params.steps;
-            if (params.origin_platform && params.origin_channel_id) {
-                meta.originChannel = {
-                    platform: params.origin_platform,
-                    channelId: params.origin_channel_id,
-                    scheduleId: params.job_id,
+            if (params.deliver_to) {
+                meta.deliverTarget = {
+                    platform: params.deliver_to.platform,
+                    channelId: params.deliver_to.channelId,
+                    ...(params.deliver_to.threadId !== undefined ? { threadId: params.deliver_to.threadId } : {}),
                 };
-            } else if (origin && origin.platform !== "cli") {
+            }
+            if (origin && origin.platform !== "cli") {
                 meta.originChannel = {
                     platform: origin.platform,
                     channelId: origin.channelId,
                     scheduleId: params.job_id,
                 };
             }
+            const sessionFile = ctx.sessionManager.getSessionFile();
+            if (sessionFile) meta.origin_session_file = sessionFile;
             const job = scheduleJob(meta);
             if (!job) throw new Error(`Invalid cron expression: "${params.cron_expression}"`);
             saveJobMeta(meta);
             const next = job.nextInvocation()?.toString() ?? "(no future invocations)";
             return {
-                content: [{ type: "text", text: `Scheduled '${params.job_id}'. Next run: ${next}.` }],
-                details: { job_id: params.job_id, next_run: next, has_steps: !!meta.steps },
+                content: [{ type: "text", text: `Scheduled task '${params.job_id}'. Next run: ${next}.` }],
+                details: { job_id: params.job_id, next_run: next, has_steps: !!meta.steps, deliver_to: meta.deliverTarget ?? null },
             };
         },
     });
@@ -317,10 +513,24 @@ export default function (pi: ExtensionAPI) {
     pi.registerTool({
         name: "schedule_reminder",
         label: "Schedule One-Off Reminder",
-        description: "Schedule a one-time reminder N minutes from now. Spawns a fresh session like recurring tasks.",
+        description:
+            "Schedule a one-off REMINDER N minutes from now. At fire time a fresh-session agent " +
+            "is told to DELIVER the reminder (not execute it) and the delivered text is appended " +
+            "to the scheduling session's history so future references like 'thanks, just watched " +
+            "it' can resolve context. Use this for 'remind me to …' requests. For jobs the agent " +
+            "should actually DO, use `schedule_recurring_task`. " +
+            "When writing `reminder_message`, include the context the user currently has in chat " +
+            "— the fire-time agent has no conversation history, so 'remind me to watch this movie' " +
+            "needs to become 'remind user to watch Oppenheimer (they mentioned it in chat today)'. " +
+            "Write the reminder as an instruction for your future self.",
         parameters: Type.Object({
-            minutes_from_now: Type.Number({ description: "Delay in minutes" }),
-            reminder_message: Type.String({ description: "What to do at the reminder time" }),
+            minutes_from_now: Type.Number({ description: "Delay in minutes from now" }),
+            reminder_message: Type.String({ description: "Self-contained reminder text — include enough context that an agent with NO chat history can deliver a useful reminder." }),
+            deliver_to: Type.Optional(Type.Object({
+                platform: Type.String({ description: "Adapter platform to deliver to: 'telegram', 'slack', 'a2a', … Must match a registered adapter at fire time." }),
+                channelId: Type.String({ description: "Platform-specific channel id." }),
+                threadId: Type.Optional(Type.String({ description: "Optional reply-to / thread id." })),
+            }, { description: "Optional override. Defaults to the chat that scheduled the reminder. Use to remind someone in a different chat (e.g. schedule from DM, deliver to a group)." })),
         }),
         async execute(_id, params, _signal, _onUpdate, ctx) {
             const delayMs = Math.max(0, params.minutes_from_now * 60 * 1000);
@@ -328,11 +538,19 @@ export default function (pi: ExtensionAPI) {
             const origin = currentOrigin(ctx.sessionManager);
             const meta: JobMeta = {
                 job_id: `reminder_${Date.now()}`,
+                job_type: "reminder",
                 cron: fireAt.toISOString(), // node-schedule accepts Date too — store ISO for replay
                 task: params.reminder_message,
                 created_at: Date.now(),
                 created_by: origin ? `${origin.platform}:${origin.senderId}` : "cli",
             };
+            if (params.deliver_to) {
+                meta.deliverTarget = {
+                    platform: params.deliver_to.platform,
+                    channelId: params.deliver_to.channelId,
+                    ...(params.deliver_to.threadId !== undefined ? { threadId: params.deliver_to.threadId } : {}),
+                };
+            }
             if (origin && origin.platform !== "cli") {
                 meta.originChannel = {
                     platform: origin.platform,
@@ -340,6 +558,9 @@ export default function (pi: ExtensionAPI) {
                     scheduleId: meta.job_id,
                 };
             }
+            const sessionFile = ctx.sessionManager.getSessionFile();
+            if (sessionFile) meta.origin_session_file = sessionFile;
+
             const job = schedule.scheduleJob(fireAt, () => {
                 void fireJob(meta).then(() => {
                     deleteJobMeta(meta.job_id);
@@ -351,7 +572,7 @@ export default function (pi: ExtensionAPI) {
             saveJobMeta(meta);
             return {
                 content: [{ type: "text", text: `Reminder ${meta.job_id} set. Will fire at ${fireAt.toISOString()}.` }],
-                details: { job_id: meta.job_id, fire_at: fireAt.toISOString() },
+                details: { job_id: meta.job_id, fire_at: fireAt.toISOString(), deliver_to: meta.deliverTarget ?? null },
             };
         },
     });

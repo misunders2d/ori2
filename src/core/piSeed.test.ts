@@ -38,16 +38,13 @@ describe("migrateLegacyVaultKeys", () => {
         assert.equal(getVault().get("GOOGLE_API_KEY"), undefined);
     });
 
-    it("is a no-op when GEMINI_API_KEY already present", () => {
+    it("when both keys present: drops legacy, keeps canonical untouched", () => {
         getVault().set("GEMINI_API_KEY", "existing");
         getVault().set("GOOGLE_API_KEY", "legacy");
         const changed = migrateLegacyVaultKeys();
-        assert.equal(changed, false);
-        // Don't clobber the canonical key.
-        assert.equal(getVault().get("GEMINI_API_KEY"), "existing");
-        // Legacy is left alone when both exist (conservative — operator may
-        // intentionally have both; subsequent cleanup can decide).
-        assert.equal(getVault().get("GOOGLE_API_KEY"), "legacy");
+        assert.equal(changed, true, "cleanup should report change");
+        assert.equal(getVault().get("GEMINI_API_KEY"), "existing", "canonical key preserved");
+        assert.equal(getVault().get("GOOGLE_API_KEY"), undefined, "legacy key dropped");
     });
 
     it("is a no-op when neither key is present", () => {
