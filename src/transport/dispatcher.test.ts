@@ -130,3 +130,114 @@ describe("TransportDispatcher — post-block hooks", () => {
         assert.match(adapter.sent[0]!.response.text ?? "", /forbidden/);
     });
 });
+
+describe("TransportDispatcher — routing on addressedToBot + platform", () => {
+    beforeEach(() => TransportDispatcher.__resetForTests());
+
+    it("CLI inbound always goes to pushToPi (live Pi runtime)", async () => {
+        const d = TransportDispatcher.instance();
+        // Use the CLI adapter sentinel shape — a bare FakeAdapter can't claim
+        // platform="cli" (dispatcher rejects without the __isOriCliAdapter
+        // marker). Build a shim with the marker.
+        const cliLike = Object.assign(new FakeAdapter("cli"), { __isOriCliAdapter: true });
+        d.register(cliLike as unknown as TransportAdapter);
+
+        let pushed = 0;
+        let active = 0;
+        let passive = 0;
+        d.setPushToPi(() => { pushed++; });
+        d.setOnActiveResponse(() => { active++; });
+        d.setOnPassiveContext(() => { passive++; });
+
+        await cliLike.simulateInbound(sampleMsg("cli"));
+        assert.equal(pushed, 1, "CLI must route to pushToPi");
+        assert.equal(active, 0, "CLI must NOT route to onActiveResponse");
+        assert.equal(passive, 0, "CLI must NOT route to onPassiveContext");
+    });
+
+    it("non-CLI addressed=true routes to onActiveResponse (NOT pushToPi)", async () => {
+        const d = TransportDispatcher.instance();
+        const tg = new FakeAdapter("telegram");
+        d.register(tg);
+
+        let pushed = 0;
+        let active = 0;
+        d.setPushToPi(() => { pushed++; });
+        d.setOnActiveResponse(() => { active++; });
+
+        await tg.simulateInbound(sampleMsg("telegram", { addressedToBot: true }));
+        assert.equal(active, 1);
+        assert.equal(pushed, 0, "non-CLI must NOT reach the live runtime");
+    });
+
+    it("non-CLI addressed=false routes to onPassiveContext (NOT pushToPi)", async () => {
+        const d = TransportDispatcher.instance();
+        const tg = new FakeAdapter("telegram");
+        d.register(tg);
+
+        let pushed = 0;
+        let passive = 0;
+        d.setPushToPi(() => { pushed++; });
+        d.setOnPassiveContext(() => { passive++; });
+
+        await tg.simulateInbound(sampleMsg("telegram", { addressedToBot: false }));
+        assert.equal(passive, 1);
+        assert.equal(pushed, 0);
+    });
+
+    it("non-CLI addressed=true is dropped (with warning) when onActiveResponse unwired", async () => {
+        const d = TransportDispatcher.instance();
+        const tg = new FakeAdapter("telegram");
+        d.register(tg);
+        // Intentionally do NOT set onActiveResponse.
+
+        await tg.simulateInbound(sampleMsg("telegram", { addressedToBot: true }));
+        // Adapter.send() NOT invoked — we silently dropped, not replied with
+        // an error. The console.warn is enough signal for operators.
+        assert.equal(tg.sent.length, 0);
+    });
+
+    it("non-CLI addressed=false is dropped (with warning) when onPassiveContext unwired", async () => {
+        const d = TransportDispatcher.instance();
+        const tg = new FakeAdapter("telegram");
+        d.register(tg);
+
+        await tg.simulateInbound(sampleMsg("telegram", { addressedToBot: false }));
+        assert.equal(tg.sent.length, 0);
+    });
+
+    it("CLI messages received before pushToPi wired are buffered and drained on wire-up", async () => {
+        const d = TransportDispatcher.instance();
+        const cliLike = Object.assign(new FakeAdapter("cli"), { __isOriCliAdapter: true });
+        d.register(cliLike as unknown as TransportAdapter);
+
+        // Two CLI messages arrive before the runtime wires pushToPi.
+        await cliLike.simulateInbound(sampleMsg("cli", { text: "first" }));
+        await cliLike.simulateInbound(sampleMsg("cli", { text: "second" }));
+
+        const received: string[] = [];
+        d.setPushToPi((msg) => { received.push(msg.text); });
+
+        // Drain is async (fire-and-forget per the source). Yield once.
+        await new Promise((r) => setImmediate(r));
+        assert.deepEqual(received, ["first", "second"]);
+    });
+
+    it("non-CLI messages received before handlers wired are NOT buffered (dropped)", async () => {
+        const d = TransportDispatcher.instance();
+        const tg = new FakeAdapter("telegram");
+        d.register(tg);
+
+        // This arrives before onActiveResponse is wired — should be dropped
+        // (buffering per-handler types that may never get wired in this
+        // process would leak memory).
+        await tg.simulateInbound(sampleMsg("telegram", { addressedToBot: true }));
+
+        let active = 0;
+        d.setOnActiveResponse(() => { active++; });
+
+        // No drain happened — the earlier message is gone.
+        await new Promise((r) => setImmediate(r));
+        assert.equal(active, 0);
+    });
+});

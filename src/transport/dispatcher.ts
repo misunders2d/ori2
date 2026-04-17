@@ -5,29 +5,35 @@ import { getOrCreate, setSingleton } from "../core/singletons.js";
 export const CLI_RESERVED_NAME = "cli";
 
 // =============================================================================
-// TransportDispatcher — singleton hub between adapters and the Pi runtime.
+// TransportDispatcher — singleton hub between adapters and message handlers.
 //
-// Inbound flow (adapter → Pi):
-//   adapter.handler(msg)                         — adapter calls this on
-//     │                                            receipt
+// Inbound flow (adapter → handler), branching on msg.addressedToBot + platform:
+//   adapter.handler(msg)
 //     └─► dispatcher.dispatch(msg)
 //           │
-//           ├─► runPreDispatchHooks(msg)        — Sprint 5 inserts whitelist
-//           │                                     check; Sprint 8 inserts
-//           │                                     channel logger; Sprint 8
-//           │                                     inserts rate limiter
-//           │     (if any hook returns "block",
-//           │      message is dropped here)
+//           ├─► runPreDispatchHooks(msg)     — whitelist, rate limit, guardrails.
+//           │                                  "block" drops the message here.
 //           │
-//           └─► pushToPi(msg)                   — wired by transport_bridge
-//                                                 extension to call
-//                                                 pi.sendUserMessage(...)
+//           ├─ (msg.platform === "cli")    → pushToPi(msg)
+//           │                                  CLI inbound always goes to the
+//           │                                  live Pi runtime (one AgentSession
+//           │                                  owned by the TUI operator).
+//           │
+//           ├─ (addressedToBot === false)  → onPassiveContext(msg)
+//           │                                  Group-chat line not directed at
+//           │                                  us — append to the channel's
+//           │                                  session as context, no response.
+//           │                                  Wired by channelRouter.
+//           │
+//           └─ (addressedToBot === true)   → onActiveResponse(msg)
+//                                              Non-CLI direct inbound — spawn
+//                                              a subprocess agent against the
+//                                              channel's own session and deliver
+//                                              its output. Wired by channelRouter.
 //
-// Outbound flow (Pi → adapter):
-//   transport_bridge extension on agent_end
-//     │
+// Outbound flow (handler → adapter):
+//   extension/router
 //     └─► dispatcher.send(platform, channelId, response)
-//           │
 //           └─► adapter.send(channelId, response)
 //
 // CROSS-CUTTING HOOKS — explicitly empty arrays at baseline. Future sprints
@@ -47,6 +53,22 @@ export const CLI_RESERVED_NAME = "cli";
 // =============================================================================
 
 export type PushToPi = (msg: Message) => Promise<void> | void;
+
+/**
+ * Handler for passive-context messages — messages that arrive in a multi-user
+ * channel but aren't addressed to the bot. Wired by channelRouter to append to
+ * the channel's session JSONL as a CustomMessageEntry (appears in LLM context
+ * next time the bot IS addressed, but doesn't trigger a turn now).
+ */
+export type OnPassiveContext = (msg: Message) => Promise<void> | void;
+
+/**
+ * Handler for active-response messages on non-CLI platforms — messages that
+ * ARE addressed to the bot and need an agent response. Wired by channelRouter
+ * to spawn `pi -p --session <channel-session.jsonl>` against the channel's
+ * own session and deliver stdout back via dispatcher.send().
+ */
+export type OnActiveResponse = (msg: Message) => Promise<void> | void;
 
 export type PreDispatchHook = (
     msg: Message,
@@ -68,6 +90,8 @@ export class TransportDispatcher {
     private postHooks: PostDispatchHook[] = [];
     private postBlockHooks: PostBlockHook[] = [];
     private pushToPi: PushToPi | null = null;
+    private onPassiveContext: OnPassiveContext | null = null;
+    private onActiveResponse: OnActiveResponse | null = null;
     private buffer: Message[] = [];
 
     static instance(): TransportDispatcher {
@@ -179,8 +203,12 @@ export class TransportDispatcher {
     }
 
     /**
-     * Wire the dispatcher to Pi. Called by the transport_bridge extension on
-     * session_start. Drains any messages that arrived before wiring.
+     * Wire the dispatcher to the live Pi runtime. Called by transport_bridge
+     * extension on session_start. Only invoked for CLI inbound (the TUI
+     * operator's conversation). Non-CLI messages never reach the live runtime
+     * — they go through onPassiveContext / onActiveResponse instead.
+     *
+     * Drains any CLI messages that arrived before wiring.
      */
     setPushToPi(push: PushToPi): void {
         this.pushToPi = push;
@@ -198,6 +226,24 @@ export class TransportDispatcher {
                 }
             })();
         }
+    }
+
+    /**
+     * Wire the passive-context handler. Called by channelRouter during boot.
+     * Subsequent (addressedToBot === false) inbound messages on non-CLI
+     * platforms invoke this instead of pushToPi.
+     */
+    setOnPassiveContext(fn: OnPassiveContext): void {
+        this.onPassiveContext = fn;
+    }
+
+    /**
+     * Wire the active-response handler. Called by channelRouter during boot.
+     * Subsequent (addressedToBot === true && platform !== "cli") inbound
+     * messages invoke this instead of pushToPi.
+     */
+    setOnActiveResponse(fn: OnActiveResponse): void {
+        this.onActiveResponse = fn;
     }
 
     /** Inbound entry point — adapters call this on receipt (via the registered handler). */
@@ -227,15 +273,40 @@ export class TransportDispatcher {
             }
         }
 
-        // 2. Push to Pi (or buffer until wired).
-        if (!this.pushToPi) {
-            this.buffer.push(msg);
-            if (this.buffer.length === 1) {
-                console.log("[transport] message received before Pi runtime wired — buffering");
+        // 2. Route based on platform + addressedToBot.
+        //
+        //    - CLI: always push to the live Pi runtime (operator's TUI).
+        //    - Non-CLI, addressedToBot=false: passive context ingest.
+        //    - Non-CLI, addressedToBot=true:  active subprocess response.
+        //
+        //    If a handler isn't wired yet (boot race), buffer CLI messages
+        //    (preserves prior behavior) and drop non-CLI ones with a log —
+        //    non-CLI inbound rarely arrives before channelRouter boots, but
+        //    when it does we'd rather lose one message than invisibly stash
+        //    unbounded buffers keyed on handler types that may never be
+        //    wired in this process (e.g. scheduler subprocesses).
+        if (msg.platform === "cli") {
+            if (!this.pushToPi) {
+                this.buffer.push(msg);
+                if (this.buffer.length === 1) {
+                    console.log("[transport] CLI message received before Pi runtime wired — buffering");
+                }
+                return;
             }
-            return;
+            await this.pushToPi(msg);
+        } else if (msg.addressedToBot) {
+            if (!this.onActiveResponse) {
+                console.warn(`[transport] active response for ${msg.platform}:${msg.channelId} dropped — onActiveResponse not wired`);
+                return;
+            }
+            await this.onActiveResponse(msg);
+        } else {
+            if (!this.onPassiveContext) {
+                console.warn(`[transport] passive context for ${msg.platform}:${msg.channelId} dropped — onPassiveContext not wired`);
+                return;
+            }
+            await this.onPassiveContext(msg);
         }
-        await this.pushToPi(msg);
 
         // 3. Post-hooks (audit log, metrics).
         for (const hook of this.postHooks) {
