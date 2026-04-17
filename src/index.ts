@@ -1,3 +1,8 @@
+// Side-effect import: patches process.stdout.write to strip pi-tui's kitty
+// keyboard-protocol "report event types" flag (see core/terminalPatch.ts).
+// MUST come before any pi-coding-agent / pi-tui imports so the patch is in
+// place when the TUI activates. Remove once pi-tui fixes upstream.
+import "./core/terminalPatch.js";
 import {
     SessionManager,
     createAgentSessionRuntime,
