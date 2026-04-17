@@ -84,12 +84,18 @@ function formatAttachmentsForPi(msg: Message): string {
     return lines.join("\n");
 }
 
-// ---------- Admin Override Option C — @bot-abort detector ----------
+// ---------- Admin Override Option C — plan-abort detector ----------
 //
-// Matches (case-insensitive):
-//     @bot abort [<optional reason>]
+// Matches a STRUCTURAL command prefix only. Previously also matched "@bot
+// abort" in natural language, but that assumed English speakers — see
+// memory/feedback_no_english_only_intent_regex.md. Admins now must use the
+// explicit `!plan-abort` (or `!plan_abort`) command, which is language-
+// neutral by design (it's a command keyword, not a conversational phrase).
+//
+// Matches (case-insensitive, prefix anchored):
 //     !plan-abort [<optional reason>]
-const ABORT_PATTERN = /^\s*(?:@\w+\s+abort|!plan[_-]abort)(?:\s+(.+))?\s*$/i;
+//     !plan_abort [<optional reason>]
+const ABORT_PATTERN = /^\s*!plan[_-]abort(?:\s+(.+))?\s*$/i;
 
 /**
  * Pre-dispatch hook that catches admin "@bot abort" / "!plan-abort" replies
