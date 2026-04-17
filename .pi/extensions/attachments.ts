@@ -2,8 +2,12 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import fs from "node:fs";
 import path from "node:path";
+import schedule from "node-schedule";
 import { botSubdir } from "../../src/core/paths.js";
 import { fileToPayload, type MediaSaveContext } from "../../src/transport/media.js";
+import { currentOrigin } from "../../src/core/identity.js";
+import { getWhitelist } from "../../src/core/whitelist.js";
+import { logWarning } from "../../src/core/errorLog.js";
 
 // =============================================================================
 // attachments — agent-facing surface for files the user has sent.
@@ -16,18 +20,28 @@ import { fileToPayload, type MediaSaveContext } from "../../src/transport/media.
 // and now asks "what were the top 10 keywords from that file?", the agent
 // has no tool to re-read it.
 //
-// These two tools close that gap. They're deliberately narrow in scope:
+// These tools close that gap. They're deliberately narrow in scope:
 // read-only, sandboxed to the incoming directory, same extraction pipeline
 // the adapter uses on ingest (fileToPayload — PDFs via pdf-parse, text/csv/
 // json decoded UTF-8, images returned with filename only since inlining
 // base64 into tool output isn't useful).
 //
+// Housekeeping:
+//   Without a sweeper, attachments would grow unbounded (a busy bot on
+//   Telegram with CSV-heavy workflows could hit GBs/month). Default
+//   retention: 30 days by mtime. Tunable via ORI2_ATTACHMENT_TTL_DAYS env
+//   var (minimum 1 day; 0 = disabled — not recommended). Sweep runs once
+//   at session_start and daily at 03:00 local time via node-schedule.
+//   Operators can trigger on-demand with the `sweep_attachments_now` tool
+//   (admin-only).
+//
 // Security:
 //   - `filename` must match a file directly inside one of the per-platform
 //     incoming subdirectories. Any `..`, absolute path, or separator in
 //     the name is rejected.
-//   - No write / delete operations. If the operator wants cleanup, they do
-//     it at the filesystem level.
+//   - No write operations. The sweeper is the ONLY code path that deletes,
+//     and it only deletes files whose mtime is older than the retention
+//     window (measured in millseconds-since-epoch, compared to Date.now()).
 // =============================================================================
 
 const INCOMING_ROOT = (): string => botSubdir("incoming");
@@ -279,4 +293,169 @@ export default function (pi: ExtensionAPI) {
             };
         },
     });
+
+    // ---------------- sweep_attachments_now (admin-only) ----------------
+
+    pi.registerTool({
+        name: "sweep_attachments_now",
+        label: "Sweep Old Attachments Now",
+        description:
+            "Manually delete attachments older than the retention window (see " +
+            "ORI2_ATTACHMENT_TTL_DAYS env var; default 30 days). Admin-only. Use when " +
+            "you want to free disk space before the next scheduled sweep fires, or to " +
+            "preview what would be deleted by passing `dry_run`.",
+        parameters: Type.Object({
+            dry_run: Type.Optional(Type.Boolean({
+                description: "If true, report what would be deleted without deleting anything. Defaults to false.",
+            })),
+            ttl_days_override: Type.Optional(Type.Integer({
+                description: "One-shot retention override in days. If omitted, uses ORI2_ATTACHMENT_TTL_DAYS (or the default of 30). Useful for aggressive cleanup ('sweep anything older than 7 days') without changing the boot-time env.",
+                minimum: 1,
+                maximum: 3650,
+            })),
+        }),
+        async execute(_id, params, _signal, _onUpdate, ctx) {
+            const origin = currentOrigin(ctx.sessionManager);
+            if (origin && !getWhitelist().isAdmin(origin.platform, origin.senderId)) {
+                throw new Error("sweep_attachments_now is admin-only.");
+            }
+            const ttlDays = params.ttl_days_override ?? resolveTtlDays();
+            const result = sweepAttachments({ ttlDays, dryRun: !!params.dry_run });
+            const lines = [
+                `Attachment sweep ${params.dry_run ? "(dry-run)" : "complete"}:`,
+                `  Retention: ${ttlDays} day${ttlDays === 1 ? "" : "s"}`,
+                `  Files scanned: ${result.scanned}`,
+                `  Files ${params.dry_run ? "would be deleted" : "deleted"}: ${result.matched}`,
+                `  Bytes freed: ${formatBytes(result.bytesFreed)}`,
+            ];
+            if (result.matched > 0 && result.sample.length > 0) {
+                lines.push("", "  Sample:");
+                for (const s of result.sample) lines.push(`    [${s.platform}] ${s.filename}  (${formatBytes(s.sizeBytes)}, ${new Date(s.mtime).toISOString().slice(0, 10)})`);
+            }
+            return {
+                content: [{ type: "text", text: lines.join("\n") }],
+                details: { ...result, ttlDays, dryRun: !!params.dry_run },
+            };
+        },
+    });
+
+    // ---------------- Sweeper scheduling ----------------
+    //
+    // Runs once on session_start (catches files accumulated during downtime),
+    // then daily at 03:00 local time. Idempotent — second start on the same
+    // session no-ops thanks to the sweeperScheduled flag.
+    pi.on("session_start", async () => {
+        if (sweeperScheduled) return;
+        sweeperScheduled = true;
+        const ttlDays = resolveTtlDays();
+        if (ttlDays <= 0) {
+            // Explicitly disabled via env. No scheduled sweeps; operator is
+            // on the hook for disk management.
+            console.log("[attachments] ORI2_ATTACHMENT_TTL_DAYS=0 — housekeeping disabled. Files will accumulate indefinitely.");
+            return;
+        }
+        // Fire-and-forget the initial sweep so session_start isn't blocked
+        // on a potentially slow fs walk.
+        setImmediate(() => {
+            try {
+                const r = sweepAttachments({ ttlDays, dryRun: false });
+                if (r.matched > 0) {
+                    console.log(`[attachments] startup sweep: deleted ${r.matched} file(s), freed ${formatBytes(r.bytesFreed)}`);
+                }
+            } catch (e) {
+                logWarning("attachments", "startup sweep failed", { err: e instanceof Error ? e.message : String(e) });
+            }
+        });
+        // Daily at 03:00 local — quiet hours for most operators.
+        schedule.scheduleJob("0 3 * * *", () => {
+            try {
+                const r = sweepAttachments({ ttlDays: resolveTtlDays(), dryRun: false });
+                if (r.matched > 0) {
+                    console.log(`[attachments] daily sweep: deleted ${r.matched} file(s), freed ${formatBytes(r.bytesFreed)}`);
+                }
+            } catch (e) {
+                logWarning("attachments", "daily sweep failed", { err: e instanceof Error ? e.message : String(e) });
+            }
+        });
+    });
+}
+
+// =============================================================================
+// Housekeeping helpers
+// =============================================================================
+
+/**
+ * Scheduled-once flag. Extension factories can run multiple times in a
+ * single process when Pi reloads resources (e.g. via /reload), and we don't
+ * want to stack N cron jobs.
+ */
+let sweeperScheduled = false;
+
+const DEFAULT_TTL_DAYS = 30;
+
+function resolveTtlDays(): number {
+    const raw = process.env["ORI2_ATTACHMENT_TTL_DAYS"];
+    if (raw === undefined || raw === "") return DEFAULT_TTL_DAYS;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n < 0) {
+        logWarning("attachments", `ORI2_ATTACHMENT_TTL_DAYS="${raw}" invalid — using default ${DEFAULT_TTL_DAYS}`, {});
+        return DEFAULT_TTL_DAYS;
+    }
+    return Math.floor(n);
+}
+
+interface SweepResult {
+    scanned: number;
+    matched: number;
+    bytesFreed: number;
+    sample: Array<{ platform: string; filename: string; sizeBytes: number; mtime: number }>;
+}
+
+export function sweepAttachments(opts: { ttlDays: number; dryRun: boolean }): SweepResult {
+    const result: SweepResult = { scanned: 0, matched: 0, bytesFreed: 0, sample: [] };
+    if (opts.ttlDays <= 0) return result; // disabled — no-op
+
+    const cutoffMs = Date.now() - opts.ttlDays * 24 * 60 * 60 * 1000;
+    const entries = scan(undefined);
+    result.scanned = entries.length;
+
+    for (const e of entries) {
+        if (e.mtime >= cutoffMs) continue; // within retention
+        result.matched++;
+        result.bytesFreed += e.sizeBytes;
+        if (result.sample.length < 10) {
+            result.sample.push({
+                platform: e.platform,
+                filename: e.filename,
+                sizeBytes: e.sizeBytes,
+                mtime: e.mtime,
+            });
+        }
+        if (!opts.dryRun) {
+            try { fs.unlinkSync(e.absPath); }
+            catch (err) {
+                logWarning("attachments", `failed to delete ${e.absPath}`, { err: err instanceof Error ? err.message : String(err) });
+            }
+        }
+    }
+    return result;
+}
+
+function formatBytes(n: number): string {
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+    if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(2)} MB`;
+    return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+/** Test-only — lets tests reset the module-level scheduled flag + cancel jobs. */
+export function __resetSweeperForTests(): void {
+    sweeperScheduled = false;
+    // node-schedule keeps a global registry; cancel everything created in
+    // this process (tests use distinct cron patterns so this is fine here).
+    for (const name in schedule.scheduledJobs) {
+        if (Object.prototype.hasOwnProperty.call(schedule.scheduledJobs, name)) {
+            schedule.scheduledJobs[name]?.cancel();
+        }
+    }
 }

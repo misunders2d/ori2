@@ -229,3 +229,114 @@ describe("attachments — read_attachment content extraction", () => {
         assert.equal(out.details.kind, "binary");
     });
 });
+
+describe("attachments — housekeeping (sweep)", () => {
+    before(cleanTestDir);
+    after(cleanTestDir);
+    beforeEach(async () => {
+        cleanTestDir();
+        const mod = await import("../.pi/extensions/attachments.js");
+        mod.__resetSweeperForTests();
+    });
+
+    it("sweepAttachments() deletes files older than ttlDays, leaves fresher ones alone", async () => {
+        // Write one "old" file (mtime = 60 days ago) and one "new" (now).
+        const oldPath = writeAttachment("telegram", "old.csv", "stale");
+        const newPath = writeAttachment("telegram", "new.csv", "fresh");
+
+        // Tweak mtime on the old file to 60 days ago.
+        const sixtyDaysAgo = Date.now() - 60 * 24 * 60 * 60 * 1000;
+        fs.utimesSync(oldPath, sixtyDaysAgo / 1000, sixtyDaysAgo / 1000);
+
+        const { sweepAttachments } = await import("../.pi/extensions/attachments.js");
+        const result = sweepAttachments({ ttlDays: 30, dryRun: false });
+
+        assert.equal(result.scanned, 2);
+        assert.equal(result.matched, 1);
+        assert.ok(result.bytesFreed >= "stale".length);
+        assert.equal(fs.existsSync(oldPath), false, "old file should be deleted");
+        assert.equal(fs.existsSync(newPath), true, "new file should remain");
+    });
+
+    it("sweepAttachments() dry_run reports but does NOT delete", async () => {
+        const oldPath = writeAttachment("telegram", "old.csv", "stale");
+        const sixtyDaysAgo = Date.now() - 60 * 24 * 60 * 60 * 1000;
+        fs.utimesSync(oldPath, sixtyDaysAgo / 1000, sixtyDaysAgo / 1000);
+
+        const { sweepAttachments } = await import("../.pi/extensions/attachments.js");
+        const result = sweepAttachments({ ttlDays: 30, dryRun: true });
+
+        assert.equal(result.matched, 1);
+        assert.equal(fs.existsSync(oldPath), true, "dry-run must not delete");
+    });
+
+    it("sweepAttachments() ttlDays=0 is a no-op (housekeeping disabled)", async () => {
+        const oldPath = writeAttachment("telegram", "very_old.csv", "stale");
+        const tenYearsAgo = Date.now() - 10 * 365 * 24 * 60 * 60 * 1000;
+        fs.utimesSync(oldPath, tenYearsAgo / 1000, tenYearsAgo / 1000);
+
+        const { sweepAttachments } = await import("../.pi/extensions/attachments.js");
+        const result = sweepAttachments({ ttlDays: 0, dryRun: false });
+
+        assert.equal(result.scanned, 0);
+        assert.equal(result.matched, 0);
+        assert.equal(fs.existsSync(oldPath), true, "ttlDays=0 must disable sweep");
+    });
+
+    it("sweep_attachments_now tool: admin can dry-run and preview what would be deleted", async () => {
+        // Pre-seed an old file.
+        const oldPath = writeAttachment("telegram", "old_report.csv", "x".repeat(1024));
+        const sixtyDaysAgo = Date.now() - 60 * 24 * 60 * 60 * 1000;
+        fs.utimesSync(oldPath, sixtyDaysAgo / 1000, sixtyDaysAgo / 1000);
+
+        const tools = await loadTools();
+        const t = tools.find((x) => x.name === "sweep_attachments_now");
+        assert.ok(t, "sweep tool must be registered");
+
+        // ctx without origin — extension treats that as "no channel" →
+        // admin check short-circuits allows (like TUI operator).
+        const ctx = {
+            sessionManager: { getBranch: () => [] },
+            hasUI: true,
+        };
+        const out = await t.execute("c", { dry_run: true }, null, null, ctx);
+        assert.match(out.content[0]!.text, /dry-run/);
+        assert.equal(out.details.matched, 1);
+        assert.equal(fs.existsSync(oldPath), true, "dry_run must not delete");
+    });
+
+    it("sweep_attachments_now tool: ttl_days_override narrows the window", async () => {
+        const fivedayPath = writeAttachment("telegram", "five_days_old.csv", "data");
+        const fiveDaysAgo = Date.now() - 5 * 24 * 60 * 60 * 1000;
+        fs.utimesSync(fivedayPath, fiveDaysAgo / 1000, fiveDaysAgo / 1000);
+
+        const tools = await loadTools();
+        const t = tools.find((x) => x.name === "sweep_attachments_now")!;
+        const ctx = { sessionManager: { getBranch: () => [] }, hasUI: true };
+        const out = await t.execute("c", { ttl_days_override: 3, dry_run: false }, null, null, ctx);
+        assert.equal(out.details.matched, 1);
+        assert.equal(fs.existsSync(fivedayPath), false, "5-day-old file exceeds 3-day window — should be deleted");
+    });
+
+    it("sweep_attachments_now tool: rejects non-admin caller with a chat origin", async () => {
+        const { getWhitelist: gw } = await import("./core/whitelist.js");
+        gw().add("telegram", "alice", { roles: ["user"], addedBy: "test" });
+
+        const tools = await loadTools();
+        const t = tools.find((x) => x.name === "sweep_attachments_now")!;
+        const ctx = {
+            sessionManager: {
+                getBranch: () => [{
+                    type: "custom",
+                    customType: "transport-origin",
+                    data: { platform: "telegram", senderId: "alice", senderDisplayName: "Alice", channelId: "-100", timestamp: Date.now() },
+                }],
+            },
+            hasUI: false,
+        };
+        await assert.rejects(
+            async () => { await t.execute("c", {}, null, null, ctx); },
+            /admin-only/i,
+        );
+    });
+});
