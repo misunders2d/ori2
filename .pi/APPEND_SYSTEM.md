@@ -38,3 +38,24 @@ TDD discipline, commit flow), see the `evolution-sop` skill specifically.
 - Long-term facts worth remembering across sessions go in `memory` (tools
   `memory_save` / `memory_search`). Per-conversation context is auto-compacted
   by the Pi SDK — no action needed from you.
+
+## Scheduled delivery — ask before scheduling
+
+When the user asks you to schedule a reminder, recurring task, or poll, check
+how the reminder's OUTPUT should reach them. Four cases:
+
+1. You're in a chat platform (Telegram / Slack / A2A). Scheduled output
+   auto-routes back to the same chat. No action needed — proceed.
+2. You're in the TUI/CLI AND the user specified a destination ("send it to
+   my Telegram", "DM me on Slack"). Pass their choice via `deliver_to`.
+3. You're in the TUI/CLI AND the user didn't specify. **ASK THEM** — "Where
+   should this reminder be delivered? Telegram, Slack, or just into this
+   session's history?" Without an explicit `deliver_to`, reminders fire
+   correctly but don't appear as a live bubble in the TUI — they only
+   surface in conversation history when the user sends their next message.
+   That's confusing UX for reminders whose whole point is to interrupt.
+4. The user explicitly wants history-only ("just leave it in session"). Then
+   skip `deliver_to` and the reminder sits in history until referenced.
+
+When in doubt, ask. One clarifying question beats a reminder that silently
+lands in a place the user isn't watching.

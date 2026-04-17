@@ -627,7 +627,13 @@ export default function (pi: ExtensionAPI) {
             "activates (no skipping, no hallucinating steps). " +
             "For gentle reminders that should NOT execute (e.g. 'remind me to drink coffee') " +
             "use `schedule_reminder` instead — that path tells the fire-time agent to deliver " +
-            "a message rather than do the thing.",
+            "a message rather than do the thing. " +
+            "\n\n" +
+            "DELIVERY: set `deliver_to` explicitly for recurring tasks whose output is " +
+            "user-facing (weekly reports, daily standups). If omitted and the user is in " +
+            "the CLI/TUI, the task runs but results only surface in session history on " +
+            "the NEXT message. ASK THE USER where they want recurring output delivered " +
+            "before scheduling (Telegram? Slack? an A2A peer? the same chat they're in now?).",
         parameters: Type.Object({
             job_id: Type.String({ description: "Unique identifier (e.g. 'daily_inventory')" }),
             cron_expression: Type.String({ description: "Cron expression (e.g. '0 9 * * *' for 9 AM daily)" }),
@@ -689,6 +695,19 @@ export default function (pi: ExtensionAPI) {
             "to the scheduling session's history so future references like 'thanks, just watched " +
             "it' can resolve context. Use this for 'remind me to …' requests. For jobs the agent " +
             "should actually DO, use `schedule_recurring_task`. " +
+            "\n\n" +
+            "WHERE DOES THE REMINDER APPEAR? " +
+            "If `deliver_to` is set, the reminder is pushed to that chat platform as a real " +
+            "message (Telegram bubble, Slack DM, etc.) when it fires. " +
+            "If `deliver_to` is omitted AND the user is talking to you via a chat platform " +
+            "(telegram, slack, a2a), it auto-routes back to that chat. " +
+            "If `deliver_to` is omitted AND the user is in the CLI/TUI (you can see by checking " +
+            "currentOrigin or transport-origin), the reminder IS scheduled and fires correctly, " +
+            "but WILL NOT appear as a live bubble in the TUI — it only appears in conversation " +
+            "history on the NEXT message. In that case, ASK THE USER where they want the " +
+            "reminder sent ('via Telegram? Slack? or just kept in session history?') and pass " +
+            "their choice via `deliver_to`. " +
+            "\n\n" +
             "When writing `reminder_message`, include the context the user currently has in chat " +
             "— the fire-time agent has no conversation history, so 'remind me to watch this movie' " +
             "needs to become 'remind user to watch Oppenheimer (they mentioned it in chat today)'. " +
@@ -755,6 +774,12 @@ export default function (pi: ExtensionAPI) {
             "spawns a fresh subprocess that runs `check_instruction`; that subprocess's agent " +
             "decides whether the condition is met and calls `mark_poll_done` to stop the poll " +
             "and deliver the final result. " +
+            "\n\n" +
+            "DELIVERY: when the poll finishes (via mark_poll_done or timeout), the final result " +
+            "is delivered to `deliver_to` if set, otherwise back to the origin chat. " +
+            "For polls kicked off from the TUI, the final result appears in session history " +
+            "(next message) but not live in the TUI — ASK THE USER where the completion notice " +
+            "should be sent before scheduling. " +
             "\n\n" +
             "Use for async external work the user shouldn't have to watch manually — SP-API " +
             "report jobs, 'ping me when this PR is green', 'notify me when the listing becomes " +
