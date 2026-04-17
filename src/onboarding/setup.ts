@@ -128,62 +128,74 @@ export async function runOnboardingFlow(): Promise<void> {
     });
 
     console.log("\n================================================");
-    console.log("🚀 Welcome to the Ori Platform Setup Wizard 🚀");
+    console.log("🚀 Welcome — let's set up your assistant 🚀");
     console.log("================================================\n");
-    console.log("It looks like this is your first time starting up.");
-    console.log("Let's get your assistant configured in just 3 steps.\n");
+    console.log("This wizard asks 3 questions. Takes about a minute.\n");
 
-    const botNameRaw = await rl.question("1. What would you like to name this assistant? (e.g. MarketingBot): ");
+    // --- 1. Name ---
+    console.log("1️⃣  NAME YOUR ASSISTANT");
+    console.log("   A short nickname, letters/numbers/underscores only.");
+    console.log("   Examples: MarketingBot, amazon_helper, ClaireBot\n");
+    const botNameRaw = await rl.question("   Name: ");
     const safeBotName = botNameRaw.trim().replace(/[^a-zA-Z0-9_-]/g, "_") || "Platform_Controller";
+    if (safeBotName !== botNameRaw.trim()) {
+        console.log(`   (cleaned to: ${safeBotName})`);
+    }
 
-    console.log("\n2. ADMIN identity for chat platforms");
-    console.log("");
-    console.log("   The terminal operator (you, right now) is ALWAYS admin —");
-    console.log("   you own the process and the vault, no setup needed for CLI access.");
-    console.log("");
-    console.log("   For chat platforms (Telegram/Slack/etc.), the recommended path is");
-    console.log("   to claim admin AFTER install via `/init <passcode>` from chat. The");
-    console.log("   passcode is shown ONCE in this boot's log, your chat ID is captured");
-    console.log("   automatically, and the passcode is consumed on first successful claim.");
-    console.log("");
-    console.log("   You can ALSO pre-register chat IDs here in <platform>:<id> format,");
-    console.log("   comma-separated. Examples:");
-    console.log("     telegram:123456789");
-    console.log("     telegram:123456789,slack:U0ABC123XYZ");
-    console.log("   (Telegram numeric ID: message @userinfobot. Slack: profile → More → Copy member ID.)");
-    console.log("");
-    console.log("   Press ENTER to skip — you'll claim admin via /init from chat after install.");
-    const adminIds = (await rl.question("   Pre-registered admin IDs (or ENTER to skip): ")).trim();
+    // --- 2. Admin access (chat-side) ---
+    console.log("\n2️⃣  WHO IS THE ADMIN?");
+    console.log("   You (running this wizard in the terminal) are ALREADY admin — nothing");
+    console.log("   to do for terminal access.\n");
+    console.log("   For chat platforms (Telegram etc.), just press ENTER below. After");
+    console.log("   install the bot prints a one-time passcode — you'll send it to the");
+    console.log("   bot from your chat app (like: /init abc123xyz) and you become admin.\n");
+    console.log("   (Advanced: if you already know your chat IDs, paste them as");
+    console.log("    telegram:123456789 or slack:U0ABC123 — otherwise ENTER to skip.)");
+    const adminIds = (await rl.question("   Admin chat IDs (ENTER to skip): ")).trim();
 
-    console.log("\n3. Choose your primary AI brain. (You can add others later)");
-    console.log("   [1] Google Gemini  (Recommended for embeddings)");
-    console.log("   [2] Anthropic Claude");
-    console.log("   [3] OpenAI GPT-4");
-    const providerChoice = (await rl.question("   Select an option (1-3): ")).trim();
+    // --- 3. AI provider ---
+    console.log("\n3️⃣  PICK AN AI BRAIN");
+    console.log("   Your assistant needs an AI provider key. You can change this later.");
+    console.log("   Pick ONE — whichever you already have an account with.\n");
+    console.log("   [1] Google Gemini   → get a key at https://aistudio.google.com/apikey");
+    console.log("   [2] Anthropic Claude → get a key at https://console.anthropic.com/settings/keys");
+    console.log("   [3] OpenAI (GPT)    → get a key at https://platform.openai.com/api-keys\n");
+    console.log("   Don't have any? → [1] Gemini has a free tier, quickest to sign up.\n");
+    const providerChoice = (await rl.question("   Your pick (1/2/3): ")).trim();
 
-    // Map our user-facing choice (1/2/3) to:
-    //   - Pi's provider name (what goes in auth.json and settings.json)
-    //   - vault key name (Pi SDK env-var convention per
-    //     @mariozechner/pi-ai/dist/env-api-keys.js: google → GEMINI_API_KEY)
-    //   - the human label shown during the prompt
-    let piProvider: "google" | "anthropic" | "openai" = "google";
-    let vaultKey: "GEMINI_API_KEY" | "ANTHROPIC_API_KEY" | "OPENAI_API_KEY" = "GEMINI_API_KEY";
+    // Map choice → (Pi provider name, vault key name per Pi SDK convention,
+    // human-readable provider label for the API key prompt).
+    const providerMap = {
+        "1": { pi: "google" as const,    vaultKey: "GEMINI_API_KEY" as const,    label: "Google Gemini",   url: "https://aistudio.google.com/apikey" },
+        "2": { pi: "anthropic" as const, vaultKey: "ANTHROPIC_API_KEY" as const, label: "Anthropic Claude", url: "https://console.anthropic.com/settings/keys" },
+        "3": { pi: "openai" as const,    vaultKey: "OPENAI_API_KEY" as const,    label: "OpenAI",           url: "https://platform.openai.com/api-keys" },
+    };
+    const chosen = providerMap[providerChoice as "1" | "2" | "3"] ?? providerMap["1"];
+    const piProvider: "google" | "anthropic" | "openai" = chosen.pi;
+    const vaultKey: "GEMINI_API_KEY" | "ANTHROPIC_API_KEY" | "OPENAI_API_KEY" = chosen.vaultKey;
+    if (!providerMap[providerChoice as "1" | "2" | "3"]) {
+        console.log(`   (didn't recognize "${providerChoice}" — defaulting to Google Gemini)`);
+    }
+
+    // Loop until we get a plausible key, OR the user explicitly skips.
+    // Minimum length 20 is a sanity check — real keys are 40-200 chars
+    // depending on provider; anything under 20 is almost certainly a typo.
     let apiKey = "";
-
-    if (providerChoice === "2") {
-        piProvider = "anthropic";
-        vaultKey = "ANTHROPIC_API_KEY";
-        apiKey = (await rl.question("\n   🔑 Enter your Anthropic API Key: ")).trim();
-        console.log("\n   ℹ️  Your prompt-injection guardrail uses LOCAL embeddings (BGE-small) by default — no extra API key needed.");
-        console.log("       You can switch to Google/OpenAI embeddings later by adding their keys via the wizard or vault tools.");
-    } else if (providerChoice === "3") {
-        piProvider = "openai";
-        vaultKey = "OPENAI_API_KEY";
-        apiKey = (await rl.question("\n   🔑 Enter your OpenAI API Key: ")).trim();
-    } else {
-        piProvider = "google";
-        vaultKey = "GEMINI_API_KEY";
-        apiKey = (await rl.question("\n   🔑 Enter your Google Gemini API Key: ")).trim();
+    while (true) {
+        console.log(`\n   Paste your ${chosen.label} API key (get one at ${chosen.url}):`);
+        console.log(`   Or type SKIP to set it up later via /credentials or /oauth.`);
+        const raw = (await rl.question("   Key: ")).trim();
+        if (raw.toUpperCase() === "SKIP") {
+            console.log("   ⚠️  Skipping — you'll need to set a key before the bot can reply.");
+            break;
+        }
+        if (raw.length < 20) {
+            console.log(`   ❌ That doesn't look like a valid API key (too short: ${raw.length} chars).`);
+            console.log(`      Real keys are long strings from ${chosen.url}. Try again or type SKIP.`);
+            continue;
+        }
+        apiKey = raw;
+        break;
     }
 
     rl.close();
