@@ -59,6 +59,33 @@ const PASSIVE_CUSTOM_TYPE = "chat-context";
 /** Per-channel lock promises to serialize writes per channel. */
 const channelLocks = new Map<string, Promise<void>>();
 
+/**
+ * Active subprocess state per channel. Populated when a `doActiveResponse`
+ * starts its spawn, cleared on subprocess exit. Used by the next active
+ * arrival to kill the prior in-flight subprocess (ori/-style mid-flight
+ * interrupt — see telegram_poller.py:731-756).
+ */
+interface ActiveState {
+    controller: AbortController;
+    /** The incoming Message that kicked off this subprocess. Saved as a
+     *  passive context entry if interrupted, so the agent sees what was
+     *  being asked when it got cut off. */
+    kickoffMsg: Message;
+}
+const activeSubprocesses = new Map<string, ActiveState>();
+
+// NOTE: We deliberately do NOT do pre-dispatch cancel-word detection
+// ("cancel"/"stop"/etc). Language-dependent regex would exclude every
+// non-English speaker. Instead, every active mention:
+//   (1) kills the prior subprocess for this channel (if any),
+//   (2) saves the prior mention as a passive context entry,
+//   (3) spawns a FRESH subprocess with the new mention.
+// The new subprocess's LLM sees the interrupted prior mention + the new
+// text and interprets intent (including "cancel" in any language) — that's
+// what the LLM is good at. Cost: one short LLM turn for what could have
+// been a regex short-circuit. Benefit: works for every language the model
+// understands.
+
 function channelKey(platform: string, channelId: string): string {
     return `${platform}:${channelId}`;
 }
@@ -145,22 +172,32 @@ async function doPassiveContext(msg: Message): Promise<void> {
 }
 
 /**
- * Force a session's in-memory entries to disk, bypassing Pi's hasAssistant
- * gating (session-manager.js:549-567). Called after every passive append so
- * subprocesses see the full context, not just entries Pi decided were worth
- * persisting.
+ * Force the entry we JUST appended (via sm.appendX) to disk, bypassing Pi's
+ * hasAssistant gating (session-manager.js:549-567). Append-only (O(1) per
+ * call) so it NEVER overwrites work a concurrent subprocess is doing on the
+ * same JSONL — critical because our active subprocess runs in parallel with
+ * passive ingests for the same channel.
  *
  * TypeScript `private` is compile-only; `fileEntries` is accessible at
  * runtime. Verified at session-manager.js:436 (`fileEntries = []`).
  *
- * Cost: O(N) per passive append. Pi's own format (`_rewriteFile` at
- * session-manager.js:528-532) is line-per-entry JSONL with trailing newline;
- * we replicate that exactly so a subsequent Pi load doesn't need migration.
+ * For a fresh session file (doesn't exist yet) we write header + entries
+ * with writeFileSync — safe because if the file doesn't exist, nothing else
+ * is writing to it either.
  */
 function persistSessionNow(sm: SessionManager, sessionFile: string): void {
     const entries = (sm as unknown as { fileEntries: unknown[] }).fileEntries;
-    const jsonl = entries.map((e) => JSON.stringify(e)).join("\n") + "\n";
-    fs.writeFileSync(sessionFile, jsonl);
+    if (entries.length === 0) return;
+    if (fs.existsSync(sessionFile)) {
+        // File exists — someone (or a prior run) has already written at
+        // least the header. Append only the new entry.
+        const last = entries[entries.length - 1];
+        fs.appendFileSync(sessionFile, JSON.stringify(last) + "\n");
+    } else {
+        // Fresh file — write everything (header + the one entry we just added).
+        const jsonl = entries.map((e) => JSON.stringify(e)).join("\n") + "\n";
+        fs.writeFileSync(sessionFile, jsonl);
+    }
 }
 
 /**
@@ -176,9 +213,21 @@ export interface SpawnResult {
     exitCode: number | null;
 }
 
-export type SpawnPiPrint = (kickoff: string, sessionFile: string) => Promise<SpawnResult>;
+/**
+ * Spawn contract: given kickoff text + session file + an AbortSignal, run the
+ * pi -p subprocess and resolve when it exits. If `signal.abort()` fires
+ * mid-run, the implementation MUST terminate the child (SIGTERM) and resolve
+ * with whatever has been captured (exitCode may be null on signal-kill).
+ * The promise should NOT reject on abort — callers distinguish outcomes via
+ * the returned SpawnResult, not via throws.
+ */
+export type SpawnPiPrint = (
+    kickoff: string,
+    sessionFile: string,
+    signal: AbortSignal,
+) => Promise<SpawnResult>;
 
-const realSpawnPiPrint: SpawnPiPrint = (kickoff, sessionFile) =>
+const realSpawnPiPrint: SpawnPiPrint = (kickoff, sessionFile, signal) =>
     new Promise<SpawnResult>((resolve) => {
         const proc = spawn(
             "npx",
@@ -196,10 +245,59 @@ const realSpawnPiPrint: SpawnPiPrint = (kickoff, sessionFile) =>
         proc.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
         proc.on("close", (code) => resolve({ stdout, stderr, exitCode: code }));
         proc.on("error", (e) => resolve({ stdout, stderr: `${stderr}\nspawn error: ${e.message}`, exitCode: null }));
+
+        const onAbort = () => {
+            // SIGTERM gives the process a chance to flush. Pi's SessionManager
+            // writes on each entry via appendFileSync, so partial state is on
+            // disk regardless — SIGKILL would only risk a torn JSONL line.
+            try { proc.kill("SIGTERM"); } catch { /* already dead */ }
+        };
+        if (signal.aborted) onAbort();
+        else signal.addEventListener("abort", onAbort, { once: true });
     });
 
 async function doActiveResponse(msg: Message, spawnFn: SpawnPiPrint): Promise<void> {
+    const key = channelKey(msg.platform, msg.channelId);
     const sessionFile = getChannelSessions().getOrCreateSessionFile(msg.platform, msg.channelId);
+
+    // ---------------- Mid-flight interrupt (ori/-style) ----------------
+    //
+    // If a subprocess is already running for this channel, cut it off:
+    // save the prior kickoff as a passive context entry (so the agent later
+    // sees what the user had been asking when interrupted), then abort the
+    // AbortController to SIGTERM the child. The serialization enqueue
+    // pattern would otherwise make us wait 5+ seconds for the prior turn
+    // to complete — fine for scheduled work, awful for chat UX.
+    //
+    // Pattern port reference: ori/interfaces/telegram_poller.py:731-756.
+    const prev = activeSubprocesses.get(key);
+    if (prev) {
+        try {
+            const psm = SessionManager.open(sessionFile);
+            psm.appendCustomMessageEntry(
+                PASSIVE_CUSTOM_TYPE,
+                `${prev.kickoffMsg.senderDisplayName} (interrupted): ${prev.kickoffMsg.text}`,
+                false,
+                {
+                    platform: prev.kickoffMsg.platform,
+                    channelId: prev.kickoffMsg.channelId,
+                    senderId: prev.kickoffMsg.senderId,
+                    senderDisplayName: prev.kickoffMsg.senderDisplayName,
+                    timestamp: prev.kickoffMsg.timestamp,
+                    interrupted: true,
+                },
+            );
+            persistSessionNow(psm, sessionFile);
+        } catch (e) {
+            logWarning("channelRouter", "failed to save interrupted kickoff as context", {
+                err: e instanceof Error ? e.message : String(e),
+                platform: msg.platform,
+                channelId: msg.channelId,
+            });
+        }
+        prev.controller.abort();
+        activeSubprocesses.delete(key);
+    }
 
     // Seed a transport-origin CustomEntry before spawning so that tools in
     // the subprocess can call currentOrigin() and learn who this active turn
@@ -233,7 +331,24 @@ async function doActiveResponse(msg: Message, spawnFn: SpawnPiPrint): Promise<vo
 
     const kickoff = formatActiveKickoff(msg);
 
-    const result = await spawnFn(kickoff, sessionFile);
+    const controller = new AbortController();
+    activeSubprocesses.set(key, { controller, kickoffMsg: msg });
+    let result: SpawnResult;
+    try {
+        result = await spawnFn(kickoff, sessionFile, controller.signal);
+    } finally {
+        // Only clear if we're still the registered controller — a later
+        // interrupt may have replaced us with a fresh one.
+        const current = activeSubprocesses.get(key);
+        if (current && current.controller === controller) {
+            activeSubprocesses.delete(key);
+        }
+    }
+
+    // If we were aborted, the subprocess was killed — DON'T deliver its
+    // truncated stdout. The next active response (already enqueued by the
+    // same interrupt that killed us) will produce the real answer.
+    if (controller.signal.aborted) return;
     if (result.exitCode !== 0) {
         logWarning("channelRouter", "subprocess non-zero exit — no delivery", {
             platform: msg.platform,
@@ -274,11 +389,18 @@ async function doActiveResponse(msg: Message, spawnFn: SpawnPiPrint): Promise<vo
  */
 export function installChannelRouter(spawnFn: SpawnPiPrint = realSpawnPiPrint): void {
     const d = getDispatcher();
+    // Passive ingests serialize per channel so concurrent passives on the
+    // same channel don't interleave (quick, never blocks the adapter).
     d.setOnPassiveContext((msg) => {
         enqueueForChannel(msg.platform, msg.channelId, () => doPassiveContext(msg));
     });
+    // Active responses DO NOT serialize. A new mention on a channel that's
+    // already running a subprocess must interrupt it — queueing behind would
+    // mean the user waits 5s+ for their "never mind" / "actually something
+    // else" to even start being processed. doActiveResponse handles the
+    // kill-prior + spawn-new pattern inline (see its body).
     d.setOnActiveResponse((msg) => {
-        enqueueForChannel(msg.platform, msg.channelId, () => doActiveResponse(msg, spawnFn));
+        void doActiveResponse(msg, spawnFn);
     });
 }
 

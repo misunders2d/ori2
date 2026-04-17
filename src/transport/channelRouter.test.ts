@@ -229,75 +229,172 @@ describe("channelRouter — active path", () => {
     });
 });
 
-describe("channelRouter — per-channel serialization", () => {
+describe("channelRouter — mid-flight interrupt (ori/-style)", () => {
     beforeEach(resetAll);
     after(cleanTestDir);
 
-    it("serializes two inbound on the SAME channel (they do not overlap)", async () => {
+    it("a new active mention on the same channel ABORTS the running subprocess", async () => {
         const d = TransportDispatcher.instance();
         const tg = new FakeAdapter("telegram");
         d.register(tg);
 
-        // A controllable spawn — each call waits on an external resolver so
-        // we can directly observe overlap. If calls were concurrent, both
-        // would be pending at the same time.
-        const pending: Array<(r: { stdout: string; stderr: string; exitCode: number }) => void> = [];
-        let startedCount = 0;
-        const fakeSpawn: SpawnPiPrint = () => new Promise((resolve) => {
-            startedCount++;
-            pending.push(resolve);
+        const pending: Array<{
+            resolve: (r: { stdout: string; stderr: string; exitCode: number | null }) => void;
+            signal: AbortSignal;
+            aborted: boolean;
+        }> = [];
+        const fakeSpawn: SpawnPiPrint = (_k, _f, signal) => new Promise((resolve) => {
+            const slot = { resolve, signal, aborted: false };
+            pending.push(slot);
+            signal.addEventListener("abort", () => {
+                slot.aborted = true;
+                // Simulate a SIGTERM'd subprocess: resolve with null exitCode.
+                resolve({ stdout: "", stderr: "SIGTERM", exitCode: null });
+            }, { once: true });
         });
         installChannelRouter(fakeSpawn);
 
-        // Enqueue two messages on the SAME channel. First one starts spawn;
-        // second one should NOT start until the first resolves.
+        // First active — starts spawn, hangs.
         await tg.simulateInbound(baseMsg({ text: "first" }));
+        await new Promise((r) => setImmediate(r));
+        assert.equal(pending.length, 1, "first spawn should have started");
+        assert.equal(pending[0]!.aborted, false);
+
+        // Second active on SAME channel — must abort the first.
         await tg.simulateInbound(baseMsg({ text: "second" }));
-
-        // Yield a few microtasks so any eager starts fire.
         await new Promise((r) => setImmediate(r));
         await new Promise((r) => setImmediate(r));
 
-        assert.equal(startedCount, 1, "second must not start until first resolves");
+        assert.equal(pending[0]!.aborted, true, "first subprocess should have been aborted");
+        assert.equal(pending.length, 2, "second spawn should have started");
 
-        // Finish the first one.
-        pending[0]!({ stdout: "out-1", stderr: "", exitCode: 0 });
-        // Wait for second to start.
-        await new Promise((r) => setImmediate(r));
-        await new Promise((r) => setImmediate(r));
-        assert.equal(startedCount, 2, "second should start once first resolves");
-
-        pending[1]!({ stdout: "out-2", stderr: "", exitCode: 0 });
+        // Finish the second normally.
+        pending[1]!.resolve({ stdout: "answer from second", stderr: "", exitCode: 0 });
         await __drainChannelLocksForTests();
 
-        assert.deepEqual(tg.sent.map((s) => s.response.text), ["out-1", "out-2"]);
+        // Only the second's output is delivered; the aborted first's is discarded.
+        assert.equal(tg.sent.length, 1);
+        assert.equal(tg.sent[0]!.response.text, "answer from second");
     });
 
-    it("does NOT serialize across DIFFERENT channels (they run in parallel)", async () => {
+    it("saves the interrupted prior kickoff as a passive context entry", async () => {
         const d = TransportDispatcher.instance();
         const tg = new FakeAdapter("telegram");
         d.register(tg);
 
-        const pending: Array<(r: { stdout: string; stderr: string; exitCode: number }) => void> = [];
-        let startedCount = 0;
-        const fakeSpawn: SpawnPiPrint = () => new Promise((resolve) => {
-            startedCount++;
-            pending.push(resolve);
+        const pending: Array<{ resolve: (r: { stdout: string; stderr: string; exitCode: number | null }) => void; signal: AbortSignal }> = [];
+        const fakeSpawn: SpawnPiPrint = (_k, _f, signal) => new Promise((resolve) => {
+            pending.push({ resolve, signal });
+            signal.addEventListener("abort", () => {
+                resolve({ stdout: "", stderr: "SIGTERM", exitCode: null });
+            }, { once: true });
+        });
+        installChannelRouter(fakeSpawn);
+
+        await tg.simulateInbound(baseMsg({
+            senderDisplayName: "Alice",
+            text: "summarize everything since Monday",
+        }));
+        await new Promise((r) => setImmediate(r));
+        // Interrupt with a different mention:
+        await tg.simulateInbound(baseMsg({
+            senderDisplayName: "Bob",
+            text: "actually just the last hour",
+        }));
+        await new Promise((r) => setImmediate(r));
+
+        // The session file should now contain a passive entry for Alice's
+        // interrupted request.
+        const sessionFile = getChannelSessions().get("telegram", "-100abc")!;
+        const entries = fs.readFileSync(sessionFile, "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+        const interruptedEntry = entries.find((e) =>
+            e.type === "custom_message" &&
+            e.customType === "chat-context" &&
+            typeof e.content === "string" &&
+            e.content.includes("interrupted") &&
+            e.content.includes("Alice"),
+        );
+        assert.ok(
+            interruptedEntry,
+            `expected a passive context entry for the interrupted Alice request; session has ${entries.length} entries`,
+        );
+
+        // Cleanup the still-pending second promise.
+        pending[1]!.resolve({ stdout: "short answer", stderr: "", exitCode: 0 });
+        await __drainChannelLocksForTests();
+    });
+
+    it("does NOT abort across DIFFERENT channels (independent subprocess lifecycles)", async () => {
+        const d = TransportDispatcher.instance();
+        const tg = new FakeAdapter("telegram");
+        d.register(tg);
+
+        const pending: Array<{ resolve: (r: { stdout: string; stderr: string; exitCode: number | null }) => void; aborted: boolean; signal: AbortSignal }> = [];
+        const fakeSpawn: SpawnPiPrint = (_k, _f, signal) => new Promise((resolve) => {
+            const slot = { resolve, aborted: false, signal };
+            pending.push(slot);
+            signal.addEventListener("abort", () => {
+                slot.aborted = true;
+                resolve({ stdout: "", stderr: "SIGTERM", exitCode: null });
+            }, { once: true });
         });
         installChannelRouter(fakeSpawn);
 
         await tg.simulateInbound(baseMsg({ channelId: "chan-A", text: "A1" }));
         await tg.simulateInbound(baseMsg({ channelId: "chan-B", text: "B1" }));
-
         await new Promise((r) => setImmediate(r));
         await new Promise((r) => setImmediate(r));
 
-        assert.equal(startedCount, 2, "both channels should start in parallel");
+        assert.equal(pending.length, 2, "both channel subprocesses should be running");
+        assert.equal(pending[0]!.aborted, false, "chan-A must not be aborted by chan-B's activity");
+        assert.equal(pending[1]!.aborted, false);
 
-        pending[0]!({ stdout: "A-out", stderr: "", exitCode: 0 });
-        pending[1]!({ stdout: "B-out", stderr: "", exitCode: 0 });
+        pending[0]!.resolve({ stdout: "A-out", stderr: "", exitCode: 0 });
+        pending[1]!.resolve({ stdout: "B-out", stderr: "", exitCode: 0 });
         await __drainChannelLocksForTests();
 
         assert.equal(tg.sent.length, 2);
+    });
+
+    it("a cancel-intent message (any language) is handled by the LLM in the fresh subprocess — no hardcoded word list", async () => {
+        // Contract: channelRouter does NOT inspect message text for cancel
+        // keywords. Whatever language the user uses to say "cancel", it's
+        // the SUBPROCESS LLM's job to interpret and respond. Interruption
+        // always happens (so the user gets a fast response), spawn always
+        // follows.
+        const d = TransportDispatcher.instance();
+        const tg = new FakeAdapter("telegram");
+        d.register(tg);
+
+        let spawnKickoffs: string[] = [];
+        const fakeSpawn: SpawnPiPrint = (kickoff, _f, signal) => new Promise((resolve) => {
+            spawnKickoffs.push(kickoff);
+            signal.addEventListener("abort", () => {
+                resolve({ stdout: "", stderr: "SIGTERM", exitCode: null });
+            }, { once: true });
+            // Resolve normally for non-aborted calls after a microtask.
+            queueMicrotask(() => {
+                if (!signal.aborted) resolve({ stdout: "llm-reply", stderr: "", exitCode: 0 });
+            });
+        });
+        installChannelRouter(fakeSpawn);
+
+        // Non-English "cancel" — Ukrainian, Russian, German — must all reach
+        // the subprocess with their original text for the LLM to interpret.
+        const cases = ["скасуй", "отмена", "abbrechen", "cancel", "stop"];
+        for (const txt of cases) {
+            const sent = tg.sent.length;
+            await tg.simulateInbound(baseMsg({ text: txt }));
+            await __drainChannelLocksForTests();
+            // Some kickoff must have been sent for this message (either the
+            // new one, or — if an abort fired — the previous one survived and
+            // delivered). Key invariant: text is NOT short-circuited by any
+            // regex; the subprocess is spawned.
+            assert.ok(
+                spawnKickoffs.some((k) => k.includes(txt)),
+                `expected spawn kickoff containing "${txt}" — router must not filter non-English cancel words`,
+            );
+            void sent;
+        }
     });
 });
