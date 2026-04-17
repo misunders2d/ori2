@@ -259,3 +259,21 @@ describe("arch invariant: AGENTS.md is present at repo root", () => {
         assert.match(content, /Hard rules/i, "AGENTS.md should have a Hard rules section");
     });
 });
+
+describe("arch invariant: APPEND_SYSTEM.md imposes terse-style default", () => {
+    // Runtime behavior — every agent turn sees APPEND_SYSTEM.md prepended
+    // to its system prompt. The terse-response protocol is baseline
+    // default; removing it silently would change user-visible agent
+    // behavior across every fork. Pin it here.
+    it(".pi/APPEND_SYSTEM.md has the caveman/terse response-style directive", () => {
+        const file = path.join(REPO_ROOT, ".pi", "APPEND_SYSTEM.md");
+        assert.ok(fs.existsSync(file), "APPEND_SYSTEM.md missing — no runtime directives will reach the agent");
+        const content = fs.readFileSync(file, "utf-8");
+        // Require both the anchor phrase and the revert-to-prose escape hatch
+        // so an edit that drops one without the other is flagged.
+        assert.match(content, /caveman-terse|Execute first, talk second/i,
+            "APPEND_SYSTEM.md should impose the terse response-style default");
+        assert.match(content, /Revert to normal prose|security warnings/i,
+            "APPEND_SYSTEM.md terse section should document when to revert to normal prose");
+    });
+});
