@@ -57,7 +57,7 @@ const TELEGRAM_API_BASE = "https://api.telegram.org";
 const POLL_TIMEOUT_SECS = 30;
 const MAX_TELEGRAM_TEXT = 4096; // Telegram message text limit
 
-interface TelegramUser {
+export interface TelegramUser {
     id: number;
     is_bot: boolean;
     first_name: string;
@@ -90,13 +90,25 @@ interface TelegramDocument {
     file_size?: number;
 }
 
-interface TelegramMessage {
+/** Subset of Telegram MessageEntity we use for mention detection. */
+interface TelegramEntity {
+    /** "mention" = @username; "text_mention" = link to a user (includes private users with no @username). */
+    type: "mention" | "text_mention" | string;
+    offset: number;
+    length: number;
+    /** Only present for "text_mention". */
+    user?: TelegramUser;
+}
+
+export interface TelegramMessage {
     message_id: number;
     from?: TelegramUser;
     chat: TelegramChat;
     date: number;
     text?: string;
     caption?: string;
+    entities?: TelegramEntity[];
+    caption_entities?: TelegramEntity[];
     photo?: TelegramPhotoSize[];
     document?: TelegramDocument;
     audio?: TelegramDocument & { duration: number };
@@ -287,6 +299,7 @@ export class TelegramAdapter implements TransportAdapter {
             senderDisplayName,
             timestamp: m.date * 1000,
             text,
+            addressedToBot: isAddressedToBot(m, text, this.botInfo),
             raw: m,
         };
         if (attachments.length > 0) incoming.attachments = attachments;
@@ -410,6 +423,42 @@ export class TelegramAdapter implements TransportAdapter {
             console.error("[telegram] failed to persist offset:", e);
         }
     }
+}
+
+/**
+ * Decide if a Telegram message is directly addressed to our bot.
+ *
+ * DM (chat.type === "private"): always true — every DM is for the bot.
+ *
+ * Group / supergroup / channel:
+ *   - `reply_to_message.from.id === bot.id` — replying to a bot message.
+ *   - `entities` contains a `mention` whose span equals `@<bot.username>`.
+ *   - `entities` contains a `text_mention` whose `user.id === bot.id`
+ *     (covers users without a public @username).
+ *   - Same checks on `caption_entities` for media with caption.
+ *
+ * Exported for unit testing; intentionally pure.
+ */
+export function isAddressedToBot(
+    m: TelegramMessage,
+    text: string,
+    botInfo: TelegramUser | undefined,
+): boolean {
+    if (m.chat.type === "private") return true;
+    if (!botInfo) return false; // can't decide without our own id/username
+
+    if (m.reply_to_message?.from?.id === botInfo.id) return true;
+
+    const botUsernameLc = botInfo.username?.toLowerCase();
+    const entities = [...(m.entities ?? []), ...(m.caption_entities ?? [])];
+    for (const e of entities) {
+        if (e.type === "text_mention" && e.user?.id === botInfo.id) return true;
+        if (e.type === "mention" && botUsernameLc) {
+            const span = text.slice(e.offset, e.offset + e.length).toLowerCase();
+            if (span === `@${botUsernameLc}`) return true;
+        }
+    }
+    return false;
 }
 
 function chunkText(text: string, max: number): string[] {

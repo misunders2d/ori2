@@ -38,6 +38,7 @@ function sampleMsg(platform: string, overrides?: Partial<Message>): Message {
         senderDisplayName: "User One",
         timestamp: Date.now(),
         text: "hello",
+        addressedToBot: true,
         ...overrides,
     };
 }

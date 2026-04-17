@@ -11,6 +11,7 @@ function msg(overrides?: Partial<Message>): Message {
         senderDisplayName: "Peer",
         timestamp: Date.now(),
         text: "hi",
+        addressedToBot: true,
         ...overrides,
     };
 }

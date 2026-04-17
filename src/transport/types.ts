@@ -58,6 +58,29 @@ export interface Message {
     /** Plain text content of the message. May be empty if message was attachments-only. */
     text: string;
 
+    /**
+     * Whether this message is directly addressed to the bot.
+     *
+     * Set by the ADAPTER (not by the dispatcher or hooks) based on
+     * platform-native signals — Telegram `entities` mention of the bot's
+     * username, `text_mention` pointing at the bot's user id, or a
+     * `reply_to_message` whose `from.id` is the bot. CLI and A2A are
+     * always `true` (CLI = operator talking to bot; A2A = peer RPC).
+     *
+     * Dispatcher routing:
+     *   - true  → ACTIVE path: spawn a subprocess agent against the
+     *             channel's session, capture stdout, deliver back via
+     *             this adapter's send().
+     *   - false → PASSIVE path: append to the channel's session as a
+     *             `CustomMessageEntry` so future mentions have context.
+     *             No agent run, no response sent.
+     *
+     * In group chats / channels this is the mention-only-response contract.
+     * In DMs, platforms SHOULD set it to true unconditionally (every DM is
+     * addressed to the bot).
+     */
+    addressedToBot: boolean;
+
     /** Pre-processed attachments. Adapter has already done extraction/decoding. */
     attachments?: MediaPayload[];
 

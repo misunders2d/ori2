@@ -55,6 +55,9 @@ export class A2AAgentExecutor implements AgentExecutor {
             senderDisplayName: friendName,
             timestamp: Date.now(),
             text: inboundText,
+            // A2A is peer-to-peer direct RPC — every inbound is addressed
+            // to us by definition.
+            addressedToBot: true,
         };
 
         try {
