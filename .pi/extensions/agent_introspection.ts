@@ -126,37 +126,47 @@ export default function (pi: ExtensionAPI) {
         name: "set_channel_model",
         label: "Set Channel Model",
         description:
-            "Set the LLM model to use for FUTURE responses in the current chat/channel. " +
-            "Takes effect on the next message — not this one (the current subprocess is already " +
-            "running on whatever model it was spawned with). ADMIN-ONLY: prevents random users " +
-            "from running up costs or swapping capabilities. Call list_available_models first " +
-            "to confirm the provider + model_id are valid. " +
-            "To clear an override and fall back to the bot-wide default, set provider='' and model_id=''.",
+            "Set the LLM model to use for FUTURE responses in a chat/channel. Takes effect on " +
+            "the NEXT message — the current response is still on the old model (the running " +
+            "subprocess can't be re-modeled mid-turn). " +
+            "\n\n" +
+            "Target resolution (in order): " +
+            "(1) if you provide `target_platform` and `target_channel_id`, those are used — " +
+            "use this from the TUI to set a remote channel's model; " +
+            "(2) otherwise the current chat's channel is used — the normal case for 'switch " +
+            "to Opus here' in a Telegram/Slack group. " +
+            "\n\n" +
+            "ADMIN-ONLY. Call list_available_models first to confirm provider+model_id exist. " +
+            "To clear an override and fall back to the bot-wide default, pass provider='' and " +
+            "model_id='' (with the usual target resolution). " +
+            "\n\n" +
+            "Note: this cannot change the model of the CURRENT TUI session — extensions have no " +
+            "access to the live AgentSession.setModel(). Use Pi's /model slash command for that.",
         parameters: Type.Object({
-            provider: Type.String({ description: "Provider id from list_available_models (e.g. 'anthropic', 'openai', 'google'). Empty string to clear." }),
-            model_id: Type.String({ description: "Model id from list_available_models (e.g. 'claude-opus-4-5'). Empty string to clear." }),
-            thinking_level: Type.Optional(Type.String({ description: "Optional thinking level: off | minimal | low | medium | high | xhigh. Omit for model default." })),
+            provider: Type.String({ description: "Provider id (e.g. 'anthropic', 'openai', 'google'). Empty string to clear." }),
+            model_id: Type.String({ description: "Model id (e.g. 'claude-opus-4-5'). Empty string to clear." }),
+            thinking_level: Type.Optional(Type.String({ description: "off | minimal | low | medium | high | xhigh. Omit for model default." })),
+            target_platform: Type.Optional(Type.String({ description: "Platform of the target channel — 'telegram', 'slack', 'a2a'. Optional; defaults to current chat. Required when calling from TUI." })),
+            target_channel_id: Type.Optional(Type.String({ description: "Channel id on target_platform. Optional; defaults to current chat. Required alongside target_platform." })),
         }),
         async execute(_id, params, _signal, _onUpdate, ctx) {
-            const origin = currentOrigin(ctx.sessionManager);
-            if (!origin) {
-                throw new Error("set_channel_model requires an identifiable origin (channel). Not available in this context.");
-            }
-            if (!getWhitelist().isAdmin(origin.platform, origin.senderId)) {
-                throw new Error("set_channel_model is admin-only. Ask an admin to run this tool.");
-            }
+            const resolved = resolveTargetAndAdmin(ctx, {
+                targetPlatform: params.target_platform,
+                targetChannelId: params.target_channel_id,
+                toolName: "set_channel_model",
+            });
 
             // Clear path: empty strings → remove the override.
             if (!params.provider && !params.model_id) {
-                const had = getChannelModels().clear(origin.platform, origin.channelId);
+                const had = getChannelModels().clear(resolved.target.platform, resolved.target.channelId);
                 return {
                     content: [{
                         type: "text",
                         text: had
-                            ? `Cleared model override for ${origin.platform}:${origin.channelId}. Future responses will use the bot-wide default.`
-                            : `No override was set for ${origin.platform}:${origin.channelId}.`,
+                            ? `Cleared model override for ${resolved.target.platform}:${resolved.target.channelId}. Future responses will use the bot-wide default.`
+                            : `No override was set for ${resolved.target.platform}:${resolved.target.channelId}.`,
                     }],
-                    details: { cleared: had, platform: origin.platform, channelId: origin.channelId },
+                    details: { cleared: had, ...resolved.target },
                 };
             }
 
@@ -164,7 +174,7 @@ export default function (pi: ExtensionAPI) {
                 throw new Error("Both provider and model_id must be provided together (or both empty to clear).");
             }
 
-            // Validate against the configured models — reject typos and models
+            // Validate against configured models — reject typos and models
             // the bot can't actually use (no API key).
             const found = ctx.modelRegistry.find(params.provider, params.model_id);
             if (!found) {
@@ -174,12 +184,11 @@ export default function (pi: ExtensionAPI) {
                 );
             }
 
-            const setByOpt = origin.senderDisplayName ?? origin.senderId;
-            getChannelModels().set(origin.platform, origin.channelId, {
+            getChannelModels().set(resolved.target.platform, resolved.target.channelId, {
                 provider: params.provider,
                 modelId: params.model_id,
                 ...(params.thinking_level !== undefined ? { thinkingLevel: params.thinking_level } : {}),
-                setBy: `${origin.platform}:${origin.senderId} (${setByOpt})`,
+                setBy: resolved.callerDesc,
             });
 
             const suffix = params.thinking_level ? ` at thinking=${params.thinking_level}` : "";
@@ -187,16 +196,15 @@ export default function (pi: ExtensionAPI) {
                 content: [{
                     type: "text",
                     text:
-                        `Channel model set to ${params.provider}/${params.model_id}${suffix}. ` +
-                        `The NEXT message in this channel will run on the new model. ` +
-                        `The current response you're about to receive is still on the old one.`,
+                        `Channel model for ${resolved.target.platform}:${resolved.target.channelId} set to ` +
+                        `${params.provider}/${params.model_id}${suffix}. The next message in that channel ` +
+                        `runs on the new model.`,
                 }],
                 details: {
                     provider: params.provider,
                     modelId: params.model_id,
                     ...(params.thinking_level !== undefined ? { thinkingLevel: params.thinking_level } : {}),
-                    platform: origin.platform,
-                    channelId: origin.channelId,
+                    ...resolved.target,
                 },
             };
         },
@@ -263,30 +271,110 @@ export default function (pi: ExtensionAPI) {
         name: "reset_channel_session",
         label: "Reset Channel Session",
         description:
-            "Start a fresh conversation for this channel. Drops the binding that links " +
-            "this channel to its session JSONL, so the NEXT message creates a new session " +
-            "with empty history. The old JSONL stays on disk (operator can recover manually). " +
-            "ADMIN-ONLY. Use when the user explicitly asks to start over — 'new conversation', " +
-            "'forget everything', 'clear'. Warn them this is irreversible from their side.",
-        parameters: Type.Object({}),
-        async execute(_id, _params, _signal, _onUpdate, ctx) {
-            const origin = currentOrigin(ctx.sessionManager);
-            if (!origin) {
-                throw new Error("reset_channel_session requires an identifiable origin (channel).");
-            }
-            if (!getWhitelist().isAdmin(origin.platform, origin.senderId)) {
-                throw new Error("reset_channel_session is admin-only.");
-            }
-            const had = getChannelSessions().remove(origin.platform, origin.channelId);
+            "Start a fresh conversation for a chat/channel. Drops the binding that links " +
+            "the channel to its session JSONL, so the NEXT message creates a new session with " +
+            "empty history. The old JSONL stays on disk (operator can recover manually). " +
+            "\n\n" +
+            "Target resolution: same as set_channel_model — optional `target_platform` + " +
+            "`target_channel_id` to reset a specific remote channel from the TUI, or omit to " +
+            "reset the current chat. ADMIN-ONLY.",
+        parameters: Type.Object({
+            target_platform: Type.Optional(Type.String({ description: "Platform of the target channel. Optional; defaults to current chat." })),
+            target_channel_id: Type.Optional(Type.String({ description: "Channel id on target_platform. Optional; defaults to current chat." })),
+        }),
+        async execute(_id, params, _signal, _onUpdate, ctx) {
+            const resolved = resolveTargetAndAdmin(ctx, {
+                targetPlatform: params.target_platform,
+                targetChannelId: params.target_channel_id,
+                toolName: "reset_channel_session",
+            });
+
+            const had = getChannelSessions().remove(resolved.target.platform, resolved.target.channelId);
             return {
                 content: [{
                     type: "text",
                     text: had
-                        ? `Session binding for ${origin.platform}:${origin.channelId} cleared. The next message in this channel starts fresh.`
-                        : `No session binding existed for ${origin.platform}:${origin.channelId} — nothing to reset.`,
+                        ? `Session binding for ${resolved.target.platform}:${resolved.target.channelId} cleared. The next message in that channel starts fresh.`
+                        : `No session binding existed for ${resolved.target.platform}:${resolved.target.channelId} — nothing to reset.`,
                 }],
-                details: { reset: had, platform: origin.platform, channelId: origin.channelId },
+                details: { reset: had, ...resolved.target },
             };
         },
     });
+}
+
+// -----------------------------------------------------------------------------
+// Shared helper — resolves (target channel, admin check) for tools that need
+// both. Called by set_channel_model and reset_channel_session.
+//
+// Target resolution:
+//   1. explicit target_platform AND target_channel_id → use them.
+//   2. otherwise: current chat origin (from session's transport-origin entry).
+//   3. otherwise: fail.
+//
+// Admin check:
+//   - If we resolved an origin: check whitelist.isAdmin(origin.platform, senderId).
+//   - If no origin but ctx.hasUI (TUI): operator is implicit admin (owns the
+//     process, the vault, the data dir — CLI is implicit admin per
+//     Whitelist.isAdmin). Verified in whitelist.ts:196.
+//   - If no origin AND !ctx.hasUI (a subprocess with no transport-origin seed,
+//     which shouldn't normally happen — channelRouter always seeds it): fail
+//     closed. ctx.hasUI verified at pi-coding-agent types.d.ts:184.
+// -----------------------------------------------------------------------------
+
+interface ResolveArgs {
+    targetPlatform?: string | undefined;
+    targetChannelId?: string | undefined;
+    toolName: string;
+}
+
+function resolveTargetAndAdmin(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ctx: any,
+    args: ResolveArgs,
+): { target: { platform: string; channelId: string }; callerDesc: string } {
+    const origin = currentOrigin(ctx.sessionManager);
+
+    // ---- target ----
+    let target: { platform: string; channelId: string };
+    const hasTP = typeof args.targetPlatform === "string" && args.targetPlatform.length > 0;
+    const hasTC = typeof args.targetChannelId === "string" && args.targetChannelId.length > 0;
+    if (hasTP && hasTC) {
+        target = { platform: args.targetPlatform!, channelId: args.targetChannelId! };
+    } else if (hasTP || hasTC) {
+        throw new Error(`${args.toolName}: target_platform and target_channel_id must be provided together.`);
+    } else if (origin) {
+        target = { platform: origin.platform, channelId: origin.channelId };
+    } else if (ctx.hasUI) {
+        throw new Error(
+            `${args.toolName}: you're calling from the TUI, which has no implicit channel. ` +
+            `Pass target_platform and target_channel_id explicitly — e.g. ` +
+            `target_platform='telegram', target_channel_id='-100123456'.`,
+        );
+    } else {
+        throw new Error(
+            `${args.toolName}: no current channel origin and not running in TUI. ` +
+            `Cannot infer target channel.`,
+        );
+    }
+
+    // ---- admin check ----
+    let isAdmin: boolean;
+    let callerDesc: string;
+    if (origin) {
+        isAdmin = getWhitelist().isAdmin(origin.platform, origin.senderId);
+        callerDesc = `${origin.platform}:${origin.senderId} (${origin.senderDisplayName ?? origin.senderId})`;
+    } else if (ctx.hasUI) {
+        // TUI operator owns the process — implicit admin. Matches the same
+        // short-circuit in Whitelist.isAdmin for platform="cli".
+        isAdmin = true;
+        callerDesc = "cli:operator (TUI)";
+    } else {
+        throw new Error(`${args.toolName}: cannot identify caller.`);
+    }
+    if (!isAdmin) {
+        throw new Error(`${args.toolName} is admin-only. Caller ${callerDesc} is not an admin.`);
+    }
+
+    return { target, callerDesc };
 }
