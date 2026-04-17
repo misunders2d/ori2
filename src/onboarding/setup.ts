@@ -2,24 +2,94 @@ import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { getVault, Vault } from "../core/vault.js";
+import { botSubdir, ensureDir } from "../core/paths.js";
 
 // =============================================================================
 // First-run onboarding wizard.
 //
-// Two-store split:
-//   - VAULT (data/<BOT>/vault.json, mode 0600) — secrets:
-//       ADMIN_USER_IDS, ANTHROPIC_API_KEY, GOOGLE_API_KEY, OPENAI_API_KEY
-//   - .env (project root) — non-secret runtime config:
-//       BOT_NAME, PRIMARY_PROVIDER, REQUIRE_2FA, GUARDRAIL_EMBEDDINGS
+// Three-store split:
+//   - VAULT (data/<BOT>/vault.json, mode 0600) — our own secret store:
+//       ADMIN_USER_IDS, ANTHROPIC_API_KEY, GEMINI_API_KEY, OPENAI_API_KEY,
+//       TELEGRAM_BOT_TOKEN, A2A_API_KEY, INIT_PASSCODE, etc.
+//       The *_API_KEY entries mirror what we write to Pi's auth.json so a
+//       future bot evolution can read them without parsing Pi's state.
+//   - PI AUTH (data/<BOT>/.pi-state/auth.json, mode 0600) — Pi-native LLM
+//       credential store. Resolution priority for Pi: --api-key flag >
+//       auth.json > env vars > models.json (see pi-coding-agent/docs/providers.md
+//       §Resolution Order). Writing here is the correct path — env-var
+//       hydration is a belt-and-braces fallback.
+//   - PI SETTINGS (data/<BOT>/.pi-state/settings.json) — Pi-native
+//       configuration: defaultProvider, defaultModel, compaction, theme, etc.
+//       (see pi-coding-agent/docs/settings.md).
+//   - .env (project root) — non-secret runtime config only:
+//       BOT_NAME (needed to locate vault), REQUIRE_2FA, GUARDRAIL_EMBEDDINGS.
+//       NOTE: PRIMARY_PROVIDER was previously written here but no Pi
+//       component reads it; Pi reads defaultProvider from settings.json.
 //
 // Why split: BOT_NAME is needed BEFORE the vault loads (it determines the
-// vault's path: data/<BOT_NAME>/vault.json). Other .env entries are flags or
-// UI hints that don't need protecting.
+// vault's path: data/<BOT_NAME>/vault.json). Pi-native files need the
+// per-bot .pi-state dir which is set via PI_CODING_AGENT_DIR at boot.
 //
 // "System configured" = vault file exists. The wizard runs iff vault is missing.
 // =============================================================================
 
 const ENV_PATH = path.resolve(process.cwd(), ".env");
+
+/** Pi's per-bot config dir, same as src/index.ts PI_CODING_AGENT_DIR. */
+function piStateDir(): string {
+    return botSubdir(".pi-state");
+}
+
+/**
+ * Pi-native auth file. Shape per pi-coding-agent/docs/providers.md §Auth File:
+ *   { "<provider>": { "type": "api_key", "key": "..." } }
+ * Pi reads this at model-resolution time and it takes priority over env vars.
+ * Created mode 0600 (docs say Pi does the same on its /login flow).
+ */
+function writePiAuthJson(entries: Record<string, string>): void {
+    const dir = piStateDir();
+    ensureDir(dir);
+    const file = path.join(dir, "auth.json");
+    // Merge with any existing auth.json (e.g. user ran /login previously).
+    let existing: Record<string, unknown> = {};
+    if (fs.existsSync(file)) {
+        try { existing = JSON.parse(fs.readFileSync(file, "utf-8")) as Record<string, unknown>; }
+        catch { /* treat as empty — malformed will be overwritten */ }
+    }
+    for (const [provider, key] of Object.entries(entries)) {
+        if (!key) continue;
+        existing[provider] = { type: "api_key", key };
+    }
+    // Atomic write with 0600 — matches Pi's own /login implementation.
+    const tmp = `${file}.tmp`;
+    const fd = fs.openSync(tmp, "w", 0o600);
+    try {
+        fs.writeSync(fd, JSON.stringify(existing, null, 2));
+        fs.fsyncSync(fd);
+    } finally { fs.closeSync(fd); }
+    fs.renameSync(tmp, file);
+}
+
+/**
+ * Pi-native settings file. Keys documented in
+ * pi-coding-agent/docs/settings.md — we only set defaultProvider + optionally
+ * defaultModel at wizard time; operator can `/settings` to tune the rest.
+ */
+function writePiSettingsJson(updates: { defaultProvider?: string; defaultModel?: string }): void {
+    const dir = piStateDir();
+    ensureDir(dir);
+    const file = path.join(dir, "settings.json");
+    let existing: Record<string, unknown> = {};
+    if (fs.existsSync(file)) {
+        try { existing = JSON.parse(fs.readFileSync(file, "utf-8")) as Record<string, unknown>; }
+        catch { /* fine, overwrite */ }
+    }
+    if (updates.defaultProvider) existing["defaultProvider"] = updates.defaultProvider;
+    if (updates.defaultModel) existing["defaultModel"] = updates.defaultModel;
+    const tmp = `${file}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(existing, null, 2));
+    fs.renameSync(tmp, file);
+}
 
 export function isSystemConfigured(): boolean {
     // Vault on disk is the authoritative signal — without it, the bot has no
@@ -89,48 +159,73 @@ export async function runOnboardingFlow(): Promise<void> {
     console.log("   [3] OpenAI GPT-4");
     const providerChoice = (await rl.question("   Select an option (1-3): ")).trim();
 
-    let googleKey = "";
-    let anthropicKey = "";
-    let openaiKey = "";
-    let primaryProvider: "gemini" | "anthropic" | "openai" = "gemini";
+    // Map our user-facing choice (1/2/3) to:
+    //   - Pi's provider name (what goes in auth.json and settings.json)
+    //   - vault key name (Pi SDK env-var convention per
+    //     @mariozechner/pi-ai/dist/env-api-keys.js: google → GEMINI_API_KEY)
+    //   - the human label shown during the prompt
+    let piProvider: "google" | "anthropic" | "openai" = "google";
+    let vaultKey: "GEMINI_API_KEY" | "ANTHROPIC_API_KEY" | "OPENAI_API_KEY" = "GEMINI_API_KEY";
+    let apiKey = "";
 
     if (providerChoice === "2") {
-        primaryProvider = "anthropic";
-        anthropicKey = (await rl.question("\n   🔑 Enter your Anthropic API Key: ")).trim();
+        piProvider = "anthropic";
+        vaultKey = "ANTHROPIC_API_KEY";
+        apiKey = (await rl.question("\n   🔑 Enter your Anthropic API Key: ")).trim();
         console.log("\n   ℹ️  Your prompt-injection guardrail uses LOCAL embeddings (BGE-small) by default — no extra API key needed.");
         console.log("       You can switch to Google/OpenAI embeddings later by adding their keys via the wizard or vault tools.");
     } else if (providerChoice === "3") {
-        primaryProvider = "openai";
-        openaiKey = (await rl.question("\n   🔑 Enter your OpenAI API Key: ")).trim();
+        piProvider = "openai";
+        vaultKey = "OPENAI_API_KEY";
+        apiKey = (await rl.question("\n   🔑 Enter your OpenAI API Key: ")).trim();
     } else {
-        primaryProvider = "gemini";
-        googleKey = (await rl.question("\n   🔑 Enter your Google Gemini API Key: ")).trim();
+        piProvider = "google";
+        vaultKey = "GEMINI_API_KEY";
+        apiKey = (await rl.question("\n   🔑 Enter your Google Gemini API Key: ")).trim();
     }
 
     rl.close();
 
-    // Write secrets to vault — atomic, mode 0600.
+    // BOT_NAME has to be in env BEFORE vault is consulted (vault path depends
+    // on it), AND before piStateDir() resolves.
+    process.env["BOT_NAME"] = safeBotName;
+
+    // Write our own secret store (vault) — admin IDs + the API key under its
+    // Pi-canonical name so future reads (rotation, migration, inspection) use
+    // the same name Pi itself uses.
     const vault = getVault();
     const secrets: Record<string, string> = {};
     if (adminIds) secrets["ADMIN_USER_IDS"] = adminIds;
-    if (googleKey) secrets["GOOGLE_API_KEY"] = googleKey;
-    if (anthropicKey) secrets["ANTHROPIC_API_KEY"] = anthropicKey;
-    if (openaiKey) secrets["OPENAI_API_KEY"] = openaiKey;
-    // BOT_NAME has to be in env BEFORE vault is consulted (vault path depends
-    // on it), so we set it temporarily so botSubdir() in vault.set works.
-    process.env["BOT_NAME"] = safeBotName;
+    if (apiKey) secrets[vaultKey] = apiKey;
     vault.bulkSet(secrets);
 
-    // Non-secret runtime config goes to .env so it's loaded by dotenv on next boot.
+    // Write Pi's native auth.json — this is what Pi's ModelRegistry reads
+    // first (priority: --api-key flag > auth.json > env vars). Without this
+    // the wizard leaves Pi with no credentials and the TUI fails with
+    // "No API key found for unknown" on first message.
+    if (apiKey) {
+        writePiAuthJson({ [piProvider]: apiKey });
+    }
+
+    // Write Pi's settings.json — defaultProvider tells Pi which provider to
+    // pick a model from on boot. Without this Pi has no default and fails
+    // model resolution. See pi-coding-agent/docs/settings.md §Model & Thinking.
+    writePiSettingsJson({ defaultProvider: piProvider });
+
+    // Non-secret runtime config. REQUIRE_2FA is a flag; BOT_NAME is needed
+    // to locate the vault on next boot (before .env is loaded).
+    // PRIMARY_PROVIDER is deliberately NOT written here — no Pi component
+    // reads it; settings.json.defaultProvider is the source of truth.
     writeEnv({
         BOT_NAME: safeBotName,
-        PRIMARY_PROVIDER: primaryProvider,
         REQUIRE_2FA: "true",
     });
 
     console.log("\n================================================");
     console.log("✅ Setup Complete!");
-    console.log(`   Vault: ${Vault.path()}`);
+    console.log(`   Vault:          ${Vault.path()}`);
+    console.log(`   Pi auth:        ${path.join(piStateDir(), "auth.json")}`);
+    console.log(`   Pi settings:    ${path.join(piStateDir(), "settings.json")}`);
     console.log(`   Runtime config: ${ENV_PATH}`);
     console.log("================================================\n");
 }

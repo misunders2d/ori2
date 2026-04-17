@@ -44,12 +44,27 @@ import { TelegramAdapter } from "../src/transport/telegram.js";
 
 const DEFAULT_KICKOFF = "[SCHEDULED] Begin executing the seeded plan or task. Report results when complete.";
 
+// Mirrors src/index.ts VAULT_HYDRATED_KEYS. Keep in sync — the subprocess
+// runs in a fresh Node process so it must do its own hydration. GEMINI_API_KEY
+// is Pi's canonical env-var name for the Google provider (not GOOGLE_API_KEY —
+// see @mariozechner/pi-ai/dist/env-api-keys.js).
 const VAULT_HYDRATED_KEYS = [
     "ADMIN_USER_IDS",
     "ANTHROPIC_API_KEY",
-    "GOOGLE_API_KEY",
+    "GEMINI_API_KEY",
     "OPENAI_API_KEY",
 ] as const;
+
+function migrateLegacyVaultKeys(): void {
+    const vault = getVault();
+    const legacy = vault.get("GOOGLE_API_KEY");
+    const canonical = vault.get("GEMINI_API_KEY");
+    if (legacy && !canonical) {
+        vault.set("GEMINI_API_KEY", legacy);
+        vault.delete("GOOGLE_API_KEY");
+        console.log("🔧 [vault] migrated GOOGLE_API_KEY → GEMINI_API_KEY");
+    }
+}
 
 function hydrateEnvFromVault(): void {
     const vault = getVault();
@@ -57,6 +72,10 @@ function hydrateEnvFromVault(): void {
         const v = vault.get(key);
         if (v !== undefined && v !== "") process.env[key] = v;
     }
+    // Alias for guardrails' Google-embed backend (Google AI Studio accepts
+    // either name; see src/index.ts for the same mirror).
+    const gemini = process.env["GEMINI_API_KEY"];
+    if (gemini && !process.env["GOOGLE_API_KEY"]) process.env["GOOGLE_API_KEY"] = gemini;
 }
 
 async function main(): Promise<number> {
@@ -73,6 +92,7 @@ async function main(): Promise<number> {
     const botName = getBotName();
     const storagePath = botDir();
     ensureDir(storagePath);
+    migrateLegacyVaultKeys();
     hydrateEnvFromVault();
 
     console.log(`[scheduled-run] bot=${botName} session=${sessionFile}`);

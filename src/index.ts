@@ -16,6 +16,7 @@ import { getDispatcher } from "./transport/dispatcher.js";
 import { CliAdapter } from "./transport/cli.js";
 import { TelegramAdapter } from "./transport/telegram.js";
 import { ensureInitPasscode, isPasscodeConsumed } from "./core/passcode.js";
+import path from "node:path";
 import { randomBytes } from "node:crypto";
 import { getA2AAdapter } from "./a2a/adapter.js";
 import { setA2AServerHandle, startA2AServer, type A2AServerHandle } from "./a2a/server.js";
@@ -23,6 +24,11 @@ import { TunnelManager, type TunnelMode } from "./a2a/tunnel.js";
 import { broadcastAddressUpdate } from "./a2a/broadcaster.js";
 import { logError, logWarning } from "./core/errorLog.js";
 import { startProactiveDiagnostics } from "./core/proactiveDiagnostics.js";
+import {
+    migrateLegacyVaultKeys as _migrateLegacyVaultKeys,
+    ensurePiAuthJsonSeeded as _ensurePiAuthJsonSeeded,
+    ensurePiSettingsJsonSeeded as _ensurePiSettingsJsonSeeded,
+} from "./core/piSeed.js";
 
 // .env carries non-secret runtime config only (BOT_NAME, PRIMARY_PROVIDER,
 // REQUIRE_2FA, GUARDRAIL_EMBEDDINGS). Secrets live in the vault.
@@ -42,22 +48,58 @@ function isDaemonMode(): boolean {
     return !process.stdout.isTTY;
 }
 
-// Keys the vault is authoritative for. After vault load these are pushed into
-// process.env so any code path that still reads them by name (Pi's auth flow,
-// 3rd-party SDKs, our extensions) finds them. Vault is the source of truth;
-// process.env is a derived view for compatibility.
+// Keys the vault mirrors into process.env on boot. Vault is our store of
+// record; env-var hydration is a fallback for code paths that read env
+// directly (Telegram token, guardrails' remote-embed backend, etc.).
+//
+// Pi SDK's own resolution order is: --api-key flag > auth.json > env vars
+// > models.json (pi-coding-agent/docs/providers.md §Resolution Order). The
+// wizard writes auth.json alongside the vault, so Pi picks up credentials
+// from auth.json — these env vars are only needed by our own code.
+//
+// NAMING: the LLM provider env vars use Pi's canonical names — per
+// @mariozechner/pi-ai/dist/env-api-keys.js, `google` maps to GEMINI_API_KEY
+// (NOT GOOGLE_API_KEY — that's Vertex territory). The migration below
+// renames legacy vaults that still have GOOGLE_API_KEY.
 const VAULT_HYDRATED_KEYS = [
     "ADMIN_USER_IDS",
     "ANTHROPIC_API_KEY",
-    "GOOGLE_API_KEY",
+    "GEMINI_API_KEY",
     "OPENAI_API_KEY",
 ] as const;
+
+function migrateLegacyVaultKeys(): void {
+    if (_migrateLegacyVaultKeys()) {
+        console.log("🔧 [vault] migrated GOOGLE_API_KEY → GEMINI_API_KEY (Pi SDK canonical name)");
+    }
+}
 
 function hydrateEnvFromVault(): void {
     const vault = getVault();
     for (const key of VAULT_HYDRATED_KEYS) {
         const v = vault.get(key);
         if (v !== undefined && v !== "") process.env[key] = v;
+    }
+    // Alias: guardrails' Google-embed backend reads GOOGLE_API_KEY. The
+    // Google AI Studio API accepts either name for the same service, so
+    // mirror to satisfy both consumers without duplicating vault storage.
+    const gemini = process.env["GEMINI_API_KEY"];
+    if (gemini && !process.env["GOOGLE_API_KEY"]) process.env["GOOGLE_API_KEY"] = gemini;
+}
+
+function ensurePiAuthJsonSeeded(): void {
+    const piDir = process.env["PI_CODING_AGENT_DIR"];
+    if (!piDir) return;
+    if (_ensurePiAuthJsonSeeded(piDir)) {
+        console.log(`🔧 [pi-auth] seeded auth.json from vault (${path.join(piDir, "auth.json")})`);
+    }
+}
+
+function ensurePiSettingsJsonSeeded(): void {
+    const piDir = process.env["PI_CODING_AGENT_DIR"];
+    if (!piDir) return;
+    if (_ensurePiSettingsJsonSeeded(piDir)) {
+        console.log(`🔧 [pi-settings] seeded defaultProvider (${path.join(piDir, "settings.json")})`);
     }
 }
 
@@ -91,10 +133,21 @@ async function bootstrap() {
         process.env["PI_CODING_AGENT_DIR"] = piStateDir;
     }
 
+    // Migrate legacy vault keys (GOOGLE_API_KEY → GEMINI_API_KEY) before
+    // hydration so the renamed key lands in process.env.
+    migrateLegacyVaultKeys();
+
     // Hydrate process.env from vault BEFORE any extension or Pi component reads
     // these keys. After this point, every subsequent process.env access for a
     // vault-backed key returns the vault value.
     hydrateEnvFromVault();
+
+    // Seed Pi's native auth.json + settings.json from vault if missing. This
+    // covers installs that predate the wizard writing these files. Safe to
+    // run on every boot — both functions are idempotent and respect any
+    // values the operator set via /login or /settings.
+    ensurePiAuthJsonSeeded();
+    ensurePiSettingsJsonSeeded();
 
     // Lock the instance — a second bot with the same name would corrupt
     // sessions/vault/memory.
