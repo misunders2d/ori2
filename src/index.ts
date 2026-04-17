@@ -13,6 +13,7 @@ import { acquireInstanceLock } from "./core/instanceLock.js";
 import { botDir, botSubdir, ensureDir, getBotName } from "./core/paths.js";
 import { getVault } from "./core/vault.js";
 import { getDispatcher } from "./transport/dispatcher.js";
+import { installChannelRouter } from "./transport/channelRouter.js";
 import { CliAdapter } from "./transport/cli.js";
 import { TelegramAdapter } from "./transport/telegram.js";
 import { ensureInitPasscode, isPasscodeConsumed } from "./core/passcode.js";
@@ -168,6 +169,12 @@ async function bootstrap() {
     // separate (startA2A below); this just registers the routing target so
     // dispatcher.send("a2a", ...) reaches us.
     dispatcher.register(getA2AAdapter());
+    // Multi-user chat: wire the passive-context and active-response handlers
+    // for non-CLI inbound. Must happen BEFORE startAll() so that messages
+    // which arrive right after an adapter starts have the router wired.
+    // CLI traffic continues to flow through pushToPi (installed by
+    // transport_bridge on session_start).
+    installChannelRouter();
     const startResult = await dispatcher.startAll();
     if (startResult.failed.length > 0) {
         for (const f of startResult.failed) {
