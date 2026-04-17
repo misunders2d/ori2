@@ -29,6 +29,7 @@ Ori2 is designed to be raised. Out of the box she is a capable assistant; her tr
 *   **Working Memory (auto-managed):** Conversation context compaction is handled by the Pi SDK — old turns get summarized into a structured block when you get close to the window, recent turns stay verbatim. Configure via `~/.pi/agent/settings.json` or per-bot `<data>/.pi-state/settings.json`.
 *   **Nervous System (Rich Media):** Telegram adapter supports photos, documents, audio, voice, video. Ori2 receives PDFs/CSVs as parsed text, images as image content for multi-modal models.
 *   **Metabolism (Scheduler):** `node-schedule` cron with per-fire **fresh sessions**. Each scheduled run spawns a subprocess with its own session id, optional pre-seeded plan, and a report-back channel. The live session stays uncontaminated.
+*   **Self-Awareness (Observability):** Ori can ask herself "am I OK?" mid-turn. `health_report`, `read_error_ledger`, `read_channel_log`, `check_telegram_connection`, `check_friend_reachability` are LLM-callable tools she invokes on request. Telegram poller + cloudflared tunnel write liveness heartbeats; the error ledger captures every internal warning/failure as structured JSONL. A background check every 30 minutes DMs the admin via Telegram when status drifts — no manual polling required.
 
 ## 🏗️ Architecture
 
@@ -45,9 +46,9 @@ npm start
        ├── init passcode (one-time admin claim)
        └── Daemon mode (no TTY) OR Pi TUI (interactive)
 
-.pi/extensions/ — the organ system (18 files)
-    admin_gate • audit_and_limits • credentials • dna • evolve
-    guardrails • memory • npm_security • oauth • persona
+.pi/extensions/ — the organ system (17 files)
+    admin_gate • audit_and_limits • credentials • diagnostics • dna
+    evolve • guardrails • memory • npm_security • oauth • persona
     plan_enforcer • scheduler • tdd_enforcer • transport_bridge
     web_tools • a2a
 ```
@@ -94,6 +95,16 @@ Your Ori2 is no longer an island. With the **Agent-to-Agent (A2A) Protocol**, yo
 *   **DNA Exchange at Feature Grain:** Declare a named feature (files in `.pi/extensions/` + `.pi/skills/`). It appears as a `dna:<id>` skill on the agent card. Friends `/dna pull` it; the secret scanner refuses any file with a detected credential (regex + entropy + hard-refused filenames like `.env`, `vault.json`, `*.pem`). Every apply takes a snapshot; test failure auto-restores.
 *   **Privacy Guardrail:** Outbound DNA packages are re-scanned at the source on every pull (even if registered earlier), and the importer re-scans on arrival — trust, but verify.
 
+## 🩺 Self-Diagnosis (Observability)
+
+Ori knows how she's doing and tells you when something drifts — you shouldn't have to SSH in to find out.
+
+*   **LLM-callable health tools.** Ask her in plain chat: *"how are you?"* or *"check your Telegram connection"* or *"any errors recently?"*. She has real tools for each — `health_report({deep?})`, `read_error_ledger`, `read_channel_log`, `read_scheduler_jobs`, `check_telegram_connection`, `check_friend_reachability`, `inspect_env`. Each is also a slash command (`/health`, `/health deep`, `/health errors [N]`, `/health probe telegram`, `/health probe friends`).
+*   **Unified status report.** `/health` rolls up: adapter state + heartbeats, vault + memory + plans + scheduler + rate limits + OAuth + channel log + disk + guardrails + A2A + error counts. Status = `healthy` | `degraded` | `unhealthy`, with a concrete warnings list. Use `deep` for live probes (Telegram `getMe`, A2A friend `/health` pings, disk walk).
+*   **Subsystem heartbeats.** The Telegram poller writes one after every `getUpdates`; the cloudflared tunnel writes one on URL-ready + every 30s while alive. Stale >60s flags the subsystem as degraded. You learn about a wedged long-poll before the user does.
+*   **Structured error ledger.** Every internal warning/error (Telegram 401, cloudflared crash, scheduler exception, guardrail init failure, bootstrap issues) lands in `data/<bot>/errors.jsonl` — queryable, filterable, auto-rotating. `console.error` still mirrors to stdout so `journalctl` / `launchctl log` stays informative.
+*   **Proactive DM, not silent failure.** 10 seconds after boot and every 30 minutes thereafter, Ori runs her own deep health check. If status drifts from healthy AND the warning set *changed* since last check, she DMs every admin in `ADMIN_USER_IDS` via their preferred adapter. She never spams the same warning twice; recovery gets an info-level ledger entry. Opt out with `PROACTIVE_DIAGNOSTICS=false` in vault.
+
 ## ⚡ Feature Showcase (Ability Tree)
 
 *   **[SYSTEM PERK] Tactical Silence:** Interrupt her mid-thought. Pi's TUI surfaces `/abort` to stop off-track reasoning instantly and save tokens.
@@ -105,6 +116,7 @@ Your Ori2 is no longer an island. With the **Agent-to-Agent (A2A) Protocol**, yo
 *   **[SYSTEM PERK] Context Compaction:** Pi's built-in summariser keeps the conversation window healthy without losing the thread — old turns become a structured Goal/Progress/Decisions summary; recent turns stay verbatim.
 *   **[SYSTEM PERK] Headless-First OAuth:** Google / GitHub / Microsoft / Slack via Device Code flow. No callback URL, no desktop browser needed on the VPS. Auth Code + PKCE with paste-back as a fallback.
 *   **[SYSTEM PERK] Hot-Swap Models:** Anthropic / Google / OpenAI. Pi's `pi.setModel` flips providers per-session at runtime.
+*   **[SYSTEM PERK] Self-Diagnosis + Admin Alerts:** Ori runs her own health probe every 30 minutes and DMs the admin when something drifts. `/health` and a full suite of LLM-callable observability tools let her answer *"am I OK?"* mid-turn without you having to ask.
 
 ## 📋 Prerequisites
 
@@ -175,8 +187,10 @@ Commonly-touched keys:
 | `A2A_TUNNEL_MODE` | `cloudflared` (default) / `external` / `disabled` |
 | `A2A_BIND_PORT` | Sticky local bind (default 8085, auto-walks on conflict) |
 | `GUARDRAIL_EMBEDDINGS` | `local` (default, fastembed) / `google` / `openai` |
+| `PROACTIVE_DIAGNOSTICS` | `true` (default) / `false` — disables the periodic self-health-check + admin-DM |
+| `PROACTIVE_DIAGNOSTICS_INTERVAL_MIN` | `30` (default) — how often the background health check runs |
 
-Everything else is discoverable through slash commands: `/whitelist`, `/role`, `/tool-acl`, `/staging`, `/totp`, `/memory`, `/schedule`, `/plans`, `/credentials`, `/oauth`, `/transports`, `/a2a`, `/dna`, `/log`, `/limits`, `/evolve`.
+Everything else is discoverable through slash commands: `/whitelist`, `/role`, `/tool-acl`, `/staging`, `/totp`, `/memory`, `/schedule`, `/plans`, `/credentials`, `/oauth`, `/transports`, `/a2a`, `/dna`, `/log`, `/limits`, `/evolve`, `/health`.
 
 ## 🧬 Evolving Your Bot
 
@@ -195,6 +209,21 @@ Ori2:  Researches ClickUp API.
 You: /reload
      → new tools appear in this session
 ```
+
+### How to add a new capability
+
+Ori2 is organised around **two primitives** that together act like a sub-agent in frameworks like Google ADK or LangChain:
+
+*   **An extension** (`.pi/extensions/<domain>.ts`) — one TypeScript file per domain. Registers tools (LLM-callable functions), slash commands, and hooks. Example: `amazon.ts` → `amazon_list_orders`, `amazon_get_listing`, `amazon_update_price`.
+*   **A skill** (`.pi/skills/<domain>-ops/SKILL.md`) — structured markdown the agent reads *lazily* when relevant. Tells her when to use which tool, required data, common pitfalls. Example: `amazon-ops/SKILL.md` → "Before updating a price, always pull current inventory and Keepa history first."
+
+**Extension + skill ≈ sub-agent.** Same practical effect as ADK's sub-agent pattern without the multi-agent coordination tax. One bot, many specialisations.
+
+Just ask her in chat — *"how do I add an Amazon SP-API integration?"* — and she'll walk you through it. She's equipped with a dedicated skill (`adding-capabilities`) that explains the mental model, and the rigid 6-phase SOP (`evolution-sop`) for anything non-trivial: threat modelling → doc research → secure dependency audit → scaffolding → TDD → verify + commit. She writes and tests both files for you via `evolve_extension` and `evolve_skill`; `/reload` makes them live in the current session.
+
+**Scaling pattern, in order:** one instance with multiple extensions → mode switching inside one instance when the tool list bloats → separate Ori2 instances per role communicating over A2A when teams need independent evolution paths.
+
+Operator-facing surface: `/evolve list`, `/evolve diff`, `/evolve help`. For sharing proven evolutions between bots, see `/dna` (DNA exchange).
 
 For non-trivial features, prefer the DNA + snapshot path:
 
@@ -247,6 +276,8 @@ The script never auto-merges. You're in charge of what upstream features (if any
 
 ## 🏆 Hall of Evolution (Milestones)
 
+*   **April 2026:** Observability layer — `/health` aggregate + LLM-callable self-diagnosis tools + error ledger + subsystem heartbeats + proactive admin DM on drift. Ori can now answer *"am I OK?"* mid-turn.
+*   **April 2026:** Fork-first install model — bootstrap detaches from upstream by default, `.ori2-baseline` marker + `scripts/sync-baseline.sh` for optional upstream pulls.
 *   **April 2026:** A2A subsystem — Google-spec compliance, cloudflared tunnel manager, invitation token flow, DNA exchange with secret-scanner + snapshot-rollback, 5 phases landed incrementally.
 *   **April 2026:** Baseline complete — 9 sprints + 4 follow-ups. 252 tests green. `tsc --strict` clean with `verbatimModuleSyntax` + `exactOptionalPropertyTypes` + `noUncheckedIndexedAccess`.
 *   **April 2026:** Vault / policy engine / TOTP 2FA / multi-role ACL — ori-parity security surface.
