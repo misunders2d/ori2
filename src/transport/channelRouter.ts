@@ -2,6 +2,7 @@ import fs from "node:fs";
 import { spawn } from "node:child_process";
 import { SessionManager } from "@mariozechner/pi-coding-agent";
 import { getChannelSessions } from "../core/channelSessions.js";
+import { getChannelModels } from "../core/channelModels.js";
 import { getDispatcher } from "./dispatcher.js";
 import type { Message } from "./types.js";
 import { logError, logWarning } from "../core/errorLog.js";
@@ -214,24 +215,28 @@ export interface SpawnResult {
 }
 
 /**
- * Spawn contract: given kickoff text + session file + an AbortSignal, run the
- * pi -p subprocess and resolve when it exits. If `signal.abort()` fires
- * mid-run, the implementation MUST terminate the child (SIGTERM) and resolve
- * with whatever has been captured (exitCode may be null on signal-kill).
- * The promise should NOT reject on abort — callers distinguish outcomes via
- * the returned SpawnResult, not via throws.
+ * Spawn contract: given kickoff text + session file + extra CLI args + an
+ * AbortSignal, run the pi -p subprocess and resolve when it exits. If
+ * `signal.abort()` fires mid-run, the implementation MUST terminate the
+ * child (SIGTERM) and resolve with whatever has been captured (exitCode may
+ * be null on signal-kill). The promise should NOT reject on abort — callers
+ * distinguish outcomes via the returned SpawnResult, not via throws.
+ *
+ * `extraArgs` is forwarded verbatim after `--session`. Used by the router
+ * to pass per-channel overrides like `--model anthropic/claude-opus-4-5`.
  */
 export type SpawnPiPrint = (
     kickoff: string,
     sessionFile: string,
+    extraArgs: string[],
     signal: AbortSignal,
 ) => Promise<SpawnResult>;
 
-const realSpawnPiPrint: SpawnPiPrint = (kickoff, sessionFile, signal) =>
+const realSpawnPiPrint: SpawnPiPrint = (kickoff, sessionFile, extraArgs, signal) =>
     new Promise<SpawnResult>((resolve) => {
         const proc = spawn(
             "npx",
-            ["pi", "-p", kickoff, "--session", sessionFile],
+            ["pi", "-p", kickoff, "--session", sessionFile, ...extraArgs],
             {
                 cwd: process.cwd(),
                 env: process.env,
@@ -331,11 +336,24 @@ async function doActiveResponse(msg: Message, spawnFn: SpawnPiPrint): Promise<vo
 
     const kickoff = formatActiveKickoff(msg);
 
+    // Per-channel model preference, set by agent tools (see
+    // .pi/extensions/agent_introspection.ts → set_channel_model). Absent =
+    // use Pi's default from settings.json for the spawned subprocess.
+    // Pi's --model flag accepts "<provider>/<modelId>" and an optional
+    // ":<thinkingLevel>" suffix, verified at
+    // node_modules/@mariozechner/pi-coding-agent/dist/cli/args.js:41-66.
+    const extraArgs: string[] = [];
+    const modelPref = getChannelModels().get(msg.platform, msg.channelId);
+    if (modelPref) {
+        const suffix = modelPref.thinkingLevel ? `:${modelPref.thinkingLevel}` : "";
+        extraArgs.push("--model", `${modelPref.provider}/${modelPref.modelId}${suffix}`);
+    }
+
     const controller = new AbortController();
     activeSubprocesses.set(key, { controller, kickoffMsg: msg });
     let result: SpawnResult;
     try {
-        result = await spawnFn(kickoff, sessionFile, controller.signal);
+        result = await spawnFn(kickoff, sessionFile, extraArgs, controller.signal);
     } finally {
         // Only clear if we're still the registered controller — a later
         // interrupt may have replaced us with a fresh one.

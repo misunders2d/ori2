@@ -5,6 +5,7 @@ import { strict as assert } from "node:assert";
 import fs from "node:fs";
 import { botDir } from "../core/paths.js";
 import { ChannelSessions, getChannelSessions } from "../core/channelSessions.js";
+import { ChannelModels, getChannelModels } from "../core/channelModels.js";
 import { TransportDispatcher } from "./dispatcher.js";
 import type {
     AdapterStatus,
@@ -60,6 +61,7 @@ function resetAll(): void {
     cleanTestDir();
     TransportDispatcher.__resetForTests();
     ChannelSessions.__resetForTests();
+    ChannelModels.__resetForTests();
     __resetChannelLocksForTests();
 }
 
@@ -198,6 +200,76 @@ describe("channelRouter — active path", () => {
         assert.equal(tg.sent[0]!.response.replyToMessageId, "msg-321");
     });
 
+    it("passes --model provider/id when a channel model preference is set", async () => {
+        const d = TransportDispatcher.instance();
+        const tg = new FakeAdapter("telegram");
+        d.register(tg);
+
+        // Preference set for this channel.
+        getChannelModels().set("telegram", "-100abc", {
+            provider: "anthropic",
+            modelId: "claude-opus-4-5",
+            thinkingLevel: "medium",
+            setBy: "test",
+        });
+
+        let capturedArgs: string[] = [];
+        const fakeSpawn: SpawnPiPrint = async (_k, _f, extraArgs) => {
+            capturedArgs = extraArgs;
+            return { stdout: "ok", stderr: "", exitCode: 0 };
+        };
+        installChannelRouter(fakeSpawn);
+
+        await tg.simulateInbound(baseMsg());
+        await __drainChannelLocksForTests();
+
+        // Pi's --model format is provider/modelId[:thinking]; verified at
+        // node_modules/@mariozechner/pi-coding-agent/dist/cli/args.js:41-66.
+        assert.deepEqual(capturedArgs, ["--model", "anthropic/claude-opus-4-5:medium"]);
+    });
+
+    it("passes no --model when no channel preference is set (use bot default)", async () => {
+        const d = TransportDispatcher.instance();
+        const tg = new FakeAdapter("telegram");
+        d.register(tg);
+
+        let capturedArgs: string[] = [];
+        const fakeSpawn: SpawnPiPrint = async (_k, _f, extraArgs) => {
+            capturedArgs = extraArgs;
+            return { stdout: "ok", stderr: "", exitCode: 0 };
+        };
+        installChannelRouter(fakeSpawn);
+
+        await tg.simulateInbound(baseMsg());
+        await __drainChannelLocksForTests();
+
+        assert.deepEqual(capturedArgs, []);
+    });
+
+    it("omits the :thinking suffix when thinkingLevel is not set on the preference", async () => {
+        const d = TransportDispatcher.instance();
+        const tg = new FakeAdapter("telegram");
+        d.register(tg);
+
+        getChannelModels().set("telegram", "-100abc", {
+            provider: "openai",
+            modelId: "gpt-4o",
+            setBy: "test",
+        });
+
+        let capturedArgs: string[] = [];
+        const fakeSpawn: SpawnPiPrint = async (_k, _f, extraArgs) => {
+            capturedArgs = extraArgs;
+            return { stdout: "ok", stderr: "", exitCode: 0 };
+        };
+        installChannelRouter(fakeSpawn);
+
+        await tg.simulateInbound(baseMsg());
+        await __drainChannelLocksForTests();
+
+        assert.deepEqual(capturedArgs, ["--model", "openai/gpt-4o"]);
+    });
+
     it("seeds a transport-origin CustomEntry before spawning so subprocess sees the sender", async () => {
         const d = TransportDispatcher.instance();
         const tg = new FakeAdapter("telegram");
@@ -243,7 +315,7 @@ describe("channelRouter — mid-flight interrupt (ori/-style)", () => {
             signal: AbortSignal;
             aborted: boolean;
         }> = [];
-        const fakeSpawn: SpawnPiPrint = (_k, _f, signal) => new Promise((resolve) => {
+        const fakeSpawn: SpawnPiPrint = (_k, _f, _args, signal) => new Promise((resolve) => {
             const slot = { resolve, signal, aborted: false };
             pending.push(slot);
             signal.addEventListener("abort", () => {
@@ -283,7 +355,7 @@ describe("channelRouter — mid-flight interrupt (ori/-style)", () => {
         d.register(tg);
 
         const pending: Array<{ resolve: (r: { stdout: string; stderr: string; exitCode: number | null }) => void; signal: AbortSignal }> = [];
-        const fakeSpawn: SpawnPiPrint = (_k, _f, signal) => new Promise((resolve) => {
+        const fakeSpawn: SpawnPiPrint = (_k, _f, _args, signal) => new Promise((resolve) => {
             pending.push({ resolve, signal });
             signal.addEventListener("abort", () => {
                 resolve({ stdout: "", stderr: "SIGTERM", exitCode: null });
@@ -330,7 +402,7 @@ describe("channelRouter — mid-flight interrupt (ori/-style)", () => {
         d.register(tg);
 
         const pending: Array<{ resolve: (r: { stdout: string; stderr: string; exitCode: number | null }) => void; aborted: boolean; signal: AbortSignal }> = [];
-        const fakeSpawn: SpawnPiPrint = (_k, _f, signal) => new Promise((resolve) => {
+        const fakeSpawn: SpawnPiPrint = (_k, _f, _args, signal) => new Promise((resolve) => {
             const slot = { resolve, aborted: false, signal };
             pending.push(slot);
             signal.addEventListener("abort", () => {
@@ -367,7 +439,7 @@ describe("channelRouter — mid-flight interrupt (ori/-style)", () => {
         d.register(tg);
 
         let spawnKickoffs: string[] = [];
-        const fakeSpawn: SpawnPiPrint = (kickoff, _f, signal) => new Promise((resolve) => {
+        const fakeSpawn: SpawnPiPrint = (kickoff, _f, _args, signal) => new Promise((resolve) => {
             spawnKickoffs.push(kickoff);
             signal.addEventListener("abort", () => {
                 resolve({ stdout: "", stderr: "SIGTERM", exitCode: null });
