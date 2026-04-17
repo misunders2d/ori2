@@ -470,13 +470,13 @@ export { type A2AAdapter };
 // SHOULD call setA2AServerHandle, immediately after startA2AServer resolves.
 // =============================================================================
 
-let _handle: A2AServerHandle | null = null;
+import { setSingleton, getSingleton } from "../core/singletons.js";
 
 export function setA2AServerHandle(h: A2AServerHandle | null): void {
-    _handle = h;
+    setSingleton("a2aServerHandle", h);
 }
 
 /** Returns the running A2A server handle, or null if A2A is disabled / boot failed. */
 export function getA2AServerHandle(): A2AServerHandle | null {
-    return _handle;
+    return getSingleton<A2AServerHandle>("a2aServerHandle") ?? null;
 }

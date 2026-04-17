@@ -364,9 +364,8 @@ export class Whitelist {
     }
 }
 
-let _instance: Whitelist | null = null;
+import { getOrCreate } from "./singletons.js";
 
 export function getWhitelist(): Whitelist {
-    if (!_instance) _instance = new Whitelist();
-    return _instance;
+    return getOrCreate("whitelist", () => new Whitelist());
 }

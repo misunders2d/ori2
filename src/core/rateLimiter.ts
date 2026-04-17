@@ -172,8 +172,7 @@ export class RateLimiter {
     }
 }
 
-let _instance: RateLimiter | null = null;
+import { getOrCreate } from "./singletons.js";
 export function getRateLimiter(): RateLimiter {
-    if (!_instance) _instance = new RateLimiter();
-    return _instance;
+    return getOrCreate("rateLimiter", () => new RateLimiter());
 }

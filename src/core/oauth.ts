@@ -646,10 +646,9 @@ function base64url(buf: Buffer): string {
     return buf.toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-let _instance: OAuthService | null = null;
+import { getOrCreate } from "./singletons.js";
 export function getOAuth(): OAuthService {
-    if (!_instance) _instance = new OAuthService();
-    return _instance;
+    return getOrCreate("oauth", () => new OAuthService());
 }
 
 /**

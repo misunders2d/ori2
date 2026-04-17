@@ -273,9 +273,8 @@ export class ToolAcl {
     }
 }
 
-let _instance: ToolAcl | null = null;
+import { getOrCreate } from "./singletons.js";
 
 export function getToolAcl(): ToolAcl {
-    if (!_instance) _instance = new ToolAcl();
-    return _instance;
+    return getOrCreate("toolAcl", () => new ToolAcl());
 }

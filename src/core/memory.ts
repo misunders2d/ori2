@@ -349,9 +349,8 @@ export class Memory {
     }
 }
 
-let _instance: Memory | null = null;
+import { getOrCreate } from "./singletons.js";
 
 export function getMemory(): Memory {
-    if (!_instance) _instance = new Memory();
-    return _instance;
+    return getOrCreate("memory", () => new Memory());
 }

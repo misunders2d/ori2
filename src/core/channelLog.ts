@@ -269,8 +269,7 @@ export class ChannelLog {
     }
 }
 
-let _instance: ChannelLog | null = null;
+import { getOrCreate } from "./singletons.js";
 export function getChannelLog(): ChannelLog {
-    if (!_instance) _instance = new ChannelLog();
-    return _instance;
+    return getOrCreate("channelLog", () => new ChannelLog());
 }

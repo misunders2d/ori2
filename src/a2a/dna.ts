@@ -213,10 +213,9 @@ export class DnaCatalog {
     }
 }
 
-let _catalog: DnaCatalog | null = null;
+import { getOrCreate } from "../core/singletons.js";
 export function getDnaCatalog(): DnaCatalog {
-    if (!_catalog) _catalog = new DnaCatalog();
-    return _catalog;
+    return getOrCreate("dnaCatalog", () => new DnaCatalog());
 }
 
 // ---------------------------------------------------------------------------

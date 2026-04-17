@@ -310,9 +310,8 @@ export class Credentials {
     }
 }
 
-let _instance: Credentials | null = null;
+import { getOrCreate } from "./singletons.js";
 
 export function getCredentials(): Credentials {
-    if (!_instance) _instance = new Credentials();
-    return _instance;
+    return getOrCreate("credentials", () => new Credentials());
 }

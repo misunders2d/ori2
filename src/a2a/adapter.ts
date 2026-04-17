@@ -157,9 +157,8 @@ export class A2AAdapter implements TransportAdapter {
     }
 }
 
-let _instance: A2AAdapter | null = null;
+import { getOrCreate } from "../core/singletons.js";
 
 export function getA2AAdapter(): A2AAdapter {
-    if (!_instance) _instance = new A2AAdapter();
-    return _instance;
+    return getOrCreate("a2aAdapter", () => new A2AAdapter());
 }

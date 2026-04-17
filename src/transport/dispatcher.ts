@@ -1,4 +1,5 @@
 import type { AdapterStatus, AgentResponse, Message, TransportAdapter } from "./types.js";
+import { getOrCreate, setSingleton } from "../core/singletons.js";
 
 /** Reserved platform name — see CliAdapter for the matching sentinel. */
 export const CLI_RESERVED_NAME = "cli";
@@ -68,11 +69,11 @@ export class TransportDispatcher {
     private postBlockHooks: PostBlockHook[] = [];
     private pushToPi: PushToPi | null = null;
     private buffer: Message[] = [];
-    private static _instance: TransportDispatcher | null = null;
 
     static instance(): TransportDispatcher {
-        if (!TransportDispatcher._instance) TransportDispatcher._instance = new TransportDispatcher();
-        return TransportDispatcher._instance;
+        // Shared via globalThis so jiti-loaded extensions see the same
+        // instance as tsx-loaded main program. See src/core/singletons.ts.
+        return getOrCreate("transportDispatcher", () => new TransportDispatcher());
     }
 
     /** Register an adapter. The dispatcher installs its inbound handler. */
@@ -259,7 +260,7 @@ export class TransportDispatcher {
 
     /** Reset internal state. Tests only. */
     static __resetForTests(): void {
-        TransportDispatcher._instance = null;
+        setSingleton("transportDispatcher", null);
     }
 }
 

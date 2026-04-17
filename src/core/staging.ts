@@ -244,11 +244,10 @@ export class Staging {
     }
 }
 
-let _instance: Staging | null = null;
+import { getOrCreate } from "./singletons.js";
 
 export function getStaging(): Staging {
-    if (!_instance) _instance = new Staging();
-    return _instance;
+    return getOrCreate("staging", () => new Staging());
 }
 
 /**

@@ -184,11 +184,10 @@ class Vault {
     }
 }
 
-let _instance: Vault | null = null;
+import { getOrCreate } from "./singletons.js";
 
 export function getVault(): Vault {
-    if (!_instance) _instance = new Vault();
-    return _instance;
+    return getOrCreate("vault", () => new Vault());
 }
 
 export { Vault };

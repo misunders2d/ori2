@@ -236,9 +236,8 @@ export class Friends {
     }
 }
 
-let _instance: Friends | null = null;
+import { getOrCreate } from "../core/singletons.js";
 
 export function getFriends(): Friends {
-    if (!_instance) _instance = new Friends();
-    return _instance;
+    return getOrCreate("a2aFriends", () => new Friends());
 }
