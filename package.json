@@ -4,6 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "postinstall": "node scripts/postinstall-prewarm.js",
+    "prewarm": "node scripts/postinstall-prewarm.js",
     "test": "node --import tsx --test --test-reporter=spec $(find src -type f -name '*.test.ts')",
     "start": "tsx src/index.ts"
   },
@@ -11,6 +13,9 @@
   "author": "",
   "license": "ISC",
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "dependencies": {
     "@a2a-js/sdk": "^0.3.13",
     "@mariozechner/pi-coding-agent": "^0.67.3",

@@ -25,3 +25,12 @@ export function botSubdir(name: string): string {
 export function ensureDir(p: string): void {
     if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
 }
+
+// Shared, NOT per-bot: same checkout's bots can share artefacts that don't
+// change per-bot (e.g. the fastembed ONNX model cache — always the same file
+// regardless of bot name). Lives outside data/ so `rm -rf data/<bot>` never
+// purges the model, and so a single `npm install` postinstall can warm it
+// before any bot name is chosen.
+export function sharedCacheDir(): string {
+    return path.resolve(process.cwd(), ".cache");
+}

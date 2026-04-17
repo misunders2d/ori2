@@ -1,5 +1,6 @@
+import path from "node:path";
 import { EmbeddingModel, FlagEmbedding } from "fastembed";
-import { botSubdir, ensureDir } from "./paths.js";
+import { ensureDir, sharedCacheDir } from "./paths.js";
 
 // =============================================================================
 // Shared local-embedding service.
@@ -8,9 +9,12 @@ import { botSubdir, ensureDir } from "./paths.js";
 // every consumer. Without this both guardrails AND memory would each load
 // their own copy of the model into memory (~200MB each).
 //
-// On-disk model cache stays at data/<bot>/.fastembed_cache/ — shared between
-// guardrails and memory. First boot downloads (~130MB), every subsequent
-// init is instant.
+// On-disk model cache lives at <project>/.cache/fastembed/ — shared across
+// every bot in the same checkout (the model is identical regardless of bot
+// name) and across guardrails/memory within one process. `npm install` runs
+// scripts/postinstall-prewarm.js which pre-downloads the ~130MB ONNX weights
+// here so the first chat message isn't blocked on the download. Skip the
+// prewarm with FASTEMBED_SKIP_PREWARM=1 at install time.
 //
 // Always returns plain `number[]`. fastembed's TypeScript types claim
 // number[] but its runtime yields Float32Array, which JSON-serializes as
@@ -29,7 +33,7 @@ async function getRawModel(): Promise<FlagEmbedding> {
     if (model) return model;
     if (initPromise) return initPromise;
     initPromise = (async () => {
-        const cacheDir = botSubdir(".fastembed_cache");
+        const cacheDir = path.join(sharedCacheDir(), "fastembed");
         ensureDir(cacheDir);
         const m = await FlagEmbedding.init({
             model: EmbeddingModel.BGESmallENV15,

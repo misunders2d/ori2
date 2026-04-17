@@ -279,21 +279,19 @@ function doHelp(ctx: import("@mariozechner/pi-coding-agent").ExtensionContext): 
         "  5. Approve, bot posts confirmation.",
         "",
         "QUICK START — CUSTOM PROVIDER",
-        "  Edit data/<BOT>/oauth_platforms.json directly (a slash form is",
-        "  planned but not yet implemented). Required fields:",
-        "    id, name, flow ('device_code' or 'auth_code_pkce'), client_id,",
-        "    token_endpoint, default_scope: [...], refresh_supported: bool,",
-        "  Plus one of:",
-        "    device_authorization_endpoint  (for device_code flow)",
-        "    authorization_endpoint         (for auth_code_pkce flow)",
-        "  Optional: client_secret, redirect_uri, note.",
-        "  After saving: /reload then /oauth connect <id>.",
+        "  Run /oauth register-custom (no args) for the full field reference.",
+        "  Short form:",
+        "    /oauth register-custom id=<x> name=<X> flow=<device_code|auth_code_pkce> \\",
+        "      client_id=... token_endpoint=https://... default_scope=s1,s2 \\",
+        "      refresh_supported=true \\",
+        "      device_authorization_endpoint=...   OR authorization_endpoint=...",
+        "  Then: /oauth connect <id>",
         "",
         "ALL SUBCOMMANDS",
         "  /oauth help                                — this message",
         "  /oauth list                                — show registered platforms + connection state",
         "  /oauth register <id> <client_id> [<secret>] — register from a built-in template",
-        "  /oauth register-custom                     — placeholder; edit JSON directly today",
+        "  /oauth register-custom <key=value...>      — register a non-built-in provider",
         "  /oauth connect <id> [scope1 scope2 ...]    — start the platform's flow",
         "  /oauth callback <full_redirect_url>        — paste back for Auth Code flow",
         "  /oauth disconnect <id>                     — clear tokens (keeps registration)",
@@ -381,23 +379,149 @@ function doRegister(
     }
 }
 
+/**
+ * Parse `key=value key=value ...` arg syntax. Values never contain spaces in
+ * practice for OAuth platform fields (URLs, scope names, ids), so a simple
+ * whitespace split is sufficient. Commas inside a value are preserved — the
+ * caller decides whether to split (we split `default_scope` on commas; other
+ * fields stay as-is).
+ */
+function parseKeyValueArgs(parts: string[]): Record<string, string> {
+    const out: Record<string, string> = {};
+    for (const raw of parts) {
+        const eq = raw.indexOf("=");
+        if (eq <= 0) continue;
+        const key = raw.slice(0, eq).trim();
+        const value = raw.slice(eq + 1).trim();
+        if (key && value) out[key] = value;
+    }
+    return out;
+}
+
+function parseBoolean(v: string | undefined, fallback: boolean): boolean {
+    if (v === undefined) return fallback;
+    const lower = v.toLowerCase();
+    if (["true", "yes", "y", "1"].includes(lower)) return true;
+    if (["false", "no", "n", "0"].includes(lower)) return false;
+    return fallback;
+}
+
 function doRegisterCustom(
     ctx: import("@mariozechner/pi-coding-agent").ExtensionContext,
     parts: string[],
 ): void {
-    // Minimal version — full custom registration is verbose. Prompt the
-    // operator to edit data/<bot>/oauth_platforms.json directly for now.
-    void parts;
-    ctx.ui.notify(
-        "Custom OAuth registration via slash command is not implemented yet.\n" +
-        "For now, edit data/<BOT>/oauth_platforms.json directly. Required fields:\n" +
-        "  id, name, flow ('device_code' or 'auth_code_pkce'), client_id, token_endpoint,\n" +
-        "  default_scope: [...], refresh_supported,\n" +
-        "  device_authorization_endpoint (for device_code) OR authorization_endpoint (for auth_code_pkce),\n" +
-        "  redirect_uri (auth_code_pkce; recommended 'urn:ietf:params:oauth:2.0:oob' for paste-back).\n" +
-        "After saving, /reload and /oauth connect <id>.",
-        "info",
-    );
+    // parts[0] is "register-custom"; skip it.
+    const args = parseKeyValueArgs(parts.slice(1));
+
+    // Short-help when no args.
+    if (Object.keys(args).length === 0) {
+        const lines = [
+            "Usage: /oauth register-custom key=value key=value ...",
+            "",
+            "REQUIRED fields (both flows):",
+            "  id=<stable-identifier>                e.g. id=clickup",
+            "  name=<human-readable-name>            e.g. name=ClickUp",
+            "  flow=<device_code|auth_code_pkce>",
+            "  client_id=<oauth-client-id>",
+            "  token_endpoint=<https://...>          e.g. https://api.clickup.com/api/v2/oauth/token",
+            "  default_scope=<scope1,scope2,...>     comma-separated, no spaces",
+            "  refresh_supported=<true|false>",
+            "",
+            "DEVICE-CODE FLOW additionally requires:",
+            "  device_authorization_endpoint=<https://...>",
+            "",
+            "AUTH-CODE+PKCE FLOW additionally requires:",
+            "  authorization_endpoint=<https://...>",
+            "  redirect_uri=<urn:ietf:params:oauth:2.0:oob|https://...>   (recommend urn:... for headless)",
+            "",
+            "OPTIONAL:",
+            "  client_secret=<oauth-client-secret>    omit for public-client Device Code flows",
+            "  note=<free-form-note>                  metadata for the operator",
+            "",
+            "EXAMPLE (auth_code_pkce, paste-back):",
+            "  /oauth register-custom id=clickup name=ClickUp flow=auth_code_pkce \\",
+            "    client_id=ABC client_secret=xyz \\",
+            "    authorization_endpoint=https://app.clickup.com/api \\",
+            "    token_endpoint=https://api.clickup.com/api/v2/oauth/token \\",
+            "    default_scope=read,write refresh_supported=false \\",
+            "    redirect_uri=urn:ietf:params:oauth:2.0:oob",
+            "",
+            "After registration → /oauth connect <id>",
+        ];
+        ctx.ui.notify(lines.join("\n"), "info");
+        return;
+    }
+
+    // Validate required fields.
+    const required = ["id", "name", "flow", "client_id", "token_endpoint", "default_scope"];
+    const missing = required.filter((k) => !args[k]);
+    if (missing.length > 0) {
+        ctx.ui.notify(
+            `Missing required field(s): ${missing.join(", ")}. Run /oauth register-custom (no args) for the full reference.`,
+            "error",
+        );
+        return;
+    }
+    const flow = args["flow"]!;
+    if (flow !== "device_code" && flow !== "auth_code_pkce") {
+        ctx.ui.notify(`flow must be 'device_code' or 'auth_code_pkce' (got '${flow}').`, "error");
+        return;
+    }
+    if (flow === "device_code" && !args["device_authorization_endpoint"]) {
+        ctx.ui.notify("device_code flow requires device_authorization_endpoint=<url>.", "error");
+        return;
+    }
+    if (flow === "auth_code_pkce" && !args["authorization_endpoint"]) {
+        ctx.ui.notify("auth_code_pkce flow requires authorization_endpoint=<url>.", "error");
+        return;
+    }
+
+    const id = args["id"]!;
+    if (BUILTIN_TEMPLATES[id]) {
+        ctx.ui.notify(
+            `id='${id}' collides with a built-in template. Use /oauth register ${id} <client_id> instead, ` +
+            "or pick a different id for your custom registration.",
+            "error",
+        );
+        return;
+    }
+
+    const defaultScope = args["default_scope"]!.split(",").map((s) => s.trim()).filter(Boolean);
+    if (defaultScope.length === 0) {
+        ctx.ui.notify("default_scope must contain at least one scope (comma-separated).", "error");
+        return;
+    }
+
+    const cfg = {
+        id,
+        name: args["name"]!,
+        flow: flow as "device_code" | "auth_code_pkce",
+        client_id: args["client_id"]!,
+        token_endpoint: args["token_endpoint"]!,
+        default_scope: defaultScope,
+        refresh_supported: parseBoolean(args["refresh_supported"], false),
+        ...(args["client_secret"] !== undefined ? { client_secret: args["client_secret"] } : {}),
+        ...(args["device_authorization_endpoint"] !== undefined
+            ? { device_authorization_endpoint: args["device_authorization_endpoint"] }
+            : {}),
+        ...(args["authorization_endpoint"] !== undefined
+            ? { authorization_endpoint: args["authorization_endpoint"] }
+            : {}),
+        ...(args["redirect_uri"] !== undefined ? { redirect_uri: args["redirect_uri"] } : {}),
+        ...(args["note"] !== undefined ? { note: args["note"] } : {}),
+    };
+
+    try {
+        oauth.registerCustom(cfg);
+        ctx.ui.notify(
+            `✅ Registered custom platform "${cfg.name}" (id=${cfg.id}, flow=${cfg.flow}).\n` +
+            `   Now run: /oauth connect ${cfg.id}`,
+            "info",
+        );
+    } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        ctx.ui.notify(`Registration failed: ${msg}`, "error");
+    }
 }
 
 async function doConnect(

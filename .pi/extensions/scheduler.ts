@@ -8,7 +8,7 @@ import path from "node:path";
 import { botSubdir, ensureDir } from "../../src/core/paths.js";
 import { currentOrigin } from "../../src/core/identity.js";
 import { getWhitelist } from "../../src/core/whitelist.js";
-import { seedPlan, type OriginChannel } from "./plan_enforcer.js";
+import { seedPlan, recordPlanThread, type OriginChannel } from "./plan_enforcer.js";
 
 // =============================================================================
 // scheduler — per-fire fresh-session model.
@@ -100,6 +100,15 @@ function loadAllJobMeta(): JobMeta[] {
     return out;
 }
 
+/**
+ * Derive the session ID from its on-disk file path. Pi names session files
+ * `<sessionId>.jsonl` — strip the extension to recover the ID the subprocess
+ * will self-report via `ctx.sessionManager.getSessionId()`.
+ */
+function sessionFileToId(sessionFile: string): string {
+    return path.basename(sessionFile).replace(/\.jsonl?$/i, "");
+}
+
 function deleteJobMeta(jobId: string): void {
     const f = jobFile(jobId);
     if (fs.existsSync(f)) fs.unlinkSync(f);
@@ -141,12 +150,24 @@ async function fireJob(meta: JobMeta, manualTrigger = false): Promise<void> {
             scheduleId: meta.job_id,
         };
         try {
-            await seedPlan(sessionFile, {
+            const { plan } = await seedPlan(sessionFile, {
                 task: meta.task,
                 steps: meta.steps,
                 originChannel: origin,
             });
             console.log(`[scheduler] seeded plan for ${meta.job_id}: ${meta.steps.length} step(s)`);
+            // Record the thread→session map so admin @bot-abort replies in
+            // this origin channel get routed back to THIS subprocess's
+            // session. sessionId is the session's filename sans extension.
+            const sessionId = sessionFileToId(sessionFile);
+            recordPlanThread({
+                platform: origin.platform,
+                channelId: origin.channelId,
+                ...(origin.threadId !== undefined ? { threadId: origin.threadId } : {}),
+                sessionId,
+                planId: plan.id,
+                ...(origin.scheduleId !== undefined ? { scheduleId: origin.scheduleId } : {}),
+            });
         } catch (e) {
             console.error(`[scheduler] seedPlan failed for ${meta.job_id}: ${e instanceof Error ? e.message : String(e)}`);
             return;

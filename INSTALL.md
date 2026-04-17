@@ -11,13 +11,13 @@
 ## Quick install (one-liner)
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/<YOUR_FORK>/ori2/master/bootstrap.sh)" -- --name MyBot
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/misunders2d/ori2/master/bootstrap.sh)" -- --name MyBot
 ```
 
 The bootstrap will:
-1. Verify Node ≥ 18, git, npm
+1. Verify Node ≥ 22, git, npm
 2. Clone the repo (or pull if present)
-3. Run `npm install`
+3. Run `npm install` (postinstall pre-warms the fastembed model into `.cache/fastembed/`)
 4. Run `npm test` — halts the install if any baseline test fails. To override (NOT recommended), `export ORI2_SKIP_TESTS=1` before re-running.
 5. Launch the first-run wizard (asks for bot name, optional admin IDs, primary AI provider key)
 6. Optionally install a systemd user unit (Linux) or launchd LaunchAgent (macOS) for headless deployment
@@ -25,7 +25,7 @@ The bootstrap will:
 ## Manual install
 
 ```bash
-git clone https://github.com/<YOUR_FORK>/ori2.git
+git clone https://github.com/misunders2d/ori2.git
 cd ori2
 npm install
 npm run start
@@ -114,7 +114,7 @@ rm ~/Library/LaunchAgents/dev.ori2.MyBot.plist
 A `Dockerfile` is not bundled with baseline ori2 — your deployment likely needs custom layers (your credentials, your tools, your evolved extensions). Reference Dockerfile to start from:
 
 ```dockerfile
-FROM node:20-bookworm-slim
+FROM node:22-bookworm-slim
 WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git python3 build-essential ca-certificates \
@@ -135,7 +135,7 @@ Each bot lives in its own checkout. The two checkouts are fully independent:
 | Resource | Per-bot | Where |
 |---|---|---|
 | Vault, memory, sessions, plans, OAuth, credentials, channel log | ✅ | `<checkout>/data/<BOT>/` |
-| Fastembed model cache (~130MB) | ✅ | `<checkout>/data/<BOT>/.fastembed_cache/` |
+| Fastembed model cache (~130MB) | ⚠️ shared per-checkout | `<checkout>/.cache/fastembed/` (pre-warmed by `npm install` postinstall; identical across bots so it's shared) |
 | Pi SDK global config (auth/models/settings/themes/debug log) | ✅ | `<checkout>/data/<BOT>/.pi-state/` (via `PI_CODING_AGENT_DIR`) |
 | Instance lock | ✅ | `<checkout>/data/<BOT>/.instance.lock` (PID-checked, stale-tolerant) |
 | systemd unit / launchd label | ✅ | `ori2-<BOT>.service` / `dev.ori2.<BOT>` |
@@ -225,7 +225,7 @@ To turn A2A off entirely: `A2A_TUNNEL_MODE=disabled`.
 | `A2A_BASE_URL` | (auto-detected) | Public URL — overridable when `A2A_TUNNEL_MODE=external` |
 | `A2A_BIND_HOST` | `127.0.0.1` | Local HTTP bind (loopback by default) |
 | `A2A_BIND_PORT` | `8085`, sticky | Auto-walked on conflict; persisted back to vault |
-| `A2A_API_KEY` | (generated on first boot) | OUR bearer key — what peers must present in `x-a2a-api-key` |
+| `A2A_API_KEY` | (generated on first boot) | Legacy bootstrap key. **Not currently consulted** — all inbound auth goes through per-friend `a2a:friend_key:<name>` entries. Kept for future use. |
 | `A2A_AGENT_ID` | `ori2-<bot-name>` | Identity advertised in the agent card |
 | `A2A_DESCRIPTION` | `<bot-name> — ori2 agent` | Free-text description on the card |
 | `A2A_PROVIDER_NAME` | `Ori2 Project` | Vanity field |

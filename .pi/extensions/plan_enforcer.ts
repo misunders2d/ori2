@@ -92,6 +92,89 @@ function reportsDir(): string { return path.join(botDir(), "plan-reports"); }
 function threadsDir(): string { return path.join(botDir(), "plan-threads"); }
 function ensureDir(p: string) { if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true }); }
 
+/**
+ * Deterministic filename for the thread-map index. Collapses non-identifier
+ * characters so a channelId containing '/' (Slack-style `C0123/threadTs`)
+ * or a threadId containing ':' doesn't escape the target directory.
+ */
+function threadKey(platform: string, channelId: string, threadId: string | undefined): string {
+    const safe = (s: string): string => s.replace(/[^A-Za-z0-9_.-]/g, "_");
+    const t = threadId ? `-${safe(threadId)}` : "";
+    return `${safe(platform)}-${safe(channelId)}${t}.json`;
+}
+
+// ---------- Thread→session map (Admin Override Option C support) ----------
+
+/**
+ * Associate a chat thread with an active scheduled plan so that an admin
+ * replying "@bot abort" in that thread can be routed back to this session.
+ * Called by scheduler.ts at plan-seed time (after seedPlan succeeds). The
+ * dispatcher pre-hook in transport_bridge.ts reads this to detect admin
+ * abort replies.
+ *
+ * Idempotent — overwrites any existing record for the same thread key.
+ */
+export function recordPlanThread(args: {
+    platform: string;
+    channelId: string;
+    threadId?: string;
+    sessionId: string;
+    planId: string;
+    scheduleId?: string;
+}): void {
+    ensureDir(threadsDir());
+    const file = path.join(threadsDir(), threadKey(args.platform, args.channelId, args.threadId));
+    fs.writeFileSync(file, JSON.stringify({
+        platform: args.platform,
+        channelId: args.channelId,
+        ...(args.threadId !== undefined ? { threadId: args.threadId } : {}),
+        sessionId: args.sessionId,
+        planId: args.planId,
+        ...(args.scheduleId !== undefined ? { scheduleId: args.scheduleId } : {}),
+        recordedAt: Date.now(),
+    }, null, 2), { mode: 0o600 });
+}
+
+/**
+ * Reverse lookup: given the (platform, channelId, threadId) of an inbound
+ * chat message, return the plan's sessionId if a scheduled plan is
+ * associated with that thread. Null otherwise.
+ *
+ * Used by transport_bridge's admin-abort detector.
+ */
+export function findPlanSessionByThread(
+    platform: string,
+    channelId: string,
+    threadId: string | undefined,
+): { sessionId: string; planId: string } | null {
+    const dir = threadsDir();
+    if (!fs.existsSync(dir)) return null;
+    const file = path.join(dir, threadKey(platform, channelId, threadId));
+    if (!fs.existsSync(file)) {
+        // Tolerate the case where the initial record was written without a
+        // threadId (single-channel deployment) — try without threadId.
+        if (threadId !== undefined) return findPlanSessionByThread(platform, channelId, undefined);
+        return null;
+    }
+    try {
+        const raw = fs.readFileSync(file, "utf-8");
+        const parsed = JSON.parse(raw) as { sessionId?: unknown; planId?: unknown };
+        if (typeof parsed.sessionId !== "string" || typeof parsed.planId !== "string") return null;
+        return { sessionId: parsed.sessionId, planId: parsed.planId };
+    } catch { return null; }
+}
+
+/**
+ * Drop an abort control file for the owning session to pick up. Same
+ * mechanism as Option D (manual drop-file kill switch). Used by
+ * transport_bridge's @bot-abort detector.
+ */
+export function writeAbortControlFile(sessionId: string, reason: string, by: string): void {
+    ensureDir(controlDir());
+    const file = path.join(controlDir(), `abort-${sessionId}.json`);
+    fs.writeFileSync(file, JSON.stringify({ reason, by, issuedAt: Date.now() }, null, 2), { mode: 0o600 });
+}
+
 // ---------- Programmatic seed (called by scheduler.ts at fire time) ----------
 
 /**
@@ -659,106 +742,32 @@ export default function (pi: ExtensionAPI) {
         },
     });
 
-    // ---------- Admin Override Option C: reply-in-channel (placeholder wiring) ----------
+    // ---------- Admin Override Option C: reply-in-channel ----------
+    //
+    // The inbound chat bridge (transport_bridge.ts) detects "@bot abort" or
+    // "!plan-abort" in admin replies to a thread mapped to an active
+    // scheduled plan (via recordPlanThread at plan-seed time, looked up via
+    // findPlanSessionByThread) and writes data/<BOT>/plan-control/abort-<sessionId>.json
+    // directly (shared mechanism with Option D's drop-file kill switch). The
+    // owning session picks up the abort at its next plan tool call or turn
+    // boundary via checkAbortSignal().
+    //
+    // The pi.events listener below remains available for in-process admin
+    // actions (e.g. future Option A, an A2A peer admin command that ends up
+    // in the same Pi process). Subprocess-spawned scheduled plans can only
+    // be signaled via the control file, so the file path is the source of
+    // truth regardless.
 
-    /**
-     * PLACEHOLDER — Admin Override Option C: reply-in-channel admin override.
-     *
-     * The inbound chat bridge (Slack / Telegram / etc., implemented as
-     * adapters under `src/transport/` and routed via the dispatcher) MUST
-     * emit `plan:admin-action` events on `pi.events` with this shape:
-     *
-     *     {
-     *       sessionId: string,   // target plan's session id
-     *       action: "abort",     // only "abort" today; "skip" intentionally omitted
-     *       reason: string,      // free-text reason from the admin
-     *       by: string,          // admin user id (must be in ADMIN_USER_IDS)
-     *     }
-     *
-     * Required bridge logic (in the inbound side, NOT here):
-     *
-     *   1. Maintain a thread→plan-session map. When the bot first posts a
-     *      status message for a scheduled plan, write to:
-     *        data/<BOT>/plan-threads/<platform>-<channelId>-<threadId>.json
-     *      with body { sessionId, planId, scheduleId }. seed/start time is
-     *      a good moment to do this — extend the seedPlan() caller with a
-     *      post-and-record step.
-     *
-     *   2. On every inbound message:
-     *        - sender must be in ADMIN_USER_IDS, AND
-     *        - the message must be in a thread mapped to a plan session, AND
-     *        - the message text must match `/^@bot\s+abort(\s+(.+))?$/i` or
-     *          `/^!plan-abort(\s+(.+))?$/i`
-     *      → call pi.events.emit("plan:admin-action", { sessionId, action: "abort",
-     *         reason, by }) — the listener below handles the rest.
-     *
-     *   3. Skip-step ("@bot skip <reason>") is intentionally NOT supported:
-     *      for amazon-manager you specified scheduled plans must fail loud
-     *      rather than skip. If skip semantics are wanted later, add a new
-     *      `plan-skip-<sessionId>.json` control file pattern in checkAbortSignal()
-     *      with a separate AdminAction kind.
-     */
     pi.events.on("plan:admin-action", (data: unknown) => {
         const msg = data as Partial<AdminAction>;
         if (!msg || msg.action !== "abort" || !msg.sessionId) return;
-        ensureDir(controlDir());
-        fs.writeFileSync(
-            path.join(controlDir(), `abort-${msg.sessionId}.json`),
-            JSON.stringify({ reason: msg.reason ?? "", by: msg.by ?? "admin", issuedAt: Date.now() }, null, 2),
-        );
+        writeAbortControlFile(msg.sessionId, msg.reason ?? "", msg.by ?? "admin");
     });
 
-    // ---------- Admin Override Option A: A2A peer command (placeholder) ----------
-
-    /**
-     * PLACEHOLDER — Admin Override Option A: A2A peer-issued admin command.
-     *
-     * Inbound A2A traffic flows through the standard dispatcher, so a friendly
-     * admin peer can call_friend(<our-name>, "/plan-abort <sessionId> <reason>")
-     * and reach the same slash-command handler. The handler should emit a
-     * `plan:admin-action` event (see Option C placeholder above). No additional
-     * code is needed in this file; the Option C listener catches it.
-     */
-
-    // ---------- Admin Override Option D: drop-file kill switch (no-infra fallback) ----------
-
-    /**
-     * PLACEHOLDER — Admin Override Option D: drop-file kill switch.
-     *
-     * For emergency aborts when no command surface is available (admin SSH'd
-     * into the box but no Pi terminal handy), drop a JSON file:
-     *
-     *     data/<BOT>/plan-control/abort-<sessionId>.json
-     *
-     * with body { "reason": "...", "by": "..." } and the owning session
-     * picks it up at its next plan tool call or turn boundary via
-     * checkAbortSignal(). No other code needed — this is just documenting
-     * the manual fallback. /plan-abort and the Option C bridge produce the
-     * same files.
-     */
-
-    // ---------- Status threads registry (placeholder helper, unused today) ----------
-
-    /**
-     * PLACEHOLDER helper — to be called by the inbound bridge when posting
-     * the first status message for a scheduled plan. Records the thread so
-     * admin replies in that thread can be routed back to the right session
-     * (see Option C above). Not used in this file today — exposed so the
-     * future bridge code has a stable place to hook into.
-     */
-    void function recordPlanThread(_args: {
-        platform: string;
-        channelId: string;
-        threadId: string;
-        sessionId: string;
-        planId: string;
-        scheduleId?: string;
-    }): void {
-        // Implementation deferred to inbound-bridge wiring.
-        // Suggested: ensureDir(threadsDir()); write
-        // `${threadsDir()}/${platform}-${channelId}-${threadId}.json`.
-    };
-
-    // Reference to silence unused-warnings on threadsDir until the bridge lands.
-    void threadsDir;
+    // ---------- Admin Override Option D: drop-file kill switch (documented) ----------
+    //
+    // Emergency: when no command surface is reachable, an operator can drop
+    // data/<BOT>/plan-control/abort-<sessionId>.json with {reason, by} by
+    // hand and the owning session picks it up. checkAbortSignal() scans
+    // controlDir() — no extra code needed here beyond the shared file format.
 }

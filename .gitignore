@@ -19,6 +19,10 @@ dist/
 build/
 *.tsbuildinfo
 
+# Shared caches (fastembed model weights, etc.) — repo-local, not per-bot,
+# populated by scripts/postinstall-prewarm.js.
+.cache/
+
 # OS Files
 .DS_Store
 Thumbs.db

@@ -237,3 +237,106 @@ describe("A2A server — port allocation", () => {
         assert.equal(h2.boundPort, 52121);
     });
 });
+
+describe("A2A server — /a2a/key-update", () => {
+    it("401 when x-a2a-api-key is missing", async () => {
+        const h = await bootServer({ preferredPort: 52200 });
+        const res = await fetch(url(h, "/a2a/key-update"), {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ sender_name: "P", new_key: "nk" }),
+        });
+        assert.equal(res.status, 401);
+    });
+
+    it("401 when bearer key doesn't match any registered friend", async () => {
+        const h = await bootServer({ preferredPort: 52210 });
+        const res = await fetch(url(h, "/a2a/key-update"), {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-a2a-api-key": "unknown-key" },
+            body: JSON.stringify({ sender_name: "P", new_key: "nk" }),
+        });
+        assert.equal(res.status, 401);
+    });
+
+    it("400 when body is missing new_key or sender_name", async () => {
+        const h = await bootServer({ preferredPort: 52220 });
+        getFriends().add("Peer", { url: "https://peer", agent_id: "p", added_by: "t" });
+        getFriends().setKey("Peer", "peer-inbound");
+        const res = await fetch(url(h, "/a2a/key-update"), {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-a2a-api-key": "peer-inbound" },
+            body: JSON.stringify({ sender_name: "Peer" }),
+        });
+        assert.equal(res.status, 400);
+    });
+
+    it("accepted: stores new_key as outbound key for the authenticated friend", async () => {
+        const h = await bootServer({ preferredPort: 52230 });
+        const friends = getFriends();
+        friends.add("Peer", { url: "https://peer", agent_id: "p", added_by: "t" });
+        friends.setKey("Peer", "peer-inbound");
+        friends.setOutboundKey("Peer", "peer-old-outbound");
+
+        const res = await fetch(url(h, "/a2a/key-update"), {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-a2a-api-key": "peer-inbound" },
+            body: JSON.stringify({ sender_name: "Peer", new_key: "peer-NEW-outbound" }),
+        });
+        assert.equal(res.status, 200);
+        const body = await res.json() as { status: string };
+        assert.equal(body.status, "accepted");
+        assert.equal(friends.getOutboundKey("Peer"), "peer-NEW-outbound");
+    });
+
+    it("idempotent: resubmitting the same new_key returns no-op", async () => {
+        const h = await bootServer({ preferredPort: 52240 });
+        const friends = getFriends();
+        friends.add("Peer", { url: "https://peer", agent_id: "p", added_by: "t" });
+        friends.setKey("Peer", "peer-inbound");
+        friends.setOutboundKey("Peer", "same-key");
+
+        const res = await fetch(url(h, "/a2a/key-update"), {
+            method: "POST",
+            headers: { "content-type": "application/json", "x-a2a-api-key": "peer-inbound" },
+            body: JSON.stringify({ sender_name: "Peer", new_key: "same-key" }),
+        });
+        assert.equal(res.status, 200);
+        const body = await res.json() as { status: string };
+        assert.equal(body.status, "no-op");
+    });
+
+    it("round-trip: rotateAllFriendKeys fired at one bot lands on the other bot's server", async () => {
+        // Boot a peer server; it will be the target of our key-update POST.
+        const peer = await bootServer({ preferredPort: 52250 });
+        // Pre-register ourselves as that peer's friend so the auth middleware
+        // resolves our bearer key.
+        const friends = getFriends();
+        friends.add("Caller", { url: `http://127.0.0.1:${peer.boundPort}`, agent_id: "caller", added_by: "t" });
+        friends.setKey("Caller", "caller-inbound");
+        friends.setOutboundKey("Caller", "peer-will-receive-this");
+
+        // Fire the rotation — as if from a separate bot that has "Peer" in
+        // its friend list. We reuse the real fetch so this exercises the HTTP
+        // path end-to-end.
+        const { rotateAllFriendKeys } = await import("./keyRotation.js");
+        const otherFriends = new (await import("./friends.js")).Friends();
+        otherFriends.add("Peer", { url: `http://127.0.0.1:${peer.boundPort}`, agent_id: "p", added_by: "t" });
+        otherFriends.setKey("Peer", "we-stored-for-peer");
+        otherFriends.setOutboundKey("Peer", "caller-inbound"); // = Peer's inbound for us
+
+        const report = await rotateAllFriendKeys({
+            senderName: "Caller",
+            friends: otherFriends,
+            genKey: () => "hot-fresh-key",
+        });
+
+        assert.deepEqual(report.rotated, ["Peer"]);
+        // On the Peer side (= our current test singleton friends registry),
+        // the authenticated-as name is "Caller" (resolved from bearer), so
+        // the new key is stored as Caller's outbound key.
+        assert.equal(friends.getOutboundKey("Caller"), "hot-fresh-key");
+        // On the caller's side, inbound key got committed.
+        assert.equal(otherFriends.getKey("Peer"), "hot-fresh-key");
+    });
+});

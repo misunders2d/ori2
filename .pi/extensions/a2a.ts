@@ -2,7 +2,6 @@ import { randomBytes, randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { getBotName } from "../../src/core/paths.js";
-import { getVault } from "../../src/core/vault.js";
 import { getFriends } from "../../src/a2a/friends.js";
 import {
     getA2AServerHandle,
@@ -21,6 +20,7 @@ import {
     INVITATION_TTL_MS,
 } from "../../src/a2a/invitations.js";
 import { broadcastAddressUpdate } from "../../src/a2a/broadcaster.js";
+import { rotateAllFriendKeys } from "../../src/a2a/keyRotation.js";
 import { currentOrigin } from "../../src/core/identity.js";
 import { getWhitelist } from "../../src/core/whitelist.js";
 
@@ -348,7 +348,7 @@ export default function (pi: ExtensionAPI) {
                 case "add-friend":       return doAddFriend(ctx, parts);
                 case "set-their-key":    return doSetTheirKey(ctx, parts);
                 case "remove-friend":    return doRemoveFriend(ctx, parts);
-                case "rotate-key":       return doRotateKey(ctx);
+                case "rotate-key":       return doRotateKey(ctx, parts);
                 case "broadcast-address": return doBroadcast(ctx);
                 default:
                     ctx.ui.notify(`Unknown /a2a subcommand: ${sub}. Run /a2a help.`, "error");
@@ -380,7 +380,7 @@ function doHelp(ctx: ExtensionContext): void {
         "  /a2a remove-friend <name>         — drop friend + wipe both keys (admin)",
         "",
         "OPERATIONS",
-        "  /a2a rotate-key                   — rotate OUR API key (admin)  [TODO: not yet implemented]",
+        "  /a2a rotate-key [name]            — rotate inbound key for one friend or all (admin)",
         "  /a2a broadcast-address            — re-fire URL broadcast to all friends (admin)",
         "",
         "═════════════════════════════════════════════════════════════",
@@ -543,19 +543,35 @@ function doRemoveFriend(ctx: ExtensionContext, parts: string[]): void {
     ctx.ui.notify(ok ? `Removed friend "${name}" (keys wiped).` : `Friend "${name}" not found.`, "info");
 }
 
-function doRotateKey(ctx: ExtensionContext): void {
+async function doRotateKey(ctx: ExtensionContext, parts: string[]): Promise<void> {
     if (!isAdminCaller(ctx)) { ctx.ui.notify("/a2a rotate-key is admin-only.", "error"); return; }
-    // OUR api key — the one all peers present when calling us — is currently
-    // a process-wide secret stored in vault. Rotating it requires telling
-    // every friend the new value, which means every friend's vault entry
-    // a2a:friend_outbound_key:<our-name> needs to be updated on THEIR side.
-    // We don't have a wire mechanism for that yet; deferring to a follow-up.
-    ctx.ui.notify(
-        "/a2a rotate-key is not yet implemented — peers can't auto-receive new server keys (no wire path). " +
-            "Workaround: run /a2a remove-friend <name> + re-invite each affected peer.",
-        "warning",
-    );
-    void getVault(); // suppress unused-import warning until rotation lands
+    if (!getA2AServerHandle()) { ctx.ui.notify("A2A server is not running.", "error"); return; }
+    // Inbound auth is per-friend (see server.ts makeAuthMiddleware — it checks
+    // a2a:friend_key:<name>). So rotating "our key" means generating a fresh
+    // inbound key for each friend and pushing it to their /a2a/key-update
+    // endpoint with our current outbound key to them. Transactional — we only
+    // commit locally after the peer acks.
+    const only = parts.slice(1);
+    const report = await rotateAllFriendKeys({
+        senderName: getBotName(),
+        ...(only.length > 0 ? { only } : {}),
+    });
+    const lines = [
+        `Key rotation complete:`,
+        `  rotated:            ${report.rotated.length}  [${report.rotated.join(", ")}]`,
+        `  failed:             ${report.failed.length}  [${report.failed.map((f) => `${f.name}:${f.lastError}`).join(", ")}]`,
+        `  skipped (no outbound key):  ${report.skippedNoOutboundKey.length}  [${report.skippedNoOutboundKey.join(", ")}]`,
+        `  skipped (no inbound key):   ${report.skippedNoInboundKey.length}  [${report.skippedNoInboundKey.join(", ")}]`,
+    ];
+    if (report.skippedByCaller.length > 0) {
+        lines.push(`  filtered out:       ${report.skippedByCaller.length}  [${report.skippedByCaller.join(", ")}]`);
+    }
+    if (report.failed.length > 0) {
+        lines.push("");
+        lines.push("Failed friends keep their PREVIOUS inbound key — they can still call us.");
+        lines.push("Re-run /a2a rotate-key <name> when the peer is reachable, or /a2a remove-friend + re-invite.");
+    }
+    ctx.ui.notify(lines.join("\n"), report.failed.length > 0 ? "warning" : "info");
 }
 
 async function doBroadcast(ctx: ExtensionContext): Promise<void> {

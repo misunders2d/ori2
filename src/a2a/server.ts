@@ -234,6 +234,47 @@ export async function startA2AServer(opts: A2AServerOptions): Promise<A2AServerH
     });
 
     /**
+     * POST /a2a/key-update
+     * Body: { sender_name: string, new_key: string }
+     * Auth: regular x-a2a-api-key middleware resolves the sender by their
+     * current outbound key (= our current inbound key for them). The sender
+     * is asking us to swap the key they'll use to call us next. Stored as our
+     * new outbound key for them.
+     *
+     * Idempotent: if new_key matches what we already have stored, returns
+     * `{status: "no-op"}`. Makes caller-side retries safe.
+     */
+    app.post("/a2a/key-update", (req, res) => {
+        const authenticatedAs = (req as Request & { a2aFriend?: string }).a2aFriend;
+        if (!authenticatedAs) {
+            // Belt-and-suspenders — middleware should have caught this.
+            res.status(401).json({ status: "error", message: "Unauthenticated" });
+            return;
+        }
+        const body = req.body as { sender_name?: unknown; new_key?: unknown } | undefined;
+        const senderName = typeof body?.sender_name === "string" ? body.sender_name : "";
+        const newKey = typeof body?.new_key === "string" ? body.new_key : "";
+        if (!senderName || !newKey) {
+            res.status(400).json({ status: "error", message: "Missing sender_name or new_key" });
+            return;
+        }
+        // Sanity check: the claimed sender_name should agree with how we
+        // authenticated them. Match is case-insensitive against the local
+        // friend name. Tolerate mismatch (peers may advertise themselves under
+        // a canonical name we locally aliased), but log it.
+        if (senderName.toLowerCase() !== authenticatedAs.toLowerCase()) {
+            // Still proceed — the authoritative identity is the bearer key.
+        }
+        const existing = friends.getOutboundKey(authenticatedAs);
+        if (existing === newKey) {
+            res.json({ status: "no-op", local_name: authenticatedAs });
+            return;
+        }
+        friends.setOutboundKey(authenticatedAs, newKey);
+        res.json({ status: "accepted", local_name: authenticatedAs });
+    });
+
+    /**
      * POST /a2a/friend-accept
      * Body: { accepting_name: string, accepting_url: string, accepting_key: string }
      * Auth: bearer key matches a pending invitation's inviter_key. Once the

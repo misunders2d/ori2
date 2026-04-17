@@ -15,13 +15,13 @@ import { currentOrigin } from "../../src/core/identity.js";
 //   2. credentials pre-hook      — chat-secret intercept
 //   3. THIS pre-hook             — rate limit (skipped if previous hooks blocked)
 //   4. dispatch                  — push to Pi
-//   5. THIS post-hook            — log to channel_log
+//   5. THIS post-hook            — log to channel_log with delivered=true
 //
-//   For BLOCKED messages, this module registers an additional hook that
-//   logs the block reason. The dispatcher invokes hooks in order; we use a
-//   wrapper trick: rate-limit hook returns block on rate limit, AND logs.
-//   For "earlier hook blocked" (whitelist miss, etc.), we log via a
-//   separate registration that runs AFTER admin_gate.
+//   For BLOCKED messages we register a post-block hook. The dispatcher fires
+//   it for EVERY block regardless of which pre-hook raised — whitelist miss,
+//   blacklist, credentials intercept, rate limit, guardrail trip. Single
+//   observation point → full audit trail of blocked traffic, not just the
+//   rate-limit flavour we used to log explicitly.
 // =============================================================================
 
 const cl = getChannelLog();
@@ -31,51 +31,7 @@ const whitelist = getWhitelist();
 
 // ---------- DISPATCHER WIRING (runs at module load) ----------
 
-// Pre-hook 1: log every inbound BEFORE other gates may block it. We log
-// twice for blocked traffic (once at the catch-all "blocked" detection,
-// once with full block reason post-hoc) — that's wasteful. Cleaner:
-// record at this point with delivered=null pending, then update on
-// resolution. SQLite is fast enough for two writes; let's do the simple
-// thing: log delivered=true here, and the post-dispatch chain confirms.
-// For blocks, we re-log via a wrapper.
-//
-// Actually the dispatcher's pre-hook chain doesn't tell THIS hook whether
-// later hooks blocked. The right model is:
-//   pre-hook → if rate-limit blocks, log {delivered: false, reason: "rate limit"}
-//             else: do nothing here
-//   post-dispatch hook → log {delivered: true}
-//   "blocked by other hooks" gets logged via the dispatcher's existing
-//   "blocked by hook" path — which we extend by adding a separate
-//   pre-hook that runs LATE in the chain.
-//
-// For simplicity & correctness, we log at the post-dispatch boundary
-// (the dispatcher only invokes post-hooks for messages that successfully
-// pushed to Pi). For blocked messages, we register a SECOND pre-hook
-// that runs at the very end of the chain — if it sees the message
-// (i.e. wasn't blocked yet), it does nothing. The actual "blocked" log
-// happens via a wrapper: we override addPreDispatchHook and intercept.
-// That's too invasive for Sprint 8.
-//
-// Simplest working compromise: register pre-hook that ALWAYS logs the
-// inbound (with delivered=true tentative). Then a separate post-dispatch
-// hook is a no-op (the log entry is already there). For blocked traffic,
-// the entry shows delivered=true even though it never reached Pi —
-// MISLEADING. So we need another approach.
-//
-// Right approach: register ONE pre-hook positioned LAST in the chain.
-// If we get called, no earlier hook blocked → message will be delivered
-// → log as delivered=true. We also need a way to log earlier-blocked
-// messages. The dispatcher doesn't expose hook-failure events today, so
-// we extend it: addPostDispatchHook for delivered, and for blocked we
-// rely on the dispatcher's console.log fallback PLUS an explicit hook
-// at the END of the chain that records what wasn't blocked.
-//
-// Pragmatic Sprint 8 answer: post-dispatch hook for delivered logging
-// ONLY. Blocked messages are recorded by the dispatcher's existing
-// console.log. A future improvement (small dispatcher API addition)
-// can give us a "block notification" hook for full audit-trail of
-// blocked traffic too. Documented in the extension comment.
-
+// Post-dispatch hook: message reached Pi → record delivered=true.
 dispatcher.addPostDispatchHook((msg) => {
     cl.log({
         platform: msg.platform,
@@ -90,13 +46,11 @@ dispatcher.addPostDispatchHook((msg) => {
     });
 });
 
-// Rate-limit pre-hook: runs after admin_gate (whitelist) and credentials
-// (secret intercept). Both of those are blocking, so by the time this
-// runs we know the user is whitelisted AND the message isn't a secret
-// command. Apply rate limit. If blocked, log it with a clear reason.
-dispatcher.addPreDispatchHook((msg) => {
-    const r = rl.tryConsume(msg.platform, msg.senderId);
-    if (r.allowed) return { block: false };
+// Post-block hook: ANY pre-hook blocked the message → record delivered=false
+// with the raised reason. Catches whitelist-miss, blacklist, credentials
+// intercept, rate limit, guardrail trip — everything that returns {block:true}
+// from a pre-hook — at a single observation point.
+dispatcher.addPostBlockHook((msg, reason) => {
     cl.log({
         platform: msg.platform,
         channelId: msg.channelId,
@@ -107,8 +61,18 @@ dispatcher.addPreDispatchHook((msg) => {
         text: msg.text,
         attachmentCount: msg.attachments?.length ?? 0,
         delivered: false,
-        blockReason: `rate_limit (retry in ${Math.ceil(r.retryAfterMs / 1000)}s)`,
+        blockReason: reason,
     });
+});
+
+// Rate-limit pre-hook: runs after admin_gate (whitelist) and credentials
+// (secret intercept). Both of those are blocking, so by the time this
+// runs we know the user is whitelisted AND the message isn't a secret
+// command. Apply rate limit. Block-logging is now unified via the
+// post-block hook above.
+dispatcher.addPreDispatchHook((msg) => {
+    const r = rl.tryConsume(msg.platform, msg.senderId);
+    if (r.allowed) return { block: false };
     return {
         block: true,
         reason: `Rate limit exceeded. Try again in ${Math.ceil(r.retryAfterMs / 1000)}s.`,
@@ -205,11 +169,10 @@ function doLogHelp(ctx: ExtensionContext): void {
         "      pre-hook, secret never reaches this layer; defense-in-depth",
         "      redaction is also applied here)",
         "",
-        "  Currently logs DELIVERED messages and RATE-LIMITED blocks.",
-        "  Whitelist-miss / blacklist blocks are logged by admin_gate to",
-        "  the bot's stdout but not yet to channel_log.db (the dispatcher",
-        "  hook chain doesn't expose 'earlier hook blocked' events; small",
-        "  Sprint 8 followup will add it).",
+        "  Coverage: DELIVERED messages + every BLOCKED message (whitelist-miss,",
+        "  blacklist, credentials intercept, rate limit, guardrail trip, and any",
+        "  other pre-dispatch hook that blocks) — single observation point via",
+        "  the dispatcher's post-block hook.",
         "",
         "ALL SUBCOMMANDS",
         "  /log help                                           — this message",

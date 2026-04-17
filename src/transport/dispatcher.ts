@@ -53,10 +53,19 @@ export type PreDispatchHook = (
 
 export type PostDispatchHook = (msg: Message) => Promise<void> | void;
 
+/**
+ * Fires when a pre-dispatch hook blocks a message. Lets auxiliary modules
+ * (audit logger, metrics) observe the block without having to re-implement
+ * the block detection in every hook. `reason` is the free-form string the
+ * blocking hook returned.
+ */
+export type PostBlockHook = (msg: Message, reason: string) => Promise<void> | void;
+
 export class TransportDispatcher {
     private adapters = new Map<string, TransportAdapter>();
     private preHooks: PreDispatchHook[] = [];
     private postHooks: PostDispatchHook[] = [];
+    private postBlockHooks: PostBlockHook[] = [];
     private pushToPi: PushToPi | null = null;
     private buffer: Message[] = [];
     private static _instance: TransportDispatcher | null = null;
@@ -159,6 +168,16 @@ export class TransportDispatcher {
     }
 
     /**
+     * Add a hook that runs when an inbound message is blocked by a pre-dispatch
+     * hook. Useful for audit logging of blocked traffic (whitelist-miss,
+     * rate-limit, guardrail trip, etc.) at a single observation point instead
+     * of teaching every blocking hook about the logger.
+     */
+    addPostBlockHook(hook: PostBlockHook): void {
+        this.postBlockHooks.push(hook);
+    }
+
+    /**
      * Wire the dispatcher to Pi. Called by the transport_bridge extension on
      * session_start. Drains any messages that arrived before wiring.
      */
@@ -187,12 +206,21 @@ export class TransportDispatcher {
             const result = await hook(msg);
             if (result && "block" in result && result.block) {
                 console.log(`[transport] msg blocked by hook: ${result.reason}`);
-                // Optionally tell the adapter to surface the block to the user:
+                // Tell the adapter to surface the block to the user.
                 const adapter = this.adapters.get(msg.platform);
                 if (adapter) {
                     try {
                         await adapter.send(msg.channelId, { text: `🚫 ${result.reason}` });
                     } catch { /* best effort */ }
+                }
+                // Fire post-block hooks so observers (audit log) see the block.
+                // Exceptions in observers must not mask the original block.
+                for (const postBlock of this.postBlockHooks) {
+                    try {
+                        await postBlock(msg, result.reason);
+                    } catch (e) {
+                        console.error(`[transport] post-block hook failed:`, e);
+                    }
                 }
                 return;
             }

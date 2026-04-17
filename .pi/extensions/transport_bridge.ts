@@ -2,6 +2,8 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { getDispatcher } from "../../src/transport/dispatcher.js";
 import type { Message } from "../../src/transport/types.js";
 import { getVault } from "../../src/core/vault.js";
+import { getWhitelist } from "../../src/core/whitelist.js";
+import { findPlanSessionByThread, writeAbortControlFile } from "./plan_enforcer.js";
 
 // =============================================================================
 // transport_bridge — Pi-side glue for the transport abstraction.
@@ -71,8 +73,44 @@ function formatAttachmentsForPi(msg: Message): string {
     return lines.join("\n");
 }
 
+// ---------- Admin Override Option C — @bot-abort detector ----------
+//
+// Matches (case-insensitive):
+//     @bot abort [<optional reason>]
+//     !plan-abort [<optional reason>]
+const ABORT_PATTERN = /^\s*(?:@\w+\s+abort|!plan[_-]abort)(?:\s+(.+))?\s*$/i;
+
+/**
+ * Pre-dispatch hook that catches admin "@bot abort" / "!plan-abort" replies
+ * in a thread mapped to an active scheduled plan, writes the abort control
+ * file for the owning subprocess session to pick up, and blocks the message
+ * so it doesn't also flow to the LLM. Non-admin senders, non-matching text,
+ * or messages in threads without a mapped plan fall through untouched.
+ */
+function abortDetectorHook(msg: Message): { block: true; reason: string } | { block: false } {
+    const match = (msg.text ?? "").match(ABORT_PATTERN);
+    if (!match) return { block: false };
+    if (!getWhitelist().isAdmin(msg.platform, msg.senderId)) return { block: false };
+    const target = findPlanSessionByThread(msg.platform, msg.channelId, msg.threadId);
+    if (!target) return { block: false };
+    const reason = (match[1] ?? "").trim() || "admin chat abort";
+    const by = `${msg.platform}:${msg.senderId}`;
+    writeAbortControlFile(target.sessionId, reason, by);
+    return {
+        block: true,
+        reason:
+            `✅ Abort signal sent to plan ${target.planId} (session ${target.sessionId}). ` +
+            `The scheduled run will halt at its next plan tool call or turn boundary.`,
+    };
+}
+
 export default function (pi: ExtensionAPI) {
     const dispatcher = getDispatcher();
+
+    // Run the abort detector FIRST — it must fire before rate-limit or other
+    // side-effecting hooks. Messages that don't target an active plan fall
+    // through unchanged.
+    dispatcher.addPreDispatchHook(abortDetectorHook);
 
     // Track the originating platform/channel of the most recent inbound message
     // so that on agent_end we know where to send the response. Sprint 4
