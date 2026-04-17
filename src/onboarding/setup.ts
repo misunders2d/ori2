@@ -4,6 +4,30 @@ import readline from "node:readline/promises";
 import { getVault, Vault } from "../core/vault.js";
 import { botSubdir, ensureDir } from "../core/paths.js";
 
+// ---- tiny ANSI helpers (no-color safe) ----------------------------------
+const USE_COLOR = process.stdout.isTTY && !process.env["NO_COLOR"];
+const C = {
+    reset:   USE_COLOR ? "\x1b[0m"  : "",
+    bold:    USE_COLOR ? "\x1b[1m"  : "",
+    dim:     USE_COLOR ? "\x1b[2m"  : "",
+    red:     USE_COLOR ? "\x1b[31m" : "",
+    green:   USE_COLOR ? "\x1b[32m" : "",
+    yellow:  USE_COLOR ? "\x1b[33m" : "",
+    blue:    USE_COLOR ? "\x1b[34m" : "",
+    magenta: USE_COLOR ? "\x1b[35m" : "",
+    cyan:    USE_COLOR ? "\x1b[36m" : "",
+};
+function banner(): void {
+    console.log("");
+    console.log(`${C.cyan}   ___  ____  ___ ___  ${C.reset}`);
+    console.log(`${C.cyan}  / _ \\|  _ \\|_ _|__ \\ ${C.reset}`);
+    console.log(`${C.cyan} | | | | |_) || |  / / ${C.reset}`);
+    console.log(`${C.cyan} | |_| |  _ < | | / /_ ${C.reset}`);
+    console.log(`${C.cyan}  \\___/|_| \\_\\___|____|${C.reset}`);
+    console.log(`${C.dim}  your local AI assistant${C.reset}`);
+    console.log("");
+}
+
 // =============================================================================
 // First-run onboarding wizard.
 //
@@ -127,41 +151,47 @@ export async function runOnboardingFlow(): Promise<void> {
         output: process.stdout,
     });
 
-    console.log("\n================================================");
-    console.log("🚀 Welcome — let's set up your assistant 🚀");
-    console.log("================================================\n");
-    console.log("This wizard asks 3 questions. Takes about a minute.\n");
+    banner();
+    console.log(`${C.bold}Welcome — let's set up your assistant.${C.reset}`);
+    console.log(`${C.dim}Three quick questions. Takes under a minute.${C.reset}\n`);
 
     // --- 1. Name ---
-    console.log("1️⃣  NAME YOUR ASSISTANT");
-    console.log("   A short nickname, letters/numbers/underscores only.");
-    console.log("   Examples: MarketingBot, amazon_helper, ClaireBot\n");
-    const botNameRaw = await rl.question("   Name: ");
-    const safeBotName = botNameRaw.trim().replace(/[^a-zA-Z0-9_-]/g, "_") || "Platform_Controller";
-    if (safeBotName !== botNameRaw.trim()) {
-        console.log(`   (cleaned to: ${safeBotName})`);
+    // Pre-set by bootstrap.sh via .env so the user isn't asked twice. If an
+    // explicit BOT_NAME is already in env (non-empty, not the default
+    // placeholder), reuse it and skip the prompt.
+    const envBotName = (process.env["BOT_NAME"] ?? "").trim();
+    let safeBotName: string;
+    if (envBotName && envBotName !== "ori2_agent") {
+        safeBotName = envBotName.replace(/[^a-zA-Z0-9_-]/g, "_");
+        console.log(`${C.bold}${C.cyan}1️⃣  NAME${C.reset}   ${C.green}✔${C.reset} ${C.bold}${safeBotName}${C.reset} ${C.dim}(from .env)${C.reset}`);
+    } else {
+        console.log(`${C.bold}${C.cyan}1️⃣  NAME YOUR ASSISTANT${C.reset}`);
+        console.log(`${C.dim}   Short nickname — letters, numbers, underscores only.${C.reset}`);
+        console.log(`${C.dim}   Examples: MarketingBot, amazon_helper, ClaireBot${C.reset}\n`);
+        const botNameRaw = await rl.question(`   ${C.yellow}Name:${C.reset} `);
+        safeBotName = botNameRaw.trim().replace(/[^a-zA-Z0-9_-]/g, "_") || "Platform_Controller";
+        if (safeBotName !== botNameRaw.trim()) {
+            console.log(`   ${C.dim}(cleaned to: ${safeBotName})${C.reset}`);
+        }
     }
 
     // --- 2. Admin access (chat-side) ---
-    console.log("\n2️⃣  WHO IS THE ADMIN?");
-    console.log("   You (running this wizard in the terminal) are ALREADY admin — nothing");
-    console.log("   to do for terminal access.\n");
-    console.log("   For chat platforms (Telegram etc.), just press ENTER below. After");
-    console.log("   install the bot prints a one-time passcode — you'll send it to the");
-    console.log("   bot from your chat app (like: /init abc123xyz) and you become admin.\n");
-    console.log("   (Advanced: if you already know your chat IDs, paste them as");
-    console.log("    telegram:123456789 or slack:U0ABC123 — otherwise ENTER to skip.)");
-    const adminIds = (await rl.question("   Admin chat IDs (ENTER to skip): ")).trim();
+    console.log(`\n${C.bold}${C.cyan}2️⃣  WHO IS THE ADMIN?${C.reset}`);
+    console.log(`${C.dim}   You, running this wizard, are ALREADY admin — nothing to do${C.reset}`);
+    console.log(`${C.dim}   for terminal access. For chat platforms (Telegram etc.) just${C.reset}`);
+    console.log(`${C.dim}   press ENTER — after install the bot prints a one-time passcode${C.reset}`);
+    console.log(`${C.dim}   you'll send to it via chat (like: /init abc123xyz).${C.reset}`);
+    console.log(`${C.dim}   (Advanced: paste IDs like telegram:123456789 or slack:U0ABC123.)${C.reset}`);
+    const adminIds = (await rl.question(`   ${C.yellow}Admin chat IDs (ENTER to skip):${C.reset} `)).trim();
 
     // --- 3. AI provider ---
-    console.log("\n3️⃣  PICK AN AI BRAIN");
-    console.log("   Your assistant needs an AI provider key. You can change this later.");
-    console.log("   Pick ONE — whichever you already have an account with.\n");
-    console.log("   [1] Google Gemini   → get a key at https://aistudio.google.com/apikey");
-    console.log("   [2] Anthropic Claude → get a key at https://console.anthropic.com/settings/keys");
-    console.log("   [3] OpenAI (GPT)    → get a key at https://platform.openai.com/api-keys\n");
-    console.log("   Don't have any? → [1] Gemini has a free tier, quickest to sign up.\n");
-    const providerChoice = (await rl.question("   Your pick (1/2/3): ")).trim();
+    console.log(`\n${C.bold}${C.cyan}3️⃣  PICK AN AI BRAIN${C.reset}`);
+    console.log(`${C.dim}   Your assistant needs an AI provider key. You can change this later.${C.reset}\n`);
+    console.log(`   ${C.bold}[1]${C.reset} Google Gemini    ${C.dim}→${C.reset} ${C.blue}https://aistudio.google.com/apikey${C.reset}`);
+    console.log(`   ${C.bold}[2]${C.reset} Anthropic Claude ${C.dim}→${C.reset} ${C.blue}https://console.anthropic.com/settings/keys${C.reset}`);
+    console.log(`   ${C.bold}[3]${C.reset} OpenAI (GPT)     ${C.dim}→${C.reset} ${C.blue}https://platform.openai.com/api-keys${C.reset}\n`);
+    console.log(`${C.dim}   Don't have any? → [1] Gemini has a free tier — quickest signup.${C.reset}`);
+    const providerChoice = (await rl.question(`   ${C.yellow}Your pick (1/2/3):${C.reset} `)).trim();
 
     // Map choice → (Pi provider name, vault key name per Pi SDK convention,
     // human-readable provider label for the API key prompt).
@@ -182,16 +212,16 @@ export async function runOnboardingFlow(): Promise<void> {
     // depending on provider; anything under 20 is almost certainly a typo.
     let apiKey = "";
     while (true) {
-        console.log(`\n   Paste your ${chosen.label} API key (get one at ${chosen.url}):`);
-        console.log(`   Or type SKIP to set it up later via /credentials or /oauth.`);
-        const raw = (await rl.question("   Key: ")).trim();
+        console.log(`\n   ${C.dim}Paste your ${chosen.label} API key (get one at ${C.blue}${chosen.url}${C.reset}${C.dim}):${C.reset}`);
+        console.log(`   ${C.dim}Or type ${C.reset}${C.bold}SKIP${C.reset} ${C.dim}to set it up later via /credentials or /oauth.${C.reset}`);
+        const raw = (await rl.question(`   ${C.yellow}Key:${C.reset} `)).trim();
         if (raw.toUpperCase() === "SKIP") {
-            console.log("   ⚠️  Skipping — you'll need to set a key before the bot can reply.");
+            console.log(`   ${C.yellow}!${C.reset} Skipping — you'll need to set a key before the bot can reply.`);
             break;
         }
         if (raw.length < 20) {
-            console.log(`   ❌ That doesn't look like a valid API key (too short: ${raw.length} chars).`);
-            console.log(`      Real keys are long strings from ${chosen.url}. Try again or type SKIP.`);
+            console.log(`   ${C.red}✖${C.reset} That doesn't look like a valid API key (too short: ${raw.length} chars).`);
+            console.log(`     ${C.dim}Real keys are long strings from ${chosen.url}. Try again or SKIP.${C.reset}`);
             continue;
         }
         apiKey = raw;
@@ -234,11 +264,11 @@ export async function runOnboardingFlow(): Promise<void> {
         BOT_NAME: safeBotName,
     });
 
-    console.log("\n================================================");
-    console.log("✅ Setup Complete!");
-    console.log(`   Vault:          ${Vault.path()}`);
-    console.log(`   Pi auth:        ${path.join(piStateDir(), "auth.json")}`);
-    console.log(`   Pi settings:    ${path.join(piStateDir(), "settings.json")}`);
-    console.log(`   Runtime config: ${ENV_PATH}`);
-    console.log("================================================\n");
+    console.log(`\n${C.green}╔══════════════════════════════════════════╗${C.reset}`);
+    console.log(`${C.green}║${C.reset} ${C.bold}✔ Setup complete.${C.reset}                        ${C.green}║${C.reset}`);
+    console.log(`${C.green}╚══════════════════════════════════════════╝${C.reset}`);
+    console.log(`  ${C.dim}Vault:${C.reset}          ${Vault.path()}`);
+    console.log(`  ${C.dim}Pi auth:${C.reset}        ${path.join(piStateDir(), "auth.json")}`);
+    console.log(`  ${C.dim}Pi settings:${C.reset}    ${path.join(piStateDir(), "settings.json")}`);
+    console.log(`  ${C.dim}Runtime config:${C.reset} ${ENV_PATH}\n`);
 }

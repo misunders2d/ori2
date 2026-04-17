@@ -42,6 +42,36 @@ SKIP_SYSTEMD=0
 KEEP_UPSTREAM=0
 DID_CLONE=0
 
+# -- colors -------------------------------------------------------------
+# Only emit ANSI escapes on a real TTY with color not explicitly disabled
+# (https://no-color.org). Falling back to empty strings keeps every
+# printf/echo downstream unchanged.
+if [[ -t 1 ]] && [[ -z "${NO_COLOR:-}" ]]; then
+    C_RESET=$'\033[0m'
+    C_BOLD=$'\033[1m'
+    C_DIM=$'\033[2m'
+    C_RED=$'\033[31m'
+    C_GREEN=$'\033[32m'
+    C_YELLOW=$'\033[33m'
+    C_BLUE=$'\033[34m'
+    C_CYAN=$'\033[36m'
+else
+    C_RESET=""; C_BOLD=""; C_DIM=""; C_RED=""; C_GREEN=""
+    C_YELLOW=""; C_BLUE=""; C_CYAN=""
+fi
+
+banner() {
+    printf '\n'
+    printf '%s   ___  ____  ___ ___  %s\n' "$C_CYAN" "$C_RESET"
+    printf '%s  / _ \\|  _ \\|_ _|__ \\ %s\n' "$C_CYAN" "$C_RESET"
+    printf '%s | | | | |_) || |  / / %s\n' "$C_CYAN" "$C_RESET"
+    printf '%s | |_| |  _ < | | / /_ %s\n' "$C_CYAN" "$C_RESET"
+    printf '%s  \\___/|_| \\_\\___|____|%s\n' "$C_CYAN" "$C_RESET"
+    printf '\n'
+    printf '%s  your local AI assistant%s\n' "$C_DIM" "$C_RESET"
+    printf '\n'
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --name) BOT_NAME="$2"; shift 2 ;;
@@ -54,18 +84,28 @@ while [[ $# -gt 0 ]]; do
             sed -n 's/^# \?//p' "$0" | head -25
             exit 0 ;;
         *)
-            echo "Unknown flag: $1" >&2
+            printf '%sUnknown flag: %s%s\n' "$C_RED" "$1" "$C_RESET" >&2
             exit 1 ;;
     esac
 done
 
+banner
+
 step() {
     echo
-    echo "=== $* ==="
+    printf '%s▸ %s%s\n' "$C_BOLD$C_CYAN" "$*" "$C_RESET"
+}
+
+ok() {
+    printf '%s✔%s %s\n' "$C_GREEN" "$C_RESET" "$*"
+}
+
+warn() {
+    printf '%s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2
 }
 
 err() {
-    echo "ERROR: $*" >&2
+    printf '%s✖ %s%s\n' "$C_RED$C_BOLD" "$*" "$C_RESET" >&2
     exit 1
 }
 
@@ -76,7 +116,7 @@ confirm() {
         return 0
     fi
     local prompt="${1:-Proceed?}"
-    read -r -p "$prompt [Y/n] " yn </dev/tty || return 1
+    read -r -p "$(printf '%s?%s %s [Y/n] ' "$C_YELLOW" "$C_RESET" "$prompt")" yn </dev/tty || return 1
     [[ -z "$yn" ]] || [[ "$yn" =~ ^[Yy]$ ]]
 }
 
@@ -337,24 +377,23 @@ if [[ -n "$BOT_NAME" ]]; then
     echo "BOT_NAME=$BOT_NAME" >> .env
 fi
 if [[ -f ".env" ]] && [[ -f "data/${BOT_NAME:-Test_bot}/vault.json" ]]; then
-    echo "Already configured (vault + .env present). Skipping wizard."
+    ok "Already configured (vault + .env present). Skipping wizard."
 else
+    # Setup-only mode: run the wizard and exit cleanly. We explicitly do
+    # NOT launch the full TUI here — previously we did (`npm run start`
+    # behind `( printf; cat ) | ...`), but the pipe isn't a TTY and left
+    # pi-tui's raw-mode + kitty keyboard-protocol handshake in a broken
+    # state. Ctrl-C out of that and re-starting manually avoids the pipe
+    # entirely, which is why `cd <dir> && npm run start` works fine.
+    # With ORI2_SETUP_ONLY=true index.ts runs the wizard and exits — the
+    # TUI is launched fresh by the user per the "what to do next" block.
     if [[ -n "$BOT_NAME" ]]; then
-        echo "Bot name from CLI: $BOT_NAME"
-        # The wizard reads from stdin; pre-fill the BOT_NAME line via expect-style
-        # printf. Other prompts will block for interactive input.
-        echo
-        echo "The wizard will prompt for: admin IDs (optional, ENTER to skip),"
-        echo "and a primary AI provider key. Have your Anthropic / Google /"
-        echo "OpenAI API key ready."
-        echo
-        # Pre-feed bot name; rest is interactive. printf with newline lets
-        # readline accept the value, then the wizard awaits the next prompt.
-        ( printf '%s\n' "$BOT_NAME"; cat ) | npm run start
-    else
-        echo "Launching interactive wizard..."
-        npm run start
+        echo "Configured bot name: ${C_BOLD}${BOT_NAME}${C_RESET}"
     fi
+    echo
+    echo "${C_DIM}Launching the wizard — have your AI provider API key handy.${C_RESET}"
+    echo
+    ORI2_SETUP_ONLY=true npm run start
 fi
 
 # Service-manager unit (optional). systemd on Linux, launchd on macOS.
@@ -452,51 +491,48 @@ elif [[ "$SKIP_SYSTEMD" -ne 1 ]] && [[ "$(uname -s)" == "Darwin" ]] && command -
     fi
 fi
 
-step "🎉  Install complete!"
 BOT_LABEL="${BOT_NAME:-your bot}"
-cat <<EOF
-
-Your assistant is installed at:
-  $INSTALL_DIR
-
-────────────────────────────────────────────────────────────
-WHAT TO DO NEXT — pick one:
-────────────────────────────────────────────────────────────
-
-▸ TALK TO IT IN YOUR TERMINAL (simplest)
-    cd "$INSTALL_DIR"
-    npm run start
-  Type messages, press ENTER. Type /exit to quit.
-
-▸ CONNECT IT TO TELEGRAM (so you can chat from your phone)
-    1. Open Telegram, search for "BotFather" (the official @BotFather).
-    2. Send /newbot. It asks for a name, then a @username. Save the token
-       it gives you (looks like 123456:AAH...).
-    3. Start your bot in terminal:  cd "$INSTALL_DIR" && npm run start
-    4. In the terminal bot, type:
-         /connect-telegram <paste-your-BotFather-token>
-    5. Open your new bot in Telegram, send any message.
-    6. It'll show a passcode in the terminal. DM your bot:
-         /init <that-passcode>
-       You are now admin — from anywhere.
-
-▸ RUN IT 24/7 IN THE BACKGROUND
-    Already done if you answered "y" to the service unit prompt above.
-    Otherwise see INSTALL.md → "Headless deployment".
-
-────────────────────────────────────────────────────────────
-GETTING HELP
-────────────────────────────────────────────────────────────
-  INSTALL.md       — full deployment guide
-  README.md        — what ori2 is and what it can do
-  /help  (in bot)  — list commands once the bot is running
-  https://github.com/misunders2d/ori2/issues — report problems
-
-Notes:
-  • Bot name: $BOT_LABEL (change in .env if needed)
-  • Data lives in $INSTALL_DIR/data/$BOT_LABEL/
-  • Your vault is in data/$BOT_LABEL/vault.json (file mode 0600 — keep it private)
-  • Daemon mode auto-detects no-TTY (systemd, ssh detached, docker)
-    Force interactive anywhere with:  ORI2_DAEMON=false npm run start
-
-EOF
+printf '\n'
+printf '%s╔══════════════════════════════════════════════════════════╗%s\n' "$C_GREEN" "$C_RESET"
+printf '%s║%s  %s🎉  Install complete — %s is ready!%s%s  %s║%s\n' "$C_GREEN" "$C_RESET" "$C_BOLD" "$BOT_LABEL" "$C_RESET" "$(printf '%*s' $((31 - ${#BOT_LABEL})) '')" "$C_GREEN" "$C_RESET"
+printf '%s╚══════════════════════════════════════════════════════════╝%s\n' "$C_GREEN" "$C_RESET"
+printf '\n'
+printf '%sInstalled at%s\n' "$C_DIM" "$C_RESET"
+printf '  %s%s%s\n' "$C_BOLD" "$INSTALL_DIR" "$C_RESET"
+printf '\n'
+printf '%s──────────── WHAT TO DO NEXT — pick one ────────────%s\n' "$C_BOLD$C_CYAN" "$C_RESET"
+printf '\n'
+printf '%s▸ TALK TO IT IN YOUR TERMINAL%s %s(simplest)%s\n' "$C_BOLD$C_YELLOW" "$C_RESET" "$C_DIM" "$C_RESET"
+printf '    %scd "%s"%s\n' "$C_CYAN" "$INSTALL_DIR" "$C_RESET"
+printf '    %snpm run start%s\n' "$C_CYAN" "$C_RESET"
+printf '  Type messages, press ENTER. Type %s/exit%s to quit.\n' "$C_BOLD" "$C_RESET"
+printf '\n'
+printf '%s▸ CONNECT IT TO TELEGRAM%s %s(chat from your phone)%s\n' "$C_BOLD$C_YELLOW" "$C_RESET" "$C_DIM" "$C_RESET"
+printf '    1. Open Telegram, search for %sBotFather%s (the official @BotFather).\n' "$C_BOLD" "$C_RESET"
+printf '    2. Send %s/newbot%s. It asks for a name, then a @username. Save\n' "$C_BOLD" "$C_RESET"
+printf '       the token it gives you (looks like %s123456:AAH...%s).\n' "$C_DIM" "$C_RESET"
+printf '    3. Start your bot:  %scd "%s" && npm run start%s\n' "$C_CYAN" "$INSTALL_DIR" "$C_RESET"
+printf '    4. In the bot TUI, type:\n'
+printf '         %s/connect-telegram <paste-your-BotFather-token>%s\n' "$C_CYAN" "$C_RESET"
+printf '    5. Open your bot in Telegram, send any message.\n'
+printf '    6. Terminal prints a one-time passcode. DM your bot:\n'
+printf '         %s/init <that-passcode>%s\n' "$C_CYAN" "$C_RESET"
+printf '       You are now admin — from anywhere.\n'
+printf '\n'
+printf '%s▸ RUN IT 24/7 IN THE BACKGROUND%s\n' "$C_BOLD$C_YELLOW" "$C_RESET"
+printf '    Already done if you said %sy%s to the service unit prompt above.\n' "$C_BOLD" "$C_RESET"
+printf '    Otherwise see %sINSTALL.md%s → "Headless deployment".\n' "$C_BOLD" "$C_RESET"
+printf '\n'
+printf '%s──────────── GETTING HELP ────────────%s\n' "$C_BOLD$C_CYAN" "$C_RESET"
+printf '  %sINSTALL.md%s       — full deployment guide\n' "$C_BOLD" "$C_RESET"
+printf '  %sREADME.md%s        — what ori2 is and what it can do\n' "$C_BOLD" "$C_RESET"
+printf '  %s/help%s (in bot)   — list commands once the bot is running\n' "$C_BOLD" "$C_RESET"
+printf '  %shttps://github.com/misunders2d/ori2/issues%s — report problems\n' "$C_BLUE" "$C_RESET"
+printf '\n'
+printf '%sNotes%s\n' "$C_DIM" "$C_RESET"
+printf '  %s•%s Bot name: %s%s%s (change in .env if needed)\n' "$C_DIM" "$C_RESET" "$C_BOLD" "$BOT_LABEL" "$C_RESET"
+printf '  %s•%s Data lives in %s%s/data/%s/%s\n' "$C_DIM" "$C_RESET" "$C_DIM" "$INSTALL_DIR" "$BOT_LABEL" "$C_RESET"
+printf '  %s•%s Vault: %sdata/%s/vault.json%s (mode 0600 — keep private)\n' "$C_DIM" "$C_RESET" "$C_DIM" "$BOT_LABEL" "$C_RESET"
+printf '  %s•%s Daemon mode auto-detects no-TTY (systemd, ssh, docker).\n' "$C_DIM" "$C_RESET"
+printf '    Force interactive with: %sORI2_DAEMON=false npm run start%s\n' "$C_CYAN" "$C_RESET"
+printf '\n'

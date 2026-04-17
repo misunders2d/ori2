@@ -116,12 +116,25 @@ async function bootstrap() {
     console.log("🚀 Bootstrapping Ori2 Foundational Platform...");
 
     // 1. User Onboarding & Vault Setup
+    const setupOnly = (process.env["ORI2_SETUP_ONLY"] ?? "").toLowerCase();
+    const isSetupOnly = setupOnly === "true" || setupOnly === "1";
     if (!isSystemConfigured()) {
         console.log("⚠️ System unconfigured. Launching First-Time Onboarding...");
         await runOnboardingFlow();
         // Wizard wrote .env (BOT_NAME, etc.) AND vault (secrets). Reload .env
         // so BOT_NAME is in process.env for botDir() etc.
         dotenv.config({ override: true });
+    } else if (isSetupOnly) {
+        console.log("✓ Already configured — nothing to do.");
+    }
+    // Setup-only mode (used by bootstrap.sh): run the wizard and exit
+    // cleanly without spinning up the full TUI. This prevents the install
+    // flow from leaving pi-tui's raw-mode + kitty-kbd handshake partially
+    // initialised on a non-TTY stdin (which caused duplicate-input /
+    // Ctrl-C garbage on the next `npm start`).
+    if (isSetupOnly) {
+        console.log("Setup complete. Run `npm run start` to launch the bot.");
+        process.exit(0);
     }
 
     // 2. Platform Services Setup
