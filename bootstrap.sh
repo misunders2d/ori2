@@ -203,15 +203,35 @@ if [[ -f "package.json" ]] && [[ -d ".pi/extensions" ]] && [[ -f "src/index.ts" 
     INSTALL_DIR="$(pwd)"
     step "Already in an ori2 checkout at $INSTALL_DIR"
 else
-    if [[ -z "$INSTALL_DIR" ]]; then
-        # Use the bot name as the directory when given, so the oneliner
-        # works from any cwd without colliding with an existing `ori2/`
-        # folder (e.g. a dev checkout in the same parent dir).
-        if [[ -n "$BOT_NAME" ]]; then
-            INSTALL_DIR="$(pwd)/$BOT_NAME"
-        else
-            INSTALL_DIR="$(pwd)/ori2"
+    # If neither --dir nor --name was given, prompt for the bot name now so
+    # the folder we clone into matches what the user will call the bot —
+    # no confusing "install is called ori2/ but my bot is called MyBot"
+    # mismatch. The wizard gets the same name pre-fed so the user isn't
+    # asked twice.
+    if [[ -z "$INSTALL_DIR" ]] && [[ -z "$BOT_NAME" ]]; then
+        step "Name your assistant"
+        echo "This name doubles as the install-folder name — the bot's code"
+        echo "and data will live in \$PWD/<name>/."
+        echo
+        echo "Letters, numbers, underscores only. Examples: MarketingBot,"
+        echo "amazon_helper, ClaireBot. Press ENTER for the default (ori2)."
+        echo
+        read -r -p "Name: " BOT_NAME </dev/tty || BOT_NAME=""
+        BOT_NAME="${BOT_NAME:-ori2}"
+        # Sanitize to the wizard's character class so bash-side and node-side
+        # always agree on the final name.
+        CLEANED="$(printf '%s' "$BOT_NAME" | tr -c 'a-zA-Z0-9_-' '_')"
+        if [[ "$CLEANED" != "$BOT_NAME" ]]; then
+            echo "(cleaned to: $CLEANED)"
+            BOT_NAME="$CLEANED"
         fi
+        echo
+    fi
+    if [[ -z "$INSTALL_DIR" ]]; then
+        # --name always controls the folder name now: `--name Foo` → ./Foo/,
+        # default (ENTER at the prompt above) → ./ori2/. Never the old
+        # "folder = ori2, bot = whatever" mismatch.
+        INSTALL_DIR="$(pwd)/${BOT_NAME:-ori2}"
     fi
     # Safety: if the target exists and isn't empty and isn't an ori2 checkout,
     # refuse to clobber. Non-tech users accidentally targeting their dev repo
