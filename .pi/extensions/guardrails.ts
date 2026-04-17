@@ -40,8 +40,29 @@ import { cosineSim, embedBatch, embedQuery } from "../../src/core/embeddings.js"
 //   if you edit the corpus or switch backends.
 // =============================================================================
 
-const DIRECT_THRESHOLD = 0.78;   // Lowered for BGE-small (~384d) which has tighter sim distributions than gemini-embedding (~768d).
-const INDIRECT_THRESHOLD = 0.75;
+// Tuning notes:
+//   - DIRECT is the whole-prompt embedding scan. It has NO regex prefilter,
+//     so inherent false-positive risk at low thresholds — benign prompts
+//     with injection-adjacent vocabulary ("don't forget to...", "ignore
+//     the typo...") drift near anchors. Previously 0.78, raised to 0.85
+//     after a live incident (sim=0.783 blocked a normal ask on 2026-04-17).
+//   - INDIRECT is the regex+window scan. Regex already gated the attack
+//     shape; a tighter 0.75 threshold is safe because false-positive regex
+//     matches are rare on legitimate content.
+//   - Both are env-tunable. If an injection slips through, bump DIRECT up;
+//     if legitimate prompts block, bump down. Defaults chosen for BGE-small
+//     (~384d embedding, local fastembed default); Google/OpenAI embedders
+//     (~768d+) have wider sim distributions and may warrant lower defaults.
+function readThreshold(envKey: string, fallback: number): number {
+    const raw = process.env[envKey];
+    if (raw === undefined || raw === "") return fallback;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n <= 0 || n >= 1) return fallback;
+    return n;
+}
+
+const DIRECT_THRESHOLD = readThreshold("ORI2_GUARDRAIL_DIRECT_THRESHOLD", 0.85);
+const INDIRECT_THRESHOLD = readThreshold("ORI2_GUARDRAIL_INDIRECT_THRESHOLD", 0.75);
 const INDIRECT_WINDOW = 300;
 
 // JS-syntax regex. Anchors phrasing commonly used to inject through user
