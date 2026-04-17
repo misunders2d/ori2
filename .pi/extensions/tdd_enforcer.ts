@@ -1,9 +1,10 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
-import { exec } from "child_process";
+import { exec, execFile } from "child_process";
 import { promisify } from "util";
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 export default function (pi: ExtensionAPI) {
     pi.registerTool({
@@ -27,7 +28,9 @@ export default function (pi: ExtensionAPI) {
                 
                 // Step 3: Stage and commit
                 await execAsync(`git add .`);
-                await execAsync(`git commit -m "${params.commit_message.replace(/"/g, '\\"')}"`);
+                // argv form (no shell) — commit_message is LLM-sourced and can contain
+                // backticks, $(), newlines, etc. that a shell would interpret.
+                await execFileAsync("git", ["commit", "-m", params.commit_message]);
 
                 // Step 4: Try to push to remote (fails silently if no remote is configured yet)
                 await execAsync(`git push origin main`).catch(() => {});

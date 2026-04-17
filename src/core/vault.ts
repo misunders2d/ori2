@@ -19,8 +19,8 @@ import { botSubdir, ensureDir } from "./paths.js";
 //   - Future: TOTP seeds, encrypted-at-rest field for very-high-sensitivity.
 //
 // What does NOT go here:
-//   - Runtime config: BOT_NAME, REQUIRE_2FA flag, GUARDRAIL_EMBEDDINGS backend
-//     selector. Those stay in `.env` because they're needed before vault loads
+//   - Runtime config: BOT_NAME, GUARDRAIL_EMBEDDINGS backend selector.
+//     Those stay in `.env` because they're needed before vault loads
 //     and aren't sensitive.
 //
 // SECURITY NOTES:

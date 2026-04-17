@@ -30,12 +30,12 @@ Roughly −300 LoC across phases 2-5, +200 LoC for phases 6-7 (new primitives + 
 
 ### Still open (post-plan)
 
-Minor bugs §7 identified during the audit, not blocking:
+Minor bugs §7 identified during the audit:
 
-- §7.2 — dead `REQUIRE_2FA=true` in `.env` (no consumer). Plan: drop from wizard on next touch.
-- §7.5 — `tdd_enforcer.ts:29-30` `execAsync` with naive shell-escape on commit message. Plan: switch to `spawn("git", ["commit", "-m", msg])`.
+- ~~§7.2 — dead `REQUIRE_2FA=true` in `.env` (no consumer).~~ ✅ Dropped from wizard; stale comments in `index.ts`/`vault.ts` cleaned up.
+- ~~§7.5 — `tdd_enforcer.ts:29-30` `execAsync` with naive shell-escape on commit message.~~ ✅ Switched to `execFileAsync("git", ["commit", "-m", msg])` — argv form, no shell, same error shape.
 
-Both trivial one-liners. Not scheduled.
+Both landed 2026-04-17.
 
 ### Where to resume (instructions for a fresh session)
 

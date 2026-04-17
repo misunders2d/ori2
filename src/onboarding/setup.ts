@@ -22,9 +22,11 @@ import { botSubdir, ensureDir } from "../core/paths.js";
 //       configuration: defaultProvider, defaultModel, compaction, theme, etc.
 //       (see pi-coding-agent/docs/settings.md).
 //   - .env (project root) — non-secret runtime config only:
-//       BOT_NAME (needed to locate vault), REQUIRE_2FA, GUARDRAIL_EMBEDDINGS.
+//       BOT_NAME (needed to locate vault), GUARDRAIL_EMBEDDINGS.
 //       NOTE: PRIMARY_PROVIDER was previously written here but no Pi
 //       component reads it; Pi reads defaultProvider from settings.json.
+//       NOTE: REQUIRE_2FA was previously written here but no code path
+//       reads it; 2FA is configured per-tool in core/policy.ts instead.
 //
 // Why split: BOT_NAME is needed BEFORE the vault loads (it determines the
 // vault's path: data/<BOT_NAME>/vault.json). Pi-native files need the
@@ -212,13 +214,12 @@ export async function runOnboardingFlow(): Promise<void> {
     // model resolution. See pi-coding-agent/docs/settings.md §Model & Thinking.
     writePiSettingsJson({ defaultProvider: piProvider });
 
-    // Non-secret runtime config. REQUIRE_2FA is a flag; BOT_NAME is needed
-    // to locate the vault on next boot (before .env is loaded).
-    // PRIMARY_PROVIDER is deliberately NOT written here — no Pi component
-    // reads it; settings.json.defaultProvider is the source of truth.
+    // Non-secret runtime config. BOT_NAME is needed to locate the vault on
+    // next boot (before .env is loaded). PRIMARY_PROVIDER is deliberately
+    // NOT written — no Pi component reads it; settings.json.defaultProvider
+    // is the source of truth.
     writeEnv({
         BOT_NAME: safeBotName,
-        REQUIRE_2FA: "true",
     });
 
     console.log("\n================================================");
