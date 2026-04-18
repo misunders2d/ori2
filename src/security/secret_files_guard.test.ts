@@ -2,7 +2,7 @@ process.env["BOT_NAME"] = "_test_secret_guard";
 
 import { describe, it } from "node:test";
 import { strict as assert } from "node:assert";
-import { guard } from "./secret_files_guard.js";
+import { guard } from "../../.pi/extensions/secret_files_guard.js";
 
 // Pure-function tests — guard() doesn't touch the filesystem; it just
 // inspects toolName + input and returns a deny decision (or undefined).

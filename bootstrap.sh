@@ -532,56 +532,63 @@ elif [[ "$SKIP_SYSTEMD" -ne 1 ]] && [[ "$(uname -s)" == "Darwin" ]] && command -
 fi
 
 BOT_LABEL="${BOT_NAME:-your bot}"
+
+# Read passcode written by setup.ts during the wizard. Surfacing it in the
+# panel removes the "I never saw the passcode" UX bug — the wizard prints it
+# and writes it to .secret/INIT_PASSCODE.txt; we re-display it here.
+PASSCODE=""
+PASSCODE_FILE="$INSTALL_DIR/data/$BOT_LABEL/.secret/INIT_PASSCODE.txt"
+if [[ -f "$PASSCODE_FILE" ]]; then
+    PASSCODE="$(grep -E '^Passcode:' "$PASSCODE_FILE" 2>/dev/null | head -1 | awk '{print $2}')"
+fi
+
+printf '\n\n'
+printf '%s═══════════════════════════════════════════════════════════════%s\n' "$C_GREEN" "$C_RESET"
+printf '  %s🎉  %s — install complete%s\n' "$C_BOLD$C_GREEN" "$BOT_LABEL" "$C_RESET"
+printf '%s═══════════════════════════════════════════════════════════════%s\n' "$C_GREEN" "$C_RESET"
 printf '\n'
-printf '%s╔══════════════════════════════════════════════════════════╗%s\n' "$C_GREEN" "$C_RESET"
-printf '%s║%s  %s🎉  Install complete — %s is ready!%s%s  %s║%s\n' "$C_GREEN" "$C_RESET" "$C_BOLD" "$BOT_LABEL" "$C_RESET" "$(printf '%*s' $((31 - ${#BOT_LABEL})) '')" "$C_GREEN" "$C_RESET"
-printf '%s╚══════════════════════════════════════════════════════════╝%s\n' "$C_GREEN" "$C_RESET"
-printf '\n'
-printf '%sInstalled at%s\n' "$C_DIM" "$C_RESET"
-printf '  %s%s%s\n' "$C_BOLD" "$INSTALL_DIR" "$C_RESET"
-printf '\n'
-printf '%s──────────── WHAT TO DO NEXT — pick one ────────────%s\n' "$C_BOLD$C_CYAN" "$C_RESET"
-printf '\n'
-if [[ "$INSTALLED_NVM" -eq 1 ]]; then
-    printf '%s! Node 22+ was just installed via nvm in this terminal session.%s\n' "$C_YELLOW" "$C_RESET"
-    printf '  Your CURRENT terminal still resolves %snode%s/%snpm%s to the OLD version\n' "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
-    printf '  (or none at all) — nvm only auto-loads in NEW shells.  Use\n'
-    printf '  %s./start.sh%s below: it sources nvm itself and picks the right Node.\n' "$C_BOLD" "$C_RESET"
-    printf '  %s(Or open a new terminal first, then `npm run start` works too.)%s\n' "$C_DIM" "$C_RESET"
+
+# ----- 1. PASSCODE — the single most important thing on this screen -----
+if [[ -n "$PASSCODE" ]]; then
+    printf '%s┌───────────────────────────────────────────────────────────┐%s\n' "$C_YELLOW$C_BOLD" "$C_RESET"
+    printf '%s│%s  %s🔑  ADMIN PASSCODE — SAVE THIS NOW%s%s│%s\n' "$C_YELLOW$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET" "                        $C_YELLOW$C_BOLD" "$C_RESET"
+    printf '%s│%s%s│%s\n' "$C_YELLOW$C_BOLD" "                                                           " "$C_YELLOW$C_BOLD" "$C_RESET"
+    printf '%s│%s     %s%s%s     %s│%s\n' "$C_YELLOW$C_BOLD" "$C_RESET" "$C_BOLD$C_GREEN" "$PASSCODE" "$C_RESET" "$C_YELLOW$C_BOLD" "$C_RESET"
+    printf '%s│%s%s│%s\n' "$C_YELLOW$C_BOLD" "                                                           " "$C_YELLOW$C_BOLD" "$C_RESET"
+    printf '%s│%s  Backup file (auto-deleted after first /init):            %s│%s\n' "$C_YELLOW$C_BOLD" "$C_RESET" "$C_YELLOW$C_BOLD" "$C_RESET"
+    printf '%s│%s  %s%s%s\n' "$C_YELLOW$C_BOLD" "$C_RESET" "$C_DIM" "$PASSCODE_FILE" "$C_RESET"
+    printf '%s└───────────────────────────────────────────────────────────┘%s\n' "$C_YELLOW$C_BOLD" "$C_RESET"
     printf '\n'
 fi
-printf '%s▸ TALK TO IT IN YOUR TERMINAL%s %s(simplest)%s\n' "$C_BOLD$C_YELLOW" "$C_RESET" "$C_DIM" "$C_RESET"
-printf '    %scd "%s"%s\n' "$C_CYAN" "$INSTALL_DIR" "$C_RESET"
-printf '    %s./start.sh%s\n' "$C_CYAN" "$C_RESET"
-printf '  Type messages, press ENTER. Type %s/exit%s to quit.\n' "$C_BOLD" "$C_RESET"
-printf '  %s(`npm run start` works too, once your shell can see Node.)%s\n' "$C_DIM" "$C_RESET"
+
+# ----- 2. ONE primary action — start the bot -----
+printf '%s┌─ STEP 1 ── start the bot ─────────────────────────────────┐%s\n' "$C_CYAN$C_BOLD" "$C_RESET"
 printf '\n'
-printf '%s▸ CONNECT IT TO TELEGRAM%s %s(chat from your phone)%s\n' "$C_BOLD$C_YELLOW" "$C_RESET" "$C_DIM" "$C_RESET"
-printf '    1. Open Telegram, search for %sBotFather%s (the official @BotFather).\n' "$C_BOLD" "$C_RESET"
-printf '    2. Send %s/newbot%s. It asks for a name, then a @username. Save\n' "$C_BOLD" "$C_RESET"
-printf '       the token it gives you (looks like %s123456:AAH...%s).\n' "$C_DIM" "$C_RESET"
-printf '    3. Start your bot:  %scd "%s" && ./start.sh%s\n' "$C_CYAN" "$INSTALL_DIR" "$C_RESET"
-printf '    4. In the bot TUI, type:\n'
-printf '         %s/connect-telegram <paste-your-BotFather-token>%s\n' "$C_CYAN" "$C_RESET"
-printf '    5. Open your bot in Telegram, send any message.\n'
-printf '    6. Terminal prints a one-time passcode. DM your bot:\n'
-printf '         %s/init <that-passcode>%s\n' "$C_CYAN" "$C_RESET"
-printf '       You are now admin — from anywhere.\n'
+printf '   %scd %s%s\n' "$C_CYAN" "$INSTALL_DIR" "$C_RESET"
+printf '   %s./start.sh%s\n' "$C_CYAN$C_BOLD" "$C_RESET"
 printf '\n'
-printf '%s▸ RUN IT 24/7 IN THE BACKGROUND%s\n' "$C_BOLD$C_YELLOW" "$C_RESET"
-printf '    Already done if you said %sy%s to the service unit prompt above.\n' "$C_BOLD" "$C_RESET"
-printf '    Otherwise see %sINSTALL.md%s → "Headless deployment".\n' "$C_BOLD" "$C_RESET"
+if [[ "$INSTALLED_NVM" -eq 1 ]]; then
+    printf '   %sNote:%s Node was just installed via nvm — bare %snpm%s commands\n' "$C_YELLOW" "$C_RESET" "$C_BOLD" "$C_RESET"
+    printf '   in this terminal won''t see it until you open a new shell.\n'
+    printf '   %s./start.sh%s sources nvm itself, so it works either way.\n' "$C_BOLD" "$C_RESET"
+    printf '\n'
+fi
+
+# ----- 3. ONE secondary action — claim admin from chat -----
+printf '%s┌─ STEP 2 ── claim admin from your phone (optional) ────────┐%s\n' "$C_CYAN$C_BOLD" "$C_RESET"
 printf '\n'
-printf '%s──────────── GETTING HELP ────────────%s\n' "$C_BOLD$C_CYAN" "$C_RESET"
-printf '  %sINSTALL.md%s       — full deployment guide\n' "$C_BOLD" "$C_RESET"
-printf '  %sREADME.md%s        — what ori2 is and what it can do\n' "$C_BOLD" "$C_RESET"
-printf '  %s/help%s (in bot)   — list commands once the bot is running\n' "$C_BOLD" "$C_RESET"
-printf '  %shttps://github.com/misunders2d/ori2/issues%s — report problems\n' "$C_BLUE" "$C_RESET"
+printf '   1. @BotFather on Telegram → %s/newbot%s → save the token\n' "$C_BOLD" "$C_RESET"
+printf '   2. In your bot TUI: %s/connect-telegram <token>%s\n' "$C_CYAN" "$C_RESET"
+printf '   3. DM your bot from your phone: %s/init %s%s\n' "$C_CYAN" "${PASSCODE:-<passcode-above>}" "$C_RESET"
 printf '\n'
-printf '%sNotes%s\n' "$C_DIM" "$C_RESET"
-printf '  %s•%s Bot name: %s%s%s (change in .env if needed)\n' "$C_DIM" "$C_RESET" "$C_BOLD" "$BOT_LABEL" "$C_RESET"
-printf '  %s•%s Data lives in %s%s/data/%s/%s\n' "$C_DIM" "$C_RESET" "$C_DIM" "$INSTALL_DIR" "$BOT_LABEL" "$C_RESET"
-printf '  %s•%s Vault: %sdata/%s/vault.json%s (mode 0600 — keep private)\n' "$C_DIM" "$C_RESET" "$C_DIM" "$BOT_LABEL" "$C_RESET"
-printf '  %s•%s Daemon mode auto-detects no-TTY (systemd, ssh, docker).\n' "$C_DIM" "$C_RESET"
-printf '    Force interactive with: %sORI2_DAEMON=false ./start.sh%s\n' "$C_CYAN" "$C_RESET"
+
+# ----- 4. Tertiary: links + notes, condensed -----
+printf '%s──── help / docs ────%s\n' "$C_DIM" "$C_RESET"
+printf '   %sREADME.md%s   what ori2 does\n' "$C_BOLD" "$C_RESET"
+printf '   %sINSTALL.md%s  full deployment + headless mode (systemd/launchd)\n' "$C_BOLD" "$C_RESET"
+printf '   %s/help%s       commands list (run inside the bot TUI)\n' "$C_BOLD" "$C_RESET"
+printf '   %shttps://github.com/misunders2d/ori2/issues%s\n' "$C_BLUE" "$C_RESET"
+printf '\n'
+printf '%sFiles%s   data dir: %s%s/data/%s/%s\n' "$C_DIM" "$C_RESET" "$C_DIM" "$INSTALL_DIR" "$BOT_LABEL" "$C_RESET"
+printf '         vault:    %sdata/%s/.secret/vault.json%s (mode 0600 — keep private)\n' "$C_DIM" "$BOT_LABEL" "$C_RESET"
 printf '\n'

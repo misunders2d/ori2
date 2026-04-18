@@ -1,5 +1,8 @@
 import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import { getVault } from "./vault.js";
+import { secretSubdir } from "./paths.js";
 
 // =============================================================================
 // Init passcode — one-time bootstrap token for claiming admin over chat.
@@ -63,6 +66,13 @@ export function consumeInitPasscode(candidate: string): boolean {
     // Atomic swap: delete passcode, set consumed marker.
     vault.delete(VAULT_PASSCODE);
     vault.set(VAULT_CONSUMED, new Date().toISOString());
+    // Clean up the operator-facing recovery file written by setup.ts. Best-
+    // effort — if it's already gone (operator deleted, fresh install never
+    // wrote one, etc.) we don't care.
+    try {
+        const recovery = path.join(secretSubdir(), "INIT_PASSCODE.txt");
+        if (fs.existsSync(recovery)) fs.unlinkSync(recovery);
+    } catch { /* ignore */ }
     return true;
 }
 

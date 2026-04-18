@@ -2,7 +2,8 @@ import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { getVault, Vault } from "../core/vault.js";
-import { botSubdir, ensureDir } from "../core/paths.js";
+import { botSubdir, ensureDir, secretSubdir, ensureSecretDir } from "../core/paths.js";
+import { ensureInitPasscode } from "../core/passcode.js";
 
 // ---- tiny ANSI helpers (no-color safe) ----------------------------------
 const USE_COLOR = process.stdout.isTTY && !process.env["NO_COLOR"];
@@ -243,6 +244,39 @@ export async function runOnboardingFlow(): Promise<void> {
     if (apiKey) secrets[vaultKey] = apiKey;
     vault.bulkSet(secrets);
 
+    // Generate the init passcode HERE (not on first bot boot) so we can:
+    //   1. surface it prominently in the post-install panel (bootstrap.sh
+    //      reads the recovery file below to embed it)
+    //   2. write a recovery file the operator can `cat` later if they miss
+    //      the boot log
+    // Both points address the recurring "I never saw the passcode" UX bug.
+    const passcode = ensureInitPasscode();
+    if (passcode) {
+        const recoveryFile = path.join(secretSubdir(), "INIT_PASSCODE.txt");
+        ensureSecretDir(secretSubdir());
+        const fd = fs.openSync(recoveryFile, "w", 0o600);
+        try {
+            fs.writeSync(fd, [
+                "ORI2 INIT PASSCODE — one-time admin-claim token",
+                "",
+                `Passcode:  ${passcode}`,
+                "",
+                "Use:",
+                "  • From CLI: /init " + passcode,
+                "  • From Telegram (after /connect-telegram): DM bot \"/init " + passcode + "\"",
+                "",
+                "This file is auto-deleted when /init succeeds. If the file is gone,",
+                "the passcode has already been consumed and admin has been claimed.",
+                "",
+                "If lost AND not yet consumed: run /init-status at the bot TUI to re-display.",
+                "",
+            ].join("\n"));
+            fs.fsyncSync(fd);
+        } finally {
+            fs.closeSync(fd);
+        }
+    }
+
     // Write Pi's native auth.json — this is what Pi's ModelRegistry reads
     // first (priority: --api-key flag > auth.json > env vars). Without this
     // the wizard leaves Pi with no credentials and the TUI fails with
@@ -271,4 +305,31 @@ export async function runOnboardingFlow(): Promise<void> {
     console.log(`  ${C.dim}Pi auth:${C.reset}        ${path.join(piStateDir(), "auth.json")}`);
     console.log(`  ${C.dim}Pi settings:${C.reset}    ${path.join(piStateDir(), "settings.json")}`);
     console.log(`  ${C.dim}Runtime config:${C.reset} ${ENV_PATH}\n`);
+
+    // Loud passcode banner — separated from the rest with whitespace so it's
+    // impossible to lose in scrollback. bootstrap.sh ALSO reads the recovery
+    // file and embeds the passcode in the post-install panel for a second
+    // chance to see it.
+    if (passcode) {
+        const recoveryFile = path.join(secretSubdir(), "INIT_PASSCODE.txt");
+        const w = 60;
+        const top = `${C.yellow}╔${"═".repeat(w)}╗${C.reset}`;
+        const bot = `${C.yellow}╚${"═".repeat(w)}╝${C.reset}`;
+        const pad = (s: string) => `${C.yellow}║${C.reset} ${s.padEnd(w - 2)} ${C.yellow}║${C.reset}`;
+        console.log("");
+        console.log(top);
+        console.log(pad(""));
+        console.log(pad(`${C.bold}🔑 ADMIN PASSCODE — copy this NOW${C.reset}`));
+        console.log(pad(""));
+        console.log(pad(`   ${C.bold}${passcode}${C.reset}`));
+        console.log(pad(""));
+        console.log(pad(`After bot starts, DM it from Telegram and reply:`));
+        console.log(pad(`   ${C.cyan}/init ${passcode}${C.reset}`));
+        console.log(pad(""));
+        console.log(pad(`Backup: ${C.dim}${recoveryFile}${C.reset}`));
+        console.log(pad(`(deleted after first successful /init)`));
+        console.log(pad(""));
+        console.log(bot);
+        console.log("");
+    }
 }
