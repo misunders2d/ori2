@@ -166,24 +166,33 @@ export default function (pi: ExtensionAPI) {
         }
     });
 
-    pi.on("agent_end", async (event, _ctx) => {
-        if (!lastOrigin) return;
-        if (lastOrigin.platform === "cli") {
-            // CLI adapter would just echo to stderr — but the TUI already
-            // rendered the response. Skip to avoid double-render.
-            return;
-        }
-        // Extract the assistant's text reply from the agent_end event messages.
-        const assistantText = extractAssistantText(event.messages);
-        if (!assistantText) return;
-        try {
-            await dispatcher.send(lastOrigin.platform, lastOrigin.channelId, {
-                text: assistantText,
-                ...(lastOrigin.threadId !== undefined ? { replyToMessageId: lastOrigin.threadId } : {}),
-            });
-        } catch (e) {
-            logError("transport_bridge", `failed to send response back to ${lastOrigin.platform}`, { err: e instanceof Error ? e.message : String(e), platform: lastOrigin.platform, channelId: lastOrigin.channelId });
-        }
+    pi.on("agent_end", async (_event, _ctx) => {
+        // No-op by design — historical (Sprint 4) routing-back path that
+        // is now obsolete. Delivery to the originating adapter is handled
+        // entirely outside this hook:
+        //   - CLI: pi-tui renders the assistant reply directly in the TUI;
+        //     transport_bridge has nothing to add (would just double-render).
+        //   - non-CLI (Telegram, A2A, future Slack, etc.): the PARENT
+        //     process spawns a subprocess against the channel's session
+        //     (src/transport/channelRouter.ts), captures the subprocess's
+        //     stdout, and the parent calls dispatcher.send. The parent is
+        //     where the adapters are registered.
+        //
+        // Why this used to fire (and spam the error ledger) before the
+        // fix: the subprocess loads transport_bridge too. On session_start
+        // it restored lastOrigin from a persisted "transport-origin"
+        // entry the parent wrote. On agent_end it then attempted
+        // dispatcher.send back to telegram — but the SUBPROCESS dispatcher
+        // has no adapters registered (only the parent does), so every
+        // turn produced a "no adapter registered for platform telegram"
+        // error in the ledger.
+        //
+        // The lastOrigin tracking + persisted "transport-origin" entry
+        // are still load-bearing for OTHER consumers (admin_gate uses
+        // identity.currentOrigin to learn who's driving a turn for ACL +
+        // audit). Just the send-back path here is dead.
+        void lastOrigin; // keeps the closure variable warning at bay
+        void extractAssistantText; // ditto for the import
     });
 
     pi.registerCommand("transports", {
