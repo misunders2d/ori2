@@ -62,7 +62,7 @@ describe("redactKnownSecrets — credentials store", () => {
         getCredentials().add({
             id: "github_pat",
             secret: "ghp_thisIsAFakeButLongEnoughGitHubToken12345",
-            authType: "bearer",
+            auth_type: "bearer",
             provider: "github",
             addedBy: "test",
         });
@@ -78,7 +78,7 @@ describe("redactKnownSecrets — coverage of all sources", () => {
         getCredentials().add({
             id: "stripe",
             secret: "sk_live_creds-secret-87654321",
-            authType: "bearer",
+            auth_type: "bearer",
             addedBy: "test",
         });
         const targets = _testCollectTargets();

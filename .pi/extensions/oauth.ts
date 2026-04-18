@@ -191,6 +191,21 @@ export default function (pi: ExtensionAPI) {
             if (!/^https?:\/\//i.test(params.url)) {
                 return { content: [{ type: "text", text: `URL must start with http(s)://` }], isError: true };
             }
+            // Egress allowlist (see credentials_authenticated_fetch for rationale).
+            const { getEgressAllowlist } = await import("../../src/core/egressAllowlist.js");
+            if (!getEgressAllowlist().allowsPlatform(params.platform, params.url)) {
+                const allowed = getEgressAllowlist().listPlatformHosts(params.platform);
+                return {
+                    content: [{
+                        type: "text",
+                        text:
+                            `URL host is not on the egress allowlist for OAuth platform "${params.platform}". ` +
+                            `Allowed hosts: [${allowed.join(", ") || "(none — admin must add)"}]. ` +
+                            `An admin can add via /egress-allow platform ${params.platform} <host>.`,
+                    }],
+                    isError: true,
+                };
+            }
             const token = await oauth.getAccessToken(params.platform);
             const headers: Record<string, string> = { Authorization: `Bearer ${token}`, ...(params.extra_headers ?? {}) };
             const init: RequestInit = {

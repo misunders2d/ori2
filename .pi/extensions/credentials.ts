@@ -225,6 +225,24 @@ export default function (pi: ExtensionAPI) {
             if (!/^https?:\/\//i.test(url)) {
                 return { content: [{ type: "text", text: `URL must start with http(s)://` }], isError: true };
             }
+            // Egress allowlist — refuse to send credential-bearing request to
+            // a host the admin hasn't pre-approved. Defends against the agent
+            // being tricked into sending bearer headers to attacker URLs even
+            // when the admin reflexively approves the staging prompt.
+            const { getEgressAllowlist } = await import("../../src/core/egressAllowlist.js");
+            if (!getEgressAllowlist().allowsCredential(params.credential_id, url)) {
+                const allowed = getEgressAllowlist().listCredentialHosts(params.credential_id);
+                return {
+                    content: [{
+                        type: "text",
+                        text:
+                            `URL host is not on the egress allowlist for credential "${params.credential_id}". ` +
+                            `Allowed hosts: [${allowed.join(", ") || "(none — admin must add)"}]. ` +
+                            `An admin can add via /egress-allow credential ${params.credential_id} <host>.`,
+                    }],
+                    isError: true,
+                };
+            }
             const auth = creds.getAuthHeader(params.credential_id);
             const headers: Record<string, string> = { ...auth, ...(params.extra_headers ?? {}) };
             const init: RequestInit = {

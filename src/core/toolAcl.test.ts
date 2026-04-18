@@ -36,6 +36,20 @@ describe("ToolAcl defaults & lock-down", () => {
         assert.deepEqual(acl.requiredRoles("memory_search"), ["user"]);
     });
 
+    it("DEFAULT_ALWAYS_CONFIRM tools seed with alwaysConfirm:true", () => {
+        const acl = new ToolAcl();
+        acl.requiredRoles("bash"); // trigger load
+        const bash = acl.policyEntry("bash");
+        assert.equal(bash.alwaysConfirm, true, "bash must default to alwaysConfirm:true (per-invocation admin OK)");
+        const oauth = acl.policyEntry("oauth_authenticated_fetch");
+        assert.equal(oauth.alwaysConfirm, true, "oauth_authenticated_fetch must require admin confirmation");
+        const cred = acl.policyEntry("credentials_authenticated_fetch");
+        assert.equal(cred.alwaysConfirm, true, "credentials_authenticated_fetch must require admin confirmation");
+        // Non-confirm-default tools stay unset.
+        const search = acl.policyEntry("web_search");
+        assert.equal(search.alwaysConfirm, undefined);
+    });
+
     it("first read materializes the ACL file on disk", () => {
         const acl = new ToolAcl();
         acl.requiredRoles("bash");

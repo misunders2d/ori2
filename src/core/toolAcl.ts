@@ -118,6 +118,28 @@ const DEFAULTS: Record<string, string[]> = {
     trigger_scheduled_task_now: ["admin"],
 };
 
+/**
+ * Tools that default to alwaysConfirm:true — every invocation requires an
+ * admin to reply "Approve ACT-XXXXXX" via chat. Reserved for tools whose
+ * blast radius is large or which read raw bytes (bash exec, file write).
+ *
+ * Operator can override per-tool by editing data/<bot>/tool_acl.json and
+ * setting alwaysConfirm:false; the seeded value is just the safer default.
+ */
+const DEFAULT_ALWAYS_CONFIRM: Set<string> = new Set([
+    // Bash is the universal exec/read/exfil vector. Even though it's
+    // admin-only, "admin" doesn't mean "admin OK'd this specific command" —
+    // it means the agent is operating under an admin's auth context. With
+    // alwaysConfirm the admin sees the literal command before it runs.
+    "bash",
+    // The two authenticated-fetch tools embed credentials in outbound HTTP.
+    // Admin sees URL + method before the request goes out; prevents
+    // accidental exfil to attacker-specified URLs even if URL allowlisting
+    // is misconfigured.
+    "oauth_authenticated_fetch",
+    "credentials_authenticated_fetch",
+]);
+
 const FALLBACK_DEFAULT: string[] = ["admin"];
 
 function aclPath(): string {
@@ -183,12 +205,20 @@ export class ToolAcl {
         // overwrite admin-customised entries on subsequent boots.
         for (const [tool, roles] of Object.entries(DEFAULTS)) {
             if (!this.entries.has(tool)) {
-                this.entries.set(tool, {
+                const entry: AclEntry = {
                     toolName: tool,
                     requiredRoles: [...roles],
                     updatedAt: Date.now(),
                     updatedBy: "default",
-                });
+                };
+                if (DEFAULT_ALWAYS_CONFIRM.has(tool)) {
+                    entry.alwaysConfirm = true;
+                }
+                this.entries.set(tool, entry);
+            } else if (DEFAULT_ALWAYS_CONFIRM.has(tool)) {
+                // Tool was already configured (admin edited the file) — but
+                // alwaysConfirm wasn't set. Don't override; respect operator
+                // intent. The default applies only on first seed.
             }
         }
         this.loaded = true;
