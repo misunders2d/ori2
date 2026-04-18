@@ -6,6 +6,12 @@ import { getChannelModels } from "../core/channelModels.js";
 import { getDispatcher } from "./dispatcher.js";
 import type { Message } from "./types.js";
 import { logError, logWarning } from "../core/errorLog.js";
+import { getVault } from "../core/vault.js";
+
+/** Pi accepts these via `--thinking <level>` (see Pi cli/args.js). */
+const VALID_THINKING_LEVELS: Set<string> = new Set([
+    "off", "minimal", "low", "medium", "high", "xhigh",
+]);
 
 // =============================================================================
 // channelRouter — wires the dispatcher's non-CLI inbound handlers.
@@ -433,12 +439,39 @@ async function doActiveResponse(msg: Message, spawnFn: SpawnPiPrint): Promise<vo
         extraArgs.push("--model", `${modelPref.provider}/${modelPref.modelId}${suffix}`);
     }
 
+    // Bot-wide thinking level — vault key THINKING_LEVEL accepts Pi's values
+    // (off / minimal / low / medium / high / xhigh). Default is "off" because
+    // thinking-mode models on small inputs ("hey") burn 30+ seconds before
+    // emitting any text — bad UX for chat. Operators / agents toggle via
+    // the set_thinking_mode tool. Per-channel modelPref's thinkingLevel
+    // (if set) wins over this bot-wide default.
+    if (!modelPref?.thinkingLevel) {
+        const level = (getVault().get("THINKING_LEVEL") ?? "off").toLowerCase();
+        if (VALID_THINKING_LEVELS.has(level)) {
+            extraArgs.push("--thinking", level);
+        }
+    }
+
+    // Typing indicator — fires every 4s while the subprocess runs so the
+    // user sees the bot is alive. Cancelled in finally{} below regardless
+    // of outcome (success, abort, timeout, exception). Pattern ported from
+    // amazon_manager/interfaces/telegram_poller.py:284-289.
+    const adapter = getDispatcher().getAdapter(msg.platform);
+    let typingTimer: NodeJS.Timeout | null = null;
+    if (adapter?.sendTyping) {
+        const fire = () => { void adapter.sendTyping!(msg.channelId).catch(() => {}); };
+        fire(); // immediate first ping so user sees it within ~50ms, not 4s
+        typingTimer = setInterval(fire, 4_000);
+        typingTimer.unref();
+    }
+
     const controller = new AbortController();
     activeSubprocesses.set(key, { controller, kickoffMsg: msg });
     let result: SpawnResult;
     try {
         result = await spawnFn(kickoff, sessionFile, extraArgs, controller.signal);
     } finally {
+        if (typingTimer) clearInterval(typingTimer);
         // Only clear if we're still the registered controller — a later
         // interrupt may have replaced us with a fresh one.
         const current = activeSubprocesses.get(key);

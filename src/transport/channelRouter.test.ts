@@ -251,7 +251,7 @@ describe("channelRouter — active path", () => {
         assert.deepEqual(capturedArgs, ["--model", "anthropic/claude-opus-4-5:medium"]);
     });
 
-    it("passes no --model when no channel preference is set (use bot default)", async () => {
+    it("passes only --thinking off when no channel preference is set (bot-wide default)", async () => {
         const d = TransportDispatcher.instance();
         const tg = new FakeAdapter("telegram");
         d.register(tg);
@@ -266,10 +266,13 @@ describe("channelRouter — active path", () => {
         await tg.simulateInbound(baseMsg());
         await __drainChannelLocksForTests();
 
-        assert.deepEqual(capturedArgs, []);
+        // Bot-wide thinking default is OFF (vault THINKING_LEVEL absent →
+        // "off"). Pi receives --thinking off so reasoning models don't burn
+        // 30s on a "hey".
+        assert.deepEqual(capturedArgs, ["--thinking", "off"]);
     });
 
-    it("omits the :thinking suffix when thinkingLevel is not set on the preference", async () => {
+    it("appends --thinking off when modelPref has no thinkingLevel (per-channel respects bot-wide default)", async () => {
         const d = TransportDispatcher.instance();
         const tg = new FakeAdapter("telegram");
         d.register(tg);
@@ -290,7 +293,33 @@ describe("channelRouter — active path", () => {
         await tg.simulateInbound(baseMsg());
         await __drainChannelLocksForTests();
 
-        assert.deepEqual(capturedArgs, ["--model", "openai/gpt-4o"]);
+        assert.deepEqual(capturedArgs, ["--model", "openai/gpt-4o", "--thinking", "off"]);
+    });
+
+    it("does NOT add --thinking when channel modelPref has its own thinkingLevel (per-channel wins)", async () => {
+        const d = TransportDispatcher.instance();
+        const tg = new FakeAdapter("telegram");
+        d.register(tg);
+
+        getChannelModels().set("telegram", "-100abc", {
+            provider: "openai",
+            modelId: "gpt-5",
+            thinkingLevel: "high",
+            setBy: "test",
+        });
+
+        let capturedArgs: string[] = [];
+        const fakeSpawn: SpawnPiPrint = async (_k, _f, extraArgs) => {
+            capturedArgs = extraArgs;
+            return { stdout: "ok", stderr: "", exitCode: 0 };
+        };
+        installChannelRouter(fakeSpawn);
+
+        await tg.simulateInbound(baseMsg());
+        await __drainChannelLocksForTests();
+
+        // Per-channel thinking suffix is in --model already; we don't double-set it.
+        assert.deepEqual(capturedArgs, ["--model", "openai/gpt-5:high"]);
     });
 
     it("seeds a transport-origin CustomEntry before spawning so subprocess sees the sender", async () => {

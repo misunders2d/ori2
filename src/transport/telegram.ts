@@ -223,6 +223,24 @@ export class TelegramAdapter implements TransportAdapter {
         }
     }
 
+    /**
+     * Push a transient "typing…" indicator to the channel. Telegram clears it
+     * automatically after ~5 seconds, so callers loop on a ~4-second cadence
+     * to keep it visible while the agent is processing. Best-effort — never
+     * throws; a failed indicator must not break message handling.
+     */
+    async sendTyping(channelId: string): Promise<void> {
+        const token = getVault().get("TELEGRAM_BOT_TOKEN");
+        if (!token) return;
+        const chatId = Number(channelId);
+        if (!Number.isFinite(chatId)) return;
+        try {
+            await this.callApi(token, "sendChatAction", { chat_id: chatId, action: "typing" });
+        } catch {
+            /* best-effort — no log spam if it fails */
+        }
+    }
+
     status(): AdapterStatus {
         const status: AdapterStatus = {
             platform: this.platform,

@@ -208,4 +208,17 @@ export interface TransportAdapter {
 
     /** Current status — surfaced via /transports. */
     status(): AdapterStatus;
+
+    /**
+     * OPTIONAL — send a transient "typing…" indicator to the channel so the
+     * user sees the bot is alive while the agent processes. Telegram has
+     * sendChatAction (auto-clears after ~5s). Slack has the conversations.mark
+     * + assistant.threads.setStatus pair. CLI / A2A / Synapse don't have a
+     * direct equivalent and should leave this unimplemented.
+     *
+     * Caller is expected to call this on a 4-second loop while the agent
+     * is generating, and stop calling once the reply lands. See
+     * src/transport/channelRouter.ts → doActiveResponse.
+     */
+    sendTyping?(channelId: string): Promise<void>;
 }
