@@ -324,23 +324,23 @@ export class TelegramAdapter implements TransportAdapter {
             // Pick the largest variant available — better for vision models.
             const largest = [...m.photo].sort((a, b) => (b.file_size ?? 0) - (a.file_size ?? 0))[0]!;
             const buf = await this.downloadFile(token, largest.file_id);
-            out.push(await fileToPayload(buf, "image/jpeg", undefined, ctx));
+            out.push(...await fileToPayload(buf, "image/jpeg", undefined, ctx));
         }
         if (m.document) {
             const buf = await this.downloadFile(token, m.document.file_id);
-            out.push(await fileToPayload(buf, m.document.mime_type ?? "application/octet-stream", m.document.file_name, ctx));
+            out.push(...await fileToPayload(buf, m.document.mime_type ?? "application/octet-stream", m.document.file_name, ctx));
         }
         if (m.audio) {
             const buf = await this.downloadFile(token, m.audio.file_id);
-            out.push(await fileToPayload(buf, m.audio.mime_type ?? "audio/mpeg", m.audio.file_name ?? "audio", ctx));
+            out.push(...await fileToPayload(buf, m.audio.mime_type ?? "audio/mpeg", m.audio.file_name ?? "audio", ctx));
         }
         if (m.voice) {
             const buf = await this.downloadFile(token, m.voice.file_id);
-            out.push(await fileToPayload(buf, m.voice.mime_type ?? "audio/ogg", "voice.ogg", ctx));
+            out.push(...await fileToPayload(buf, m.voice.mime_type ?? "audio/ogg", "voice.ogg", ctx));
         }
         if (m.video) {
             const buf = await this.downloadFile(token, m.video.file_id);
-            out.push(await fileToPayload(buf, m.video.mime_type ?? "video/mp4", m.video.file_name ?? "video.mp4", ctx));
+            out.push(...await fileToPayload(buf, m.video.mime_type ?? "video/mp4", m.video.file_name ?? "video.mp4", ctx));
         }
         return out;
     }

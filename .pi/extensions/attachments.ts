@@ -234,7 +234,14 @@ export default function (pi: ExtensionAPI) {
                 incomingDir: path.dirname(entry.absPath),
                 saveBinary: async () => entry.absPath,
             };
-            const payload = await fileToPayload(buf, mime, entry.filename, mediaCtx);
+            // fileToPayload returns an array (image/audio/video can produce a
+            // sibling moderator-transcript text payload). For read_attachment
+            // we want the primary representation only — the first element is
+            // always the original-format payload (image/audio binary or
+            // extracted text); the transcript sibling, if any, is not what
+            // the agent asked for here.
+            const payloads = await fileToPayload(buf, mime, entry.filename, mediaCtx);
+            const payload = payloads[0]!;
 
             if (payload.kind === "text") {
                 const full = payload.text;
