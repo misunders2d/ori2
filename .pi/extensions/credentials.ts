@@ -201,27 +201,46 @@ export default function (pi: ExtensionAPI) {
         },
     });
 
-    // LLM-callable tool — admin only by default. Returns the auth header,
-    // NOT the raw secret, so the LLM (and the agent's session log) sees only
-    // the wire-ready header. For tools that need the raw value, use
-    // getCredentials().get(id) inside the tool's execute.
+    // LLM-callable HTTP tool — performs the request with the stored credential
+    // injected as Authorization header in the Node process. The LLM never
+    // sees the secret bytes. Replaces the legacy credentials_get_auth_header
+    // tool, which returned the bearer token directly to LLM context (a leak
+    // surface even with the output-redactor backstop).
     pi.registerTool({
-        name: "credentials_get_auth_header",
-        label: "Get Credential Auth Header",
+        name: "credentials_authenticated_fetch",
+        label: "Authenticated HTTP Fetch (credential)",
         description:
-            "Build the HTTP authorization header(s) for a stored credential. " +
-            "Returns a JSON object the caller spreads into a fetch's headers. " +
-            "Prefer wrapping the API call in a dedicated tool that uses " +
-            "getCredentials().getAuthHeader() internally so secrets stay out " +
-            "of LLM context.",
+            "Make an HTTP request authenticated with a stored credential. The credential's " +
+            "auth header is injected server-side; the LLM never sees the raw token bytes. " +
+            "Returns the response body as text (truncated to 64KB) plus status + headers.",
         parameters: Type.Object({
-            id: Type.String({ description: "Credential id (e.g., 'github_pat', 'clickup')" }),
+            credential_id: Type.String({ description: "Credential id (e.g., 'github_pat', 'clickup')" }),
+            url: Type.String({ description: "Absolute URL — must be https:// for any external host" }),
+            method: Type.Optional(Type.String({ description: "HTTP method (default GET)" })),
+            body: Type.Optional(Type.String({ description: "Request body. Pass JSON as a stringified object." })),
+            extra_headers: Type.Optional(Type.Record(Type.String(), Type.String(), { description: "Additional headers to send (Content-Type, Accept, etc.)" })),
         }),
         async execute(_id, params) {
-            const headers = creds.getAuthHeader(params.id);
+            const url = params.url;
+            if (!/^https?:\/\//i.test(url)) {
+                return { content: [{ type: "text", text: `URL must start with http(s)://` }], isError: true };
+            }
+            const auth = creds.getAuthHeader(params.credential_id);
+            const headers: Record<string, string> = { ...auth, ...(params.extra_headers ?? {}) };
+            const init: RequestInit = {
+                method: params.method ?? "GET",
+                headers,
+                ...(params.body !== undefined ? { body: params.body } : {}),
+            };
+            const res = await fetch(url, init);
+            const buf = await res.arrayBuffer();
+            const text = new TextDecoder("utf-8", { fatal: false }).decode(buf);
+            const truncated = text.length > 64_000 ? text.slice(0, 64_000) + `\n…[truncated, full size ${text.length} chars]` : text;
+            const respHeaders: Record<string, string> = {};
+            res.headers.forEach((v, k) => { respHeaders[k] = v; });
             return {
-                content: [{ type: "text", text: `Auth header(s) for ${params.id}: ${JSON.stringify(headers)}` }],
-                details: { id: params.id, header_count: Object.keys(headers).length },
+                content: [{ type: "text", text: `HTTP ${res.status} ${res.statusText}\n\n${truncated}` }],
+                details: { status: res.status, url, method: init.method, response_headers: respHeaders, response_bytes: buf.byteLength },
             };
         },
     });

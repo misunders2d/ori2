@@ -86,12 +86,24 @@ type Backend = "local" | "google" | "openai";
 
 function pickBackend(): Backend {
     const v = (process.env["GUARDRAIL_EMBEDDINGS"] ?? "local").toLowerCase();
-    // Google AI Studio accepts GEMINI_API_KEY (Pi's canonical name) OR the
-    // older GOOGLE_API_KEY. Check both so operators on either convention
-    // keep working.
-    if (v === "google" && (process.env["GEMINI_API_KEY"] || process.env["GOOGLE_API_KEY"])) return "google";
-    if (v === "openai" && process.env["OPENAI_API_KEY"]) return "openai";
+    // Read API keys from VAULT, never process.env. Vault is the single store
+    // of record; env vars are scrubbed at boot so `bash 'env'` from the LLM
+    // can't read them. See src/index.ts:scrubCredentialEnvVars.
+    if (v === "google" && (vaultKey("GEMINI_API_KEY") || vaultKey("GOOGLE_API_KEY"))) return "google";
+    if (v === "openai" && vaultKey("OPENAI_API_KEY")) return "openai";
     return "local";
+}
+
+function vaultKey(name: string): string | undefined {
+    // Lazy-import to avoid pulling vault.js at module load (extensions load
+    // before vault is necessarily ready). Returns undefined on miss.
+    try {
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const { getVault } = require("../../src/core/vault.js") as typeof import("../../src/core/vault.js");
+        return getVault().get(name);
+    } catch {
+        return undefined;
+    }
 }
 
 function corpusHash(anchors: string[]): string {
@@ -110,7 +122,7 @@ async function getRemoteEmbedding(text: string, backend: "google" | "openai"): P
     // (HTTP error, malformed response) throws so the caller can't pretend
     // a check succeeded when it didn't.
     if (backend === "google") {
-        const key = process.env["GEMINI_API_KEY"] ?? process.env["GOOGLE_API_KEY"];
+        const key = vaultKey("GEMINI_API_KEY") ?? vaultKey("GOOGLE_API_KEY");
         if (!key) return null;
         const res = await fetch(
             `https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key=${key}`,
@@ -130,7 +142,7 @@ async function getRemoteEmbedding(text: string, backend: "google" | "openai"): P
         }
         return v;
     } else {
-        const key = process.env["OPENAI_API_KEY"];
+        const key = vaultKey("OPENAI_API_KEY");
         if (!key) return null;
         const res = await fetch("https://api.openai.com/v1/embeddings", {
             method: "POST",

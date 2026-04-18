@@ -37,6 +37,7 @@ import {
     ensurePiSettingsJsonSeeded as _ensurePiSettingsJsonSeeded,
 } from "./core/piSeed.js";
 import { migrateSecretFilesLocation } from "./core/secretMigration.js";
+import { scrubCredentialEnvVars } from "./core/envScrub.js";
 
 // .env carries non-secret runtime config only (BOT_NAME,
 // GUARDRAIL_EMBEDDINGS). Secrets live in the vault. Pi settings
@@ -58,44 +59,14 @@ function isDaemonMode(): boolean {
     return !process.stdout.isTTY;
 }
 
-// Keys the vault mirrors into process.env on boot. Vault is our store of
-// record; env-var hydration is a fallback for code paths that read env
-// directly (Telegram token, guardrails' remote-embed backend, etc.).
-//
-// Pi SDK's own resolution order is: --api-key flag > auth.json > env vars
-// > models.json (pi-coding-agent/docs/providers.md §Resolution Order). The
-// wizard writes auth.json alongside the vault, so Pi picks up credentials
-// from auth.json — these env vars are only needed by our own code.
-//
-// NAMING: the LLM provider env vars use Pi's canonical names — per
-// @mariozechner/pi-ai/dist/env-api-keys.js, `google` maps to GEMINI_API_KEY
-// (NOT GOOGLE_API_KEY — that's Vertex territory). The migration below
-// renames legacy vaults that still have GOOGLE_API_KEY.
-const VAULT_HYDRATED_KEYS = [
-    "ADMIN_USER_IDS",
-    "ANTHROPIC_API_KEY",
-    "GEMINI_API_KEY",
-    "OPENAI_API_KEY",
-] as const;
-
 function migrateLegacyVaultKeys(): void {
     if (_migrateLegacyVaultKeys()) {
         console.log("🔧 [vault] migrated GOOGLE_API_KEY → GEMINI_API_KEY (Pi SDK canonical name)");
     }
 }
 
-function hydrateEnvFromVault(): void {
-    const vault = getVault();
-    for (const key of VAULT_HYDRATED_KEYS) {
-        const v = vault.get(key);
-        if (v !== undefined && v !== "") process.env[key] = v;
-    }
-    // Note: we used to mirror GEMINI_API_KEY → GOOGLE_API_KEY here for
-    // guardrails' Google-embed backend. guardrails.ts now reads
-    // GEMINI_API_KEY directly (Pi's canonical name), so the mirror is gone.
-    // That also kills the "Both GOOGLE_API_KEY and GEMINI_API_KEY are set"
-    // noise `pi -p` subprocesses would emit when they saw both vars.
-}
+// scrubCredentialEnvVars + the pattern logic moved to src/core/envScrub.ts so
+// it can be unit-tested. Imported above.
 
 function ensurePiAuthJsonSeeded(): void {
     const piDir = process.env["PI_CODING_AGENT_DIR"];
@@ -171,21 +142,29 @@ async function bootstrap() {
         process.env["PI_CODING_AGENT_DIR"] = piStateDir;
     }
 
-    // Migrate legacy vault keys (GOOGLE_API_KEY → GEMINI_API_KEY) before
-    // hydration so the renamed key lands in process.env.
+    // Migrate legacy vault key names (GOOGLE_API_KEY → GEMINI_API_KEY).
     migrateLegacyVaultKeys();
 
-    // Hydrate process.env from vault BEFORE any extension or Pi component reads
-    // these keys. After this point, every subsequent process.env access for a
-    // vault-backed key returns the vault value.
-    hydrateEnvFromVault();
-
-    // Seed Pi's native auth.json + settings.json from vault if missing. This
-    // covers installs that predate the wizard writing these files. Safe to
-    // run on every boot — both functions are idempotent and respect any
-    // values the operator set via /login or /settings.
+    // Seed Pi's native auth.json + settings.json from vault if missing. Pi
+    // SDK reads model API keys from auth.json — NOT from env. This must run
+    // BEFORE scrubCredentialEnvVars below, because if Pi auth.json is
+    // missing and we've already scrubbed env, Pi has nothing to fall back
+    // to. Order: vault migrate → seed pi auth → scrub env → boot.
     ensurePiAuthJsonSeeded();
     ensurePiSettingsJsonSeeded();
+
+    // SCRUB credential-bearing env vars from the process. This is the
+    // single most important defense after secret_files_guard: it makes
+    // `bash 'env'` from the LLM return zero secrets. Both vault-mirrored
+    // values AND any operator-shell-exported credentials (GITHUB_TOKEN,
+    // AWS_*, etc.) are deleted. The vault remains the only store of
+    // record; code reads via getVault().get(name).
+    {
+        const r = scrubCredentialEnvVars();
+        if (r.scrubbed.length > 0) {
+            console.log(`🔐 Scrubbed ${r.scrubbed.length} credential env var(s) from process: ${r.scrubbed.sort().join(", ")}`);
+        }
+    }
 
     // Lock the instance — a second bot with the same name would corrupt
     // sessions/vault/memory.

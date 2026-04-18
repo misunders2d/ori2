@@ -168,29 +168,45 @@ export default function (pi: ExtensionAPI) {
         },
     });
 
-    // Tool the LLM can call to fetch an access token (for tools that wrap an
-    // OAuth-protected API). Admin-only by default — evolved tools that need
-    // user-level access should set their own ACL.
-    //
-    // NOTE: this tool returns the access token directly to the LLM context.
-    // For high-security platforms, prefer wrapping the API call in a dedicated
-    // tool that uses oauth.getAccessToken() internally so the token never
-    // enters the LLM's view.
+    // LLM-callable HTTP tool — performs the request with the OAuth access token
+    // injected as Authorization: Bearer in the Node process. Token is auto-
+    // refreshed if expired. The LLM never sees the token bytes. Replaces the
+    // legacy oauth_get_access_token, which returned the token to LLM context.
     pi.registerTool({
-        name: "oauth_get_access_token",
-        label: "Get OAuth Access Token",
+        name: "oauth_authenticated_fetch",
+        label: "Authenticated HTTP Fetch (OAuth)",
         description:
-            "Fetch a fresh access token for a registered OAuth platform (auto-refreshes if expired). " +
-            "Returns the token verbatim — caller must use it in an Authorization header. " +
-            "Prefer wrapping the API call in a dedicated tool to keep tokens out of LLM context.",
+            "Make an HTTP request authenticated with a stored OAuth access token. The Bearer " +
+            "header is injected server-side and auto-refreshed if expired; the LLM never sees " +
+            "the raw token bytes. Returns the response body as text (truncated to 64KB) " +
+            "plus status + headers.",
         parameters: Type.Object({
             platform: Type.String({ description: "Platform id (e.g. 'google', 'github')" }),
+            url: Type.String({ description: "Absolute URL — must be https://" }),
+            method: Type.Optional(Type.String({ description: "HTTP method (default GET)" })),
+            body: Type.Optional(Type.String({ description: "Request body. Pass JSON as a stringified object." })),
+            extra_headers: Type.Optional(Type.Record(Type.String(), Type.String(), { description: "Additional headers (Content-Type, Accept, etc.)" })),
         }),
         async execute(_id, params) {
+            if (!/^https?:\/\//i.test(params.url)) {
+                return { content: [{ type: "text", text: `URL must start with http(s)://` }], isError: true };
+            }
             const token = await oauth.getAccessToken(params.platform);
+            const headers: Record<string, string> = { Authorization: `Bearer ${token}`, ...(params.extra_headers ?? {}) };
+            const init: RequestInit = {
+                method: params.method ?? "GET",
+                headers,
+                ...(params.body !== undefined ? { body: params.body } : {}),
+            };
+            const res = await fetch(params.url, init);
+            const buf = await res.arrayBuffer();
+            const text = new TextDecoder("utf-8", { fatal: false }).decode(buf);
+            const truncated = text.length > 64_000 ? text.slice(0, 64_000) + `\n…[truncated, full size ${text.length} chars]` : text;
+            const respHeaders: Record<string, string> = {};
+            res.headers.forEach((v, k) => { respHeaders[k] = v; });
             return {
-                content: [{ type: "text", text: `OAuth access_token for ${params.platform}: ${token}` }],
-                details: { platform: params.platform, token_length: token.length },
+                content: [{ type: "text", text: `HTTP ${res.status} ${res.statusText}\n\n${truncated}` }],
+                details: { status: res.status, platform: params.platform, url: params.url, method: init.method, response_headers: respHeaders, response_bytes: buf.byteLength },
             };
         },
     });

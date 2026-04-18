@@ -112,8 +112,8 @@ const DEFAULTS: Record<string, string[]> = {
     // `write` inherits Pi's default ACL; restrict via policy.ts if needed.
     evolve_list: ["user"],
     // Sprint 9 audit
-    oauth_get_access_token: ["admin"],
-    credentials_get_auth_header: ["admin"],
+    oauth_authenticated_fetch: ["admin"],
+    credentials_authenticated_fetch: ["admin"],
     // Sprint 8 scheduler addition
     trigger_scheduled_task_now: ["admin"],
 };
