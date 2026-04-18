@@ -7,11 +7,11 @@ import { describe, it, before, beforeEach, after } from "node:test";
 import { strict as assert } from "node:assert";
 import fs from "node:fs";
 import path from "node:path";
-import { botDir } from "./paths.js";
+import { botDir, secretSubdir } from "./paths.js";
 import { Vault, getVault } from "./vault.js";
 
 const TEST_DIR = botDir();
-const VAULT_FILE = path.join(TEST_DIR, "vault.json");
+const VAULT_FILE = path.join(secretSubdir(), "vault.json");
 
 function rmTestDir() {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true, force: true });
@@ -119,7 +119,7 @@ describe("Vault disk format", () => {
 
 describe("Vault fail-loud", () => {
     it("throws on corrupt JSON", () => {
-        fs.mkdirSync(TEST_DIR, { recursive: true });
+        fs.mkdirSync(secretSubdir(), { recursive: true });
         fs.writeFileSync(VAULT_FILE, "not-json{", "utf-8");
         const v = new Vault();
         assert.throws(() => v.get("any"), /corrupt JSON/);
@@ -127,14 +127,14 @@ describe("Vault fail-loud", () => {
 
     it("throws on non-object scalar JSON", () => {
         // typeof null === "object" so we use a number to hit the wrong-shape branch.
-        fs.mkdirSync(TEST_DIR, { recursive: true });
+        fs.mkdirSync(secretSubdir(), { recursive: true });
         fs.writeFileSync(VAULT_FILE, "42", "utf-8");
         const v = new Vault();
         assert.throws(() => v.get("any"), /wrong shape/);
     });
 
     it("throws on array (caught at the missing-fields check)", () => {
-        fs.mkdirSync(TEST_DIR, { recursive: true });
+        fs.mkdirSync(secretSubdir(), { recursive: true });
         fs.writeFileSync(VAULT_FILE, "[]", "utf-8");
         const v = new Vault();
         // Arrays pass typeof === "object" so they're caught one branch later.
@@ -142,14 +142,14 @@ describe("Vault fail-loud", () => {
     });
 
     it("throws on missing version field", () => {
-        fs.mkdirSync(TEST_DIR, { recursive: true });
+        fs.mkdirSync(secretSubdir(), { recursive: true });
         fs.writeFileSync(VAULT_FILE, JSON.stringify({ data: {} }), "utf-8");
         const v = new Vault();
         assert.throws(() => v.get("any"), /missing required fields/);
     });
 
     it("throws on unsupported version", () => {
-        fs.mkdirSync(TEST_DIR, { recursive: true });
+        fs.mkdirSync(secretSubdir(), { recursive: true });
         fs.writeFileSync(VAULT_FILE, JSON.stringify({ version: 999, data: {} }), "utf-8");
         const v = new Vault();
         assert.throws(() => v.get("any"), /unsupported version/);

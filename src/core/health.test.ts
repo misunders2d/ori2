@@ -4,7 +4,7 @@ import { describe, it, before, beforeEach, after } from "node:test";
 import { strict as assert } from "node:assert";
 import fs from "node:fs";
 import path from "node:path";
-import { botDir } from "./paths.js";
+import { botDir, secretSubdir, ensureSecretDir } from "./paths.js";
 import { getVault } from "./vault.js";
 import { getFriends } from "../a2a/friends.js";
 import { getA2AAdapter } from "../a2a/adapter.js";
@@ -74,7 +74,8 @@ describe("getHealth — basic shape", () => {
         // full register → device flow. Write the platforms + tokens files
         // directly and reload.
         fs.mkdirSync(TEST_DIR, { recursive: true });
-        fs.writeFileSync(path.join(TEST_DIR, "oauth_platforms.json"), JSON.stringify({
+        ensureSecretDir(secretSubdir());
+        fs.writeFileSync(path.join(secretSubdir(), "oauth_platforms.json"), JSON.stringify({
             version: 1,
             updated_at: Date.now(),
             platforms: {
@@ -90,7 +91,7 @@ describe("getHealth — basic shape", () => {
                 },
             },
         }));
-        fs.writeFileSync(path.join(TEST_DIR, "oauth_tokens.json"), JSON.stringify({
+        fs.writeFileSync(path.join(secretSubdir(), "oauth_tokens.json"), JSON.stringify({
             version: 1,
             updated_at: Date.now(),
             tokens: {

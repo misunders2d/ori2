@@ -1,13 +1,15 @@
 import fs from "node:fs";
 import path from "node:path";
-import { botSubdir, ensureDir } from "./paths.js";
+import { secretSubdir, ensureSecretDir } from "./paths.js";
 
 // =============================================================================
 // Vault — per-bot encrypted-at-rest-permission, plain-text-on-disk credential
 // store. Replaces ad-hoc `.env` storage of secrets.
 //
 // Design:
-//   - File: `data/<BOT>/vault.json`, mode 0600 (owner read/write only).
+//   - File: `data/<BOT>/.secret/vault.json`, mode 0600 (owner read/write only).
+//     Lives under `.secret/` so the secret_files_guard extension can deny
+//     LLM file-tool access by single prefix.
 //   - Format: { version, created_at, updated_at, data: { key: value } }.
 //   - Atomic writes: write to vault.json.tmp + rename (atomic on POSIX).
 //   - Singleton: getVault() lazy-loads on first call, cached process-wide.
@@ -44,7 +46,7 @@ interface VaultFile {
 }
 
 function vaultPath(): string {
-    return path.join(botSubdir(""), "vault.json");
+    return path.join(secretSubdir(), "vault.json");
 }
 
 function tempPath(): string {
@@ -100,8 +102,8 @@ class Vault {
     private save(): void {
         if (!this.state) return;
         this.state.updated_at = Date.now();
-        const dir = botSubdir("");
-        ensureDir(dir);
+        const dir = secretSubdir();
+        ensureSecretDir(dir);
         const tmp = tempPath();
         const final = vaultPath();
         // Write to a tmp file first, fsync, then atomic rename. This survives

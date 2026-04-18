@@ -36,6 +36,7 @@ import {
     ensurePiAuthJsonSeeded as _ensurePiAuthJsonSeeded,
     ensurePiSettingsJsonSeeded as _ensurePiSettingsJsonSeeded,
 } from "./core/piSeed.js";
+import { migrateSecretFilesLocation } from "./core/secretMigration.js";
 
 // .env carries non-secret runtime config only (BOT_NAME,
 // GUARDRAIL_EMBEDDINGS). Secrets live in the vault. Pi settings
@@ -114,6 +115,21 @@ function ensurePiSettingsJsonSeeded(): void {
 
 async function bootstrap() {
     console.log("🚀 Bootstrapping Ori2 Foundational Platform...");
+
+    // 0. Relocate credential-bearing files from legacy data/<bot>/*.json
+    // locations into data/<bot>/.secret/. MUST run before isSystemConfigured()
+    // (which probes vault.json existence) so old installs don't get falsely
+    // marked unconfigured and re-prompted by the wizard. Idempotent — does
+    // nothing once everything has migrated.
+    try {
+        const m = migrateSecretFilesLocation();
+        if (m.moved.length > 0) {
+            console.log(`🔐 Migrated to data/<bot>/.secret/: ${m.moved.join(", ")}`);
+        }
+    } catch (e) {
+        console.error(`✖ Secret-file migration failed: ${e instanceof Error ? e.message : String(e)}`);
+        throw e;
+    }
 
     // 1. User Onboarding & Vault Setup
     const setupOnly = (process.env["ORI2_SETUP_ONLY"] ?? "").toLowerCase();

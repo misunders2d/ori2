@@ -22,8 +22,33 @@ export function botSubdir(name: string): string {
     return path.join(botDir(), name);
 }
 
+/**
+ * Per-bot dir for credential-bearing files (vault, credentials, oauth tokens
+ * + platforms, pending-actions DB). Lives under `data/<bot>/.secret/` to:
+ *   1. Cluster everything an operator should `chmod 700` for OS-level defense.
+ *   2. Give the secret_files_guard extension a single prefix to deny when
+ *      the LLM tries to read/edit/grep/cat anything under here.
+ *
+ * The dir leading-dot keeps it out of `ls` by default — defense in depth.
+ */
+export function secretSubdir(name: string = ""): string {
+    return path.join(botDir(), ".secret", name);
+}
+
 export function ensureDir(p: string): void {
     if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
+}
+
+/** Creates the dir with mode 0700 if missing. Used for `.secret/` so the
+ *  whole credential cluster is unreadable by other OS users. */
+export function ensureSecretDir(p: string): void {
+    if (!fs.existsSync(p)) {
+        fs.mkdirSync(p, { recursive: true, mode: 0o700 });
+        return;
+    }
+    // Tighten perms even on existing dirs (defense if migration created it
+    // with default umask).
+    try { fs.chmodSync(p, 0o700); } catch { /* best effort */ }
 }
 
 // Shared, NOT per-bot: same checkout's bots can share artefacts that don't

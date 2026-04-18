@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { botDir, ensureDir } from "./paths.js";
+import { secretSubdir, ensureSecretDir } from "./paths.js";
 
 // =============================================================================
 // OAuth2 service — universal Device Code (RFC 8628) + Authorization Code+PKCE
@@ -144,11 +144,11 @@ export const BUILTIN_TEMPLATES: Record<string, OAuthPlatformTemplate> = {
 
 // ----- File helpers -----
 
-function platformsPath(): string { return path.join(botDir(), "oauth_platforms.json"); }
-function tokensPath(): string { return path.join(botDir(), "oauth_tokens.json"); }
+function platformsPath(): string { return path.join(secretSubdir(), "oauth_platforms.json"); }
+function tokensPath(): string { return path.join(secretSubdir(), "oauth_tokens.json"); }
 
 function atomicWriteJson(file: string, data: unknown): void {
-    ensureDir(path.dirname(file));
+    ensureSecretDir(path.dirname(file));
     const tmp = `${file}.tmp`;
     const fd = fs.openSync(tmp, "w", 0o600);
     try {

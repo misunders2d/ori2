@@ -5,11 +5,11 @@ import { strict as assert } from "node:assert";
 import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
-import { botDir } from "./paths.js";
+import { botDir, secretSubdir } from "./paths.js";
 import { Staging, parseApproval } from "./staging.js";
 
 const TEST_DIR = botDir();
-const DB_FILE = path.join(TEST_DIR, "pending_actions.db");
+const DB_FILE = path.join(secretSubdir(), "pending_actions.db");
 
 function rmTestDir() {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true, force: true });
@@ -178,7 +178,7 @@ describe("Staging.listActive", () => {
 describe("Staging schema migration", () => {
     it("auto-adds requires_2fa column to a pre-existing v1 table", () => {
         // Create a v1 schema (without requires_2fa) directly.
-        fs.mkdirSync(TEST_DIR, { recursive: true });
+        fs.mkdirSync(secretSubdir(), { recursive: true });
         const db = new Database(DB_FILE);
         db.prepare(`
             CREATE TABLE pending_actions (

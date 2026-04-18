@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { botDir, ensureDir } from "./paths.js";
+import { secretSubdir, ensureSecretDir } from "./paths.js";
 
 // =============================================================================
 // Credentials — paste-a-token store for service integrations.
@@ -82,11 +82,11 @@ interface CredentialsFile {
 }
 
 function credentialsPath(): string {
-    return path.join(botDir(), "credentials.json");
+    return path.join(secretSubdir(), "credentials.json");
 }
 
 function atomicWriteJson(file: string, data: unknown): void {
-    ensureDir(path.dirname(file));
+    ensureSecretDir(path.dirname(file));
     const tmp = `${file}.tmp`;
     const fd = fs.openSync(tmp, "w", 0o600);
     try {

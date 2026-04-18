@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import path from "node:path";
 import Database from "better-sqlite3";
-import { botDir, ensureDir } from "./paths.js";
+import { secretSubdir, ensureSecretDir } from "./paths.js";
 
 // =============================================================================
 // Pending actions — SQLite-backed single-use tokens for admin-gated operations.
@@ -43,7 +43,7 @@ export interface PendingAction {
 }
 
 function dbPath(): string {
-    return path.join(botDir(), "pending_actions.db");
+    return path.join(secretSubdir(), "pending_actions.db");
 }
 
 function generateToken(): string {
@@ -60,7 +60,7 @@ export class Staging {
 
     private open(): Database.Database {
         if (this.db) return this.db;
-        ensureDir(botDir());
+        ensureSecretDir(secretSubdir());
         const db = new Database(dbPath());
         db.pragma("journal_mode = WAL");
         db.pragma("foreign_keys = ON");

@@ -3,7 +3,7 @@ process.env["BOT_NAME"] = "_test_proactive_diag";
 import { describe, it, before, beforeEach, after } from "node:test";
 import { strict as assert } from "node:assert";
 import fs from "node:fs";
-import { botDir } from "./paths.js";
+import { botDir, secretSubdir, ensureSecretDir } from "./paths.js";
 import { getVault } from "./vault.js";
 import { getFriends } from "../a2a/friends.js";
 import { getA2AAdapter } from "../a2a/adapter.js";
@@ -168,7 +168,8 @@ describe("runCheck — delivery", () => {
 
         // Second check: remove heartbeat, add an OAuth-expired warning instead.
         fs.unlinkSync(`${TEST_DIR}/.heartbeat.telegram`);
-        fs.writeFileSync(`${TEST_DIR}/oauth_platforms.json`, JSON.stringify({
+        ensureSecretDir(secretSubdir());
+        fs.writeFileSync(`${secretSubdir()}/oauth_platforms.json`, JSON.stringify({
             version: 1, updated_at: Date.now(),
             platforms: {
                 google: {
@@ -179,7 +180,7 @@ describe("runCheck — delivery", () => {
                 },
             },
         }));
-        fs.writeFileSync(`${TEST_DIR}/oauth_tokens.json`, JSON.stringify({
+        fs.writeFileSync(`${secretSubdir()}/oauth_tokens.json`, JSON.stringify({
             version: 1, updated_at: Date.now(),
             tokens: {
                 google: { access_token: "x", token_type: "Bearer", expires_at: Date.now() - 5000, obtained_at: Date.now() - 100000 },
