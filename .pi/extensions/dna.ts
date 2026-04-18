@@ -14,6 +14,7 @@ import { getFriends } from "../../src/a2a/friends.js";
 import { getA2AServerHandle } from "../../src/a2a/server.js";
 import { currentOrigin } from "../../src/core/identity.js";
 import { getWhitelist } from "../../src/core/whitelist.js";
+import { registerActionDescriber } from "./admin_gate.js";
 
 // =============================================================================
 // .pi/extensions/dna.ts — operator + LLM surface for DNA exchange.
@@ -42,6 +43,36 @@ function refreshCardIfRunning(): void {
 }
 
 export default function (pi: ExtensionAPI) {
+    // Register manifest-aware action describer so admin sees what files +
+    // source bot they're approving when apply_dna stages — closes the
+    // audit-flagged "admin sees only the token" gap.
+    registerActionDescriber("apply_dna", (args) => {
+        const a = args as { import_id?: string; strategy?: string };
+        if (!a.import_id) return null;
+        const imp = listImports().find((i) => i.id === a.import_id);
+        if (!imp) return `Import id: ${a.import_id} (NOT FOUND in staging — refusing would be safe)`;
+        const m = imp.manifest;
+        if (!m) return `Import id: ${a.import_id}\nManifest: (missing — apply will likely fail)`;
+        const filesPreview = m.files.slice(0, 20).map((f) => `    ${f.path}  (${f.size}B  sha256:${f.sha256.slice(0, 12)}…)`).join("\n");
+        const more = m.files.length > 20 ? `\n    …and ${m.files.length - 20} more files` : "";
+        return [
+            `DNA feature:    ${m.feature_id}  v${m.feature_version}`,
+            `Source bot:     ${m.source_bot} (agent ${m.source_agent_id})`,
+            `Description:    ${m.description}`,
+            `Tags:           ${m.tags.join(", ") || "(none)"}`,
+            `Strategy:       ${a.strategy ?? "abort"}  (abort = refuse on conflict; overwrite = clobber local; rename = keep both)`,
+            `Files (${m.files.length}):`,
+            filesPreview + more,
+        ].join("\n");
+    });
+
+    registerActionDescriber("rollback_dna", (args) => {
+        const a = args as { snapshot_id?: string };
+        if (!a.snapshot_id) return null;
+        return `Rollback to snapshot: ${a.snapshot_id}\n` +
+               `This restores .pi/ from the snapshot (overwrites whatever's there now).`;
+    });
+
     // -------------------------- LLM tools --------------------------
 
     pi.registerTool({

@@ -83,6 +83,34 @@ export default function (pi: ExtensionAPI) {
             metadata: Type.Optional(Type.Object({}, { description: "Optional structured metadata (any JSON-serializable object)" })),
         }),
         async execute(_id, params, _signal, _onUpdate, ctx) {
+            // Refuse to save content that looks like a prompt-injection
+            // payload — memory_search retrieves stored content into future
+            // contexts, so a malicious save is a persistent injection vector.
+            // See audit findings 2026-04-18 (memory_save HIGH).
+            try {
+                const { checkTextForInjection } = await import("./guardrails.js");
+                const check = await checkTextForInjection(params.content);
+                if (check.matched) {
+                    return {
+                        content: [{
+                            type: "text",
+                            text:
+                                `Refusing to save: content matches a prompt-injection pattern ` +
+                                `(similarity ${check.similarity.toFixed(3)}). ` +
+                                `If this is a legitimate fact (e.g. notes about an attack you're studying), ` +
+                                `rephrase to remove imperative-instruction phrasing.`,
+                        }],
+                        isError: true,
+                    };
+                }
+            } catch (e) {
+                // Embedder unavailable — fail OPEN on this path. We don't
+                // want a degraded guardrail to brick legitimate memory saves
+                // for the user. The output redactor still scrubs known
+                // secrets if a save somehow contains one.
+                console.warn(`[memory_save] guardrail check unavailable: ${e instanceof Error ? e.message : String(e)}`);
+            }
+
             const record = await memory.save({
                 content: params.content,
                 tags: params.tags ?? [],

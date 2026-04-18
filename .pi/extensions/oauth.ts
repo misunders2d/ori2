@@ -11,6 +11,7 @@ import {
 } from "../../src/core/oauth.js";
 import { getDispatcher } from "../../src/transport/dispatcher.js";
 import { getWhitelist } from "../../src/core/whitelist.js";
+import { registerActionDescriber } from "./admin_gate.js";
 
 // =============================================================================
 // oauth — Pi extension exposing OAuth slash commands and the LLM-callable
@@ -166,6 +167,14 @@ export default function (pi: ExtensionAPI) {
                     ctx.ui.notify(`Unknown /oauth subcommand: ${sub}. Run /oauth help.`, "error");
             }
         },
+    });
+
+    registerActionDescriber("oauth_authenticated_fetch", (args) => {
+        const a = args as { platform?: string; url?: string; method?: string };
+        if (!a.platform || !a.url) return null;
+        return `OAuth platform: ${a.platform}\n` +
+               `Method:         ${a.method ?? "GET"}\n` +
+               `URL:            ${a.url}`;
     });
 
     // LLM-callable HTTP tool — performs the request with the OAuth access token

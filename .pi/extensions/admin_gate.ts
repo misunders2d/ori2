@@ -69,6 +69,32 @@ export default function (pi: ExtensionAPI) {
         toolAcl.requiredRoles("read"); // touching any tool triggers load() → save() chain
     });
 
+    // Built-in Pi tool action describers — admins approving staged calls
+    // need to see the command/path, not just the tool name.
+    registerActionDescriber("bash", (args) => {
+        const a = args as { command?: string };
+        if (typeof a.command !== "string") return null;
+        const truncated = a.command.length > 600 ? a.command.slice(0, 600) + "…[truncated]" : a.command;
+        return `Command:\n  ${truncated}`;
+    });
+    registerActionDescriber("write", (args) => {
+        const a = args as { path?: string; content?: string };
+        if (typeof a.path !== "string") return null;
+        const sizeHint = typeof a.content === "string" ? ` (${a.content.length} chars)` : "";
+        return `Path:    ${a.path}${sizeHint}`;
+    });
+    registerActionDescriber("edit", (args) => {
+        const a = args as { path?: string };
+        if (typeof a.path !== "string") return null;
+        return `Path:    ${a.path}`;
+    });
+    registerActionDescriber("read", (args) => {
+        const a = args as { path?: string; file_path?: string };
+        const p = a.path ?? a.file_path;
+        if (typeof p !== "string") return null;
+        return `Path:    ${p}`;
+    });
+
     // ---------------- Dispatcher pre-dispatch hook ----------------
 
     dispatcher.addPreDispatchHook((msg) => {
@@ -304,10 +330,21 @@ export default function (pi: ExtensionAPI) {
                         decision.kind === "require_2fa"
                             ? `Approve ${action.token} <6-digit TOTP code>`
                             : `Approve ${action.token}`;
+
+                    // Per-tool description hook lets extensions surface
+                    // human-relevant args in the staging prompt (e.g.,
+                    // apply_dna shows the manifest file list, bash shows
+                    // the command, oauth_authenticated_fetch shows method+URL).
+                    // Falls back to a generic args summary if no describer
+                    // is registered.
+                    const description = describeAction(toolName, toolArgs);
+
                     return {
                         block: true,
                         reason:
-                            `Action staged — admin confirmation required.\n` +
+                            `Action staged — admin confirmation required.\n\n` +
+                            `Tool: ${toolName}\n` +
+                            (description ? `${description}\n\n` : `Args: ${shortArgsSummary(toolArgs)}\n\n`) +
                             `Admin reply: "${replyHint}" within 15 minutes to proceed.`,
                     };
                 } catch (e) {
@@ -856,4 +893,47 @@ function consumeOneShotAllowance(toolName: string, origin: InboundOrigin): boole
         }
     }
     return false;
+}
+
+// =============================================================================
+// Action describers — extensions register a function that turns a tool's args
+// into a human-readable description for the staging prompt. Lets the admin
+// see "applying DNA feature 'kpi-tracker' v1.2 from kpi_bot, files: …" instead
+// of just "Approve ACT-XXXXXX". Critical for any tool whose args carry intent
+// the admin needs to verify (apply_dna manifest, bash command, fetch URL).
+// =============================================================================
+
+type ActionDescriber = (args: unknown) => string | null;
+const ACTION_DESCRIBERS: Map<string, ActionDescriber> = new Map();
+
+/**
+ * Register a per-tool describer. Called by other extensions on session_start.
+ * Returns a multi-line string that admin_gate embeds in the staging-block
+ * reason. Return null if the args can't be described (e.g., import not
+ * found) — admin_gate falls back to the generic shortArgsSummary.
+ */
+export function registerActionDescriber(toolName: string, describer: ActionDescriber): void {
+    ACTION_DESCRIBERS.set(toolName, describer);
+}
+
+function describeAction(toolName: string, args: unknown): string | null {
+    const d = ACTION_DESCRIBERS.get(toolName);
+    if (!d) return null;
+    try {
+        return d(args);
+    } catch (e) {
+        console.warn(`[admin_gate] action describer for ${toolName} threw: ${e instanceof Error ? e.message : String(e)}`);
+        return null;
+    }
+}
+
+/** Generic fallback when no describer is registered. Truncated to keep
+ *  the chat-side staging prompt readable. */
+function shortArgsSummary(args: unknown): string {
+    try {
+        const json = JSON.stringify(args);
+        return json.length > 500 ? json.slice(0, 500) + "…[truncated]" : json;
+    } catch {
+        return "(unrepresentable)";
+    }
 }

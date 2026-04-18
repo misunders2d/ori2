@@ -325,6 +325,39 @@ export class GuardrailEmbedder {
 let _embedderOverride: GuardrailEmbedder | null = null;
 export function __setEmbedderForTests(e: GuardrailEmbedder | null): void {
     _embedderOverride = e;
+    _sharedEmbedder = e;
+}
+
+/**
+ * Process-wide embedder used by the default-export factory AND any other
+ * extension that needs an injection-similarity check (e.g. memory_save
+ * runs the same check on its content arg before persisting). One singleton
+ * keeps embedding cost amortised.
+ */
+let _sharedEmbedder: GuardrailEmbedder | null = null;
+export function getSharedEmbedder(): GuardrailEmbedder {
+    if (_sharedEmbedder) return _sharedEmbedder;
+    _sharedEmbedder = new GuardrailEmbedder(pickBackend());
+    return _sharedEmbedder;
+}
+
+/**
+ * Public injection check for use by other extensions. Returns
+ * `{matched, similarity, fragment?}`. `matched=true` means the text
+ * looks like a prompt-injection attempt (regex hit + semantic match
+ * above threshold). Caller decides how to handle (refuse, warn, log).
+ *
+ * Lazy-loads the corpus on first call so memory_save etc. don't pay the
+ * embedding cost until they actually need a check.
+ */
+export async function checkTextForInjection(
+    text: string,
+): Promise<{ matched: boolean; similarity: number; fragment?: string }> {
+    const embedder = getSharedEmbedder();
+    await embedder.ensureReady();
+    const hit = await scanForInjectionWindow(text, embedder);
+    if (!hit) return { matched: false, similarity: 0 };
+    return { matched: true, similarity: hit.similarity, fragment: hit.fragment };
 }
 
 /**
@@ -354,7 +387,7 @@ async function scanForInjectionWindow(
 }
 
 export default function (pi: ExtensionAPI) {
-    const embedder = _embedderOverride ?? new GuardrailEmbedder(pickBackend());
+    const embedder = _embedderOverride ?? getSharedEmbedder();
 
     // Kick off corpus embedding eagerly on session start so the first user
     // message doesn't pay the model-download + corpus-embed cost. If init

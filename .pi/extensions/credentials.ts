@@ -4,6 +4,7 @@ import { getCredentials, type CredentialAuthType, type CredentialInfo } from "..
 import { currentOrigin } from "../../src/core/identity.js";
 import { getDispatcher } from "../../src/transport/dispatcher.js";
 import { getWhitelist } from "../../src/core/whitelist.js";
+import { registerActionDescriber } from "./admin_gate.js";
 
 // =============================================================================
 // credentials — Pi extension exposing the `/credentials` slash commands and
@@ -199,6 +200,17 @@ export default function (pi: ExtensionAPI) {
                     ctx.ui.notify(`Unknown /credentials subcommand: ${sub}. Run /credentials help.`, "error");
             }
         },
+    });
+
+    // Action describer so the admin sees what URL + method + credential id
+    // they're approving when this fetch is staged. Without it the admin
+    // would see only "Approve ACT-XXXXXX for credentials_authenticated_fetch".
+    registerActionDescriber("credentials_authenticated_fetch", (args) => {
+        const a = args as { credential_id?: string; url?: string; method?: string };
+        if (!a.credential_id || !a.url) return null;
+        return `Credential:  ${a.credential_id}\n` +
+               `Method:      ${a.method ?? "GET"}\n` +
+               `URL:         ${a.url}`;
     });
 
     // LLM-callable HTTP tool — performs the request with the stored credential
