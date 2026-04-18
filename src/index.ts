@@ -19,6 +19,7 @@ import { botDir, botSubdir, ensureDir, getBotName } from "./core/paths.js";
 import { getVault } from "./core/vault.js";
 import { getDispatcher } from "./transport/dispatcher.js";
 import { installChannelRouter } from "./transport/channelRouter.js";
+import { getChannelRuntime } from "./transport/channelRuntime.js";
 import { maybeStartHealthServer } from "./core/healthServer.js";
 import { CliAdapter } from "./transport/cli.js";
 import { TelegramAdapter } from "./transport/telegram.js";
@@ -189,6 +190,10 @@ async function bootstrap() {
     // CLI traffic continues to flow through pushToPi (installed by
     // transport_bridge on session_start).
     installChannelRouter();
+    // Eagerly init the in-process channel runtime (creates Pi services once;
+    // per-channel sessions reuse them). Lazy init on first inbound also works
+    // but pays first-message latency for service construction.
+    await getChannelRuntime().start();
     const startResult = await dispatcher.startAll();
     if (startResult.failed.length > 0) {
         for (const f of startResult.failed) {

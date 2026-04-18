@@ -121,23 +121,41 @@ function abortDetectorHook(msg: Message): { block: true; reason: string } | { bl
     };
 }
 
+// CROSS-SESSION globals — shared across every Pi session that loads this
+// extension. Channel-runtime creates one Pi session per channel; without
+// this guard, dispatcher hooks would accumulate (N sessions = N copies of
+// the same hook) and dispatcher.setPushToPi would race for ownership.
+//
+// First Pi session to load us wins both the global hook + the pushToPi
+// callback. That's typically the parent (TUI / daemon) session, since
+// channel sessions are created lazily on first inbound — well after boot.
+//
+// Backed by the singleton registry (globalThis) so jiti and tsx see the
+// same flag AND clearRegistryForTests() resets it between test cases.
+import { getSingleton, setSingleton } from "../../src/core/singletons.js";
+const HOOK_WIRED_KEY = "transport_bridge.dispatcherWired";
+function isWired(): boolean { return getSingleton<boolean>(HOOK_WIRED_KEY) === true; }
+function markWired(): void { setSingleton(HOOK_WIRED_KEY, true); }
+
+let GLOBAL_LAST_ORIGIN: OriginEntry | null = null;
+
 export default function (pi: ExtensionAPI) {
     const dispatcher = getDispatcher();
 
-    // Run the abort detector FIRST — it must fire before rate-limit or other
-    // side-effecting hooks. Messages that don't target an active plan fall
-    // through unchanged.
-    dispatcher.addPreDispatchHook(abortDetectorHook);
+    if (!isWired()) {
+        markWired();
+        // Run the abort detector FIRST — it must fire before rate-limit or
+        // other side-effecting hooks. Messages that don't target an active
+        // plan fall through unchanged.
+        dispatcher.addPreDispatchHook(abortDetectorHook);
 
-    // Track the originating platform/channel of the most recent inbound message
-    // so that on agent_end we know where to send the response. Sprint 4
-    // replaces this with per-session tracking via custom session entries.
-    let lastOrigin: OriginEntry | null = null;
-
-    pi.on("session_start", async (_event, ctx) => {
         // Wire pushToPi — dispatcher will drain any buffered inbound messages.
+        // This is CLI-inbound only (the dispatcher only invokes pushToPi for
+        // msg.platform === "cli"); non-CLI inbound goes through onActiveResponse
+        // (channelRuntime). Per-channel sessions DON'T need their own pushToPi —
+        // their input arrives via channelRuntime.session.prompt() directly.
         dispatcher.setPushToPi(async (msg) => {
-            lastOrigin = {
+            GLOBAL_LAST_ORIGIN = {
                 platform: msg.platform,
                 channelId: msg.channelId,
                 ...(msg.threadId !== undefined ? { threadId: msg.threadId } : {}),
@@ -145,10 +163,7 @@ export default function (pi: ExtensionAPI) {
                 senderDisplayName: msg.senderDisplayName,
                 timestamp: msg.timestamp,
             };
-            // Persist as a session entry so the response handler on agent_end
-            // can recover origin even after a /reload or branch navigation.
-            // (Defensive — covered by closure variable too.)
-            pi.appendEntry(ENTRY_TYPE, lastOrigin);
+            pi.appendEntry(ENTRY_TYPE, GLOBAL_LAST_ORIGIN);
 
             const header = formatMetadataHeader(msg);
             const attach = formatAttachmentsForPi(msg);
@@ -156,12 +171,17 @@ export default function (pi: ExtensionAPI) {
             // Use followUp so the message is queued and triggers a turn.
             pi.sendUserMessage(body, { deliverAs: "followUp" });
         });
+    }
 
+    pi.on("session_start", async (_event, ctx) => {
         // Restore lastOrigin from the most recent persisted entry, if any.
         // This lets agent_end on a resumed session still route correctly.
+        // Per-session restore — runs for EVERY session bind (parent + every
+        // channel runtime session), which is correct: each session might
+        // resume from a different historical origin.
         for (const entry of ctx.sessionManager.getBranch()) {
             if (entry.type === "custom" && entry.customType === ENTRY_TYPE) {
-                lastOrigin = entry.data as OriginEntry;
+                GLOBAL_LAST_ORIGIN = entry.data as OriginEntry;
             }
         }
     });
@@ -191,7 +211,7 @@ export default function (pi: ExtensionAPI) {
         // are still load-bearing for OTHER consumers (admin_gate uses
         // identity.currentOrigin to learn who's driving a turn for ACL +
         // audit). Just the send-back path here is dead.
-        void lastOrigin; // keeps the closure variable warning at bay
+        void GLOBAL_LAST_ORIGIN; // keeps the closure variable warning at bay
         void extractAssistantText; // ditto for the import
     });
 

@@ -9,6 +9,18 @@ import { evaluate as evaluatePolicy, type Decision } from "../../src/core/policy
 import * as totp from "../../src/core/totp.js";
 import { getAdminNotifier } from "../../src/core/adminNotify.js";
 import { getSecretAccessLog } from "../../src/core/secretAccessLog.js";
+import { getSingleton, setSingleton } from "../../src/core/singletons.js";
+
+// Dispatcher hooks are GLOBAL (one dispatcher singleton across every Pi
+// session). Per-channel sessions re-load this extension; without this
+// guard, hooks accumulate. First session wins.
+//
+// Backed by the cross-module singleton registry (globalThis) so:
+//   - jiti-loaded extension and tsx-loaded src/ see the same flag
+//   - clearRegistryForTests() in tests resets it cleanly between cases
+const HOOK_WIRED_KEY = "admin_gate.dispatcherHookWired";
+function isHookWired(): boolean { return getSingleton<boolean>(HOOK_WIRED_KEY) === true; }
+function markHookWired(): void { setSingleton(HOOK_WIRED_KEY, true); }
 
 // =============================================================================
 // admin_gate — policy enforcement tying whitelist + roles + tool ACL +
@@ -97,7 +109,11 @@ export default function (pi: ExtensionAPI) {
     });
 
     // ---------------- Dispatcher pre-dispatch hook ----------------
-
+    // Singleton-registry guard: dispatcher is a process-wide singleton;
+    // per-channel sessions re-load this extension; without the guard we'd
+    // accumulate N copies of the same hook (each blocking N times per inbound).
+    if (!isHookWired()) {
+        markHookWired();
     dispatcher.addPreDispatchHook((msg) => {
         // Special case 1: /init <passcode> — chat-based admin claim.
         // Handled BEFORE the whitelist gate (the caller is unauthenticated
@@ -161,6 +177,7 @@ export default function (pi: ExtensionAPI) {
         });
         return { block: true, reason: "" }; // empty reason → dispatcher skips reply (silent); see TransportDispatcher.dispatch
     });
+    } // end GLOBAL_DISPATCHER_HOOK_WIRED guard
 
     // ---------------- input event ----------------
     // Intercepts messages BEFORE the LLM runs. Used to:

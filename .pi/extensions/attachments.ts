@@ -352,6 +352,11 @@ export default function (pi: ExtensionAPI) {
     // then daily at 03:00 local time. Idempotent — second start on the same
     // session no-ops thanks to the sweeperScheduled flag.
     pi.on("session_start", async () => {
+        // sweeperScheduled is module-level — first session_start to fire
+        // (typically the parent / TUI session) wins; per-channel sessions
+        // re-bind via channelRuntime and short-circuit here. Idempotency
+        // is process-wide, which is what node-schedule's global registry
+        // wants anyway (one cron per pattern across the whole bot).
         if (sweeperScheduled) return;
         sweeperScheduled = true;
         const ttlDays = resolveTtlDays();

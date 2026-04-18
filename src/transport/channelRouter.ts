@@ -1,106 +1,55 @@
 import fs from "node:fs";
-import { spawn } from "node:child_process";
 import { SessionManager } from "@mariozechner/pi-coding-agent";
 import { getChannelSessions } from "../core/channelSessions.js";
-import { getChannelModels } from "../core/channelModels.js";
 import { getDispatcher } from "./dispatcher.js";
+import { getChannelRuntime } from "./channelRuntime.js";
 import type { Message } from "./types.js";
 import { logError, logWarning } from "../core/errorLog.js";
-import { getVault } from "../core/vault.js";
-
-/** Pi accepts these via `--thinking <level>` (see Pi cli/args.js). */
-const VALID_THINKING_LEVELS: Set<string> = new Set([
-    "off", "minimal", "low", "medium", "high", "xhigh",
-]);
 
 // =============================================================================
 // channelRouter — wires the dispatcher's non-CLI inbound handlers.
 //
-// Two paths:
+// Two paths, both INVISIBLE to adapters (just register an adapter and
+// dispatch as usual; the dispatcher fans out to the right path):
 //
-//   PASSIVE (msg.addressedToBot === false):
-//     Open the channel's session JSONL and append a CustomMessageEntry with
-//     `display: false`. The entry DOES participate in LLM context
-//     (pi-coding-agent/docs/session.md §CustomMessageEntry), so the next
-//     time the bot is addressed in that channel, the agent sees the chain
-//     of prior messages with per-speaker attribution.
+//   ACTIVE (msg.addressedToBot === true):
+//     The agent should respond. Hand off to channelRuntime, which keeps a
+//     long-lived in-process Pi AgentSession per (platform, channelId) and
+//     subscribes to agent_end events to deliver replies via dispatcher.send.
+//     Pi's followUp queue serializes concurrent inbound for the same channel
+//     so a fast-typing user doesn't lose replies. Different channels run in
+//     parallel.
 //
-//   ACTIVE (msg.addressedToBot === true, msg.platform !== "cli"):
-//     Spawn `npx pi -p <kickoff> --session <channel-session-file>` against
-//     the channel's own session. Pi loads the session (including prior
-//     passive entries), adds the mention as the user turn, runs the agent,
-//     and persists both the user message and assistant reply into the
-//     session file. We capture stdout as the assistant text and deliver it
-//     via dispatcher.send() back to the originating adapter.
+//   PASSIVE (msg.addressedToBot === false, channel-allowlisted):
+//     Lurking — append the speaker's message to the channel's session JSONL
+//     as a CustomMessageEntry so future addressed turns have context, but
+//     don't trigger a turn now. Serialized per channel so simultaneous
+//     passives don't interleave.
 //
-// Per-channel serialization:
-//   Two concurrent mentions on the same channel would otherwise race on the
-//   session JSONL. We chain work through `channelLocks: Map<key, Promise>`.
-//   Serialization is PER CHANNEL, not global — different channels still run
-//   in parallel. Fire-and-forget: onActiveResponse returns immediately so
-//   the adapter's poll loop isn't blocked waiting for the subprocess.
-//
-// Pi SDK behaviors verified before implementation:
-//   - SessionManager.open(path) on a non-existent file starts a fresh
-//     in-memory session (session-manager.js:478-482). Safe to call on
-//     channel files that haven't had their first write yet.
-//   - appendCustomMessageEntry(customType, content, display, details)
-//     (session-manager.js:678). content can be string or content blocks.
-//     display=false hides from the TUI (doesn't matter here — the TUI
-//     never opens channel session files — but signals "not a user turn").
-//   - `pi -p <kickoff> --session <file>` uses SessionManager.open for the
-//     session and treats kickoff as the initial user message (main.js
-//     parseArgs → createSessionManager → runPrintMode).
-//   - CRITICAL: Pi's _persist() defers disk writes until an assistant message
-//     exists in the session (session-manager.js:549-567). That's an
-//     optimization to avoid empty "0-turn" files — but it means our passive
-//     entries (which never trigger an assistant turn on their own) would
-//     stay in-memory only and be lost when the next subprocess opens the
-//     file fresh. We work around by force-rewriting the file after every
-//     passive append — see `persistSessionNow` below.
+// HISTORY (deleted in this rewrite):
+//   The active path used to spawn `npx pi -p` per turn — subprocess-per-message.
+//   That model had a fundamental bug: extensions with persistent timers
+//   (attachments cron, node-schedule jobs, etc.) kept the subprocess's event
+//   loop alive past the agent's reply, so the subprocess printed but never
+//   exited. Watchdog + per-extension subprocess-guards were bandaids. The
+//   in-process channelRuntime model matches what production Node agent
+//   frameworks (LiveKit agents-js, OpenCode) actually do.
 // =============================================================================
 
-/** What customType to stamp on passive entries. Namespaced for future greps. */
 const PASSIVE_CUSTOM_TYPE = "chat-context";
 
-/** Per-channel lock promises to serialize writes per channel. */
+// Per-channel serialization for passive ingests. Active turns use Pi's own
+// followUp queue (channelRuntime) instead of channelLocks.
 const channelLocks = new Map<string, Promise<void>>();
-
-/**
- * Active subprocess state per channel. Populated when a `doActiveResponse`
- * starts its spawn, cleared on subprocess exit. Used by the next active
- * arrival to kill the prior in-flight subprocess (ori/-style mid-flight
- * interrupt — see telegram_poller.py:731-756).
- */
-interface ActiveState {
-    controller: AbortController;
-    /** The incoming Message that kicked off this subprocess. Saved as a
-     *  passive context entry if interrupted, so the agent sees what was
-     *  being asked when it got cut off. */
-    kickoffMsg: Message;
-}
-const activeSubprocesses = new Map<string, ActiveState>();
-
-// NOTE: We deliberately do NOT do pre-dispatch cancel-word detection
-// ("cancel"/"stop"/etc). Language-dependent regex would exclude every
-// non-English speaker. Instead, every active mention:
-//   (1) kills the prior subprocess for this channel (if any),
-//   (2) saves the prior mention as a passive context entry,
-//   (3) spawns a FRESH subprocess with the new mention.
-// The new subprocess's LLM sees the interrupted prior mention + the new
-// text and interprets intent (including "cancel" in any language) — that's
-// what the LLM is good at. Cost: one short LLM turn for what could have
-// been a regex short-circuit. Benefit: works for every language the model
-// understands.
 
 function channelKey(platform: string, channelId: string): string {
     return `${platform}:${channelId}`;
 }
 
 /**
- * Run `fn` after any currently-queued work on this channel finishes.
+ * Run `fn` after any currently-queued passive work on this channel finishes.
  * Returns immediately — the work happens fire-and-forget so the adapter's
- * poll loop isn't blocked behind the subprocess.
+ * poll loop isn't blocked behind a passive write.
  */
 function enqueueForChannel(platform: string, channelId: string, fn: () => Promise<void>): void {
     const key = channelKey(platform, channelId);
@@ -114,8 +63,7 @@ function enqueueForChannel(platform: string, channelId: string, fn: () => Promis
 /**
  * Format a passive message as a short sender-attributed line the agent can
  * read naturally: `"Alice: Bob just said it was a good movie"`. Attachments
- * are hinted textually (images/documents not inlined in v1 — see module
- * docstring tradeoffs).
+ * are hinted textually.
  */
 function formatPassiveContent(msg: Message): string {
     const parts: string[] = [];
@@ -131,37 +79,14 @@ function formatPassiveContent(msg: Message): string {
 }
 
 /**
- * Build the kickoff text for an ACTIVE response. The channel session already
- * contains prior passive entries per speaker, so the kickoff is just the
- * current speaker's message with a minimal attribution header.
- */
-function formatActiveKickoff(msg: Message): string {
-    const header = `[${msg.platform} inbound | from: ${msg.senderDisplayName} (${msg.senderId}) | channel: ${msg.channelId}]`;
-    const body = msg.text || "(no text)";
-    const attach = (msg.attachments ?? []).map((a) => {
-        if (a.kind === "image") return `[attached image: ${a.filename ?? a.mimeType}]`;
-        if (a.kind === "text") return `[attached document: ${a.filename ?? a.mimeType}]\n${a.text}`;
-        return `[attached file: ${a.filename ?? a.mimeType} @ ${a.localPath}]`;
-    });
-    return attach.length > 0 ? `${header}\n${body}\n\n${attach.join("\n")}` : `${header}\n${body}`;
-}
-
-/**
  * PASSIVE path: append to the channel session as a CustomMessageEntry. The
  * entry appears in LLM context on next active run in this channel but does
- * not trigger anything now.
+ * not trigger anything now. Pre-flight injection scan tags suspicious
+ * messages so the agent treats them as DATA, not instructions.
  */
 async function doPassiveContext(msg: Message): Promise<void> {
     const sessionFile = getChannelSessions().getOrCreateSessionFile(msg.platform, msg.channelId);
 
-    // Pre-flight injection scan on the inbound text. Group-chat passive
-    // ingests bypass admin_gate but they DO end up in the channel's session
-    // and become context for the next active turn (when a whitelisted user
-    // mentions the bot). A non-whitelisted member can plant prompt-injection
-    // content this way. We tag the entry with [GUARDRAIL: suspicious] so the
-    // LLM sees the warning in the next active turn — better than silently
-    // dropping (which loses legitimate-but-quirky content) and better than
-    // unconditionally accepting (which is the audit-flagged hole).
     let scanTag: string | null = null;
     try {
         const { checkTextForInjection } = await import("../../.pi/extensions/guardrails.js");
@@ -176,9 +101,6 @@ async function doPassiveContext(msg: Message): Promise<void> {
             });
         }
     } catch (e) {
-        // Guardrail unavailable → fail open. This path is high-volume; we
-        // don't want to drop legitimate group-chat traffic on a degraded
-        // embedder.
         logWarning("channelRouter", "passive guardrail check unavailable", { err: e instanceof Error ? e.message : String(e) });
     }
 
@@ -211,379 +133,62 @@ async function doPassiveContext(msg: Message): Promise<void> {
 
 /**
  * Force the entry we JUST appended (via sm.appendX) to disk, bypassing Pi's
- * hasAssistant gating (session-manager.js:549-567). Append-only (O(1) per
- * call) so it NEVER overwrites work a concurrent subprocess is doing on the
- * same JSONL — critical because our active subprocess runs in parallel with
- * passive ingests for the same channel.
- *
- * TypeScript `private` is compile-only; `fileEntries` is accessible at
- * runtime. Verified at session-manager.js:436 (`fileEntries = []`).
- *
- * For a fresh session file (doesn't exist yet) we write header + entries
- * with writeFileSync — safe because if the file doesn't exist, nothing else
- * is writing to it either.
+ * hasAssistant gating (session-manager.js:549-567). Append-only so it never
+ * overwrites work a concurrent active turn may be doing on the same JSONL.
  */
 function persistSessionNow(sm: SessionManager, sessionFile: string): void {
     const entries = (sm as unknown as { fileEntries: unknown[] }).fileEntries;
     if (entries.length === 0) return;
     if (fs.existsSync(sessionFile)) {
-        // File exists — someone (or a prior run) has already written at
-        // least the header. Append only the new entry.
         const last = entries[entries.length - 1];
         fs.appendFileSync(sessionFile, JSON.stringify(last) + "\n");
     } else {
-        // Fresh file — write everything (header + the one entry we just added).
         const jsonl = entries.map((e) => JSON.stringify(e)).join("\n") + "\n";
         fs.writeFileSync(sessionFile, jsonl);
     }
 }
 
 /**
- * ACTIVE path: spawn `npx pi -p <kickoff> --session <file>`, capture stdout,
- * deliver via dispatcher.send().
+ * Wire the dispatcher's two non-CLI handlers. Call ONCE at boot AFTER adapters
+ * are registered (so dispatcher.send() has the target adapters available).
  *
- * Exported for test injection — tests provide a fake `spawnFn` to avoid
- * actually invoking the pi binary.
+ * Active path delegates to channelRuntime — the in-process per-channel
+ * AgentSession orchestrator. Passive path runs inline (just appends to the
+ * channel's JSONL).
  */
-export interface SpawnResult {
-    stdout: string;
-    stderr: string;
-    exitCode: number | null;
-}
-
-/**
- * Spawn contract: given kickoff text + session file + extra CLI args + an
- * AbortSignal, run the pi -p subprocess and resolve when it exits. If
- * `signal.abort()` fires mid-run, the implementation MUST terminate the
- * child (SIGTERM) and resolve with whatever has been captured (exitCode may
- * be null on signal-kill). The promise should NOT reject on abort — callers
- * distinguish outcomes via the returned SpawnResult, not via throws.
- *
- * `extraArgs` is forwarded verbatim after `--session`. Used by the router
- * to pass per-channel overrides like `--model anthropic/claude-opus-4-5`.
- */
-export type SpawnPiPrint = (
-    kickoff: string,
-    sessionFile: string,
-    extraArgs: string[],
-    signal: AbortSignal,
-) => Promise<SpawnResult>;
-
-/**
- * Hard ceiling on how long a single subprocess turn may take before we
- * SIGTERM it. Beyond this, the user is staring at "thinking" with no signal
- * for too long. 120s covers slow models + warm-up; anything longer is
- * almost certainly a hang (network stall, embedder init wedge, deadlock).
- *
- * Operator override via vault SUBPROCESS_TIMEOUT_MS (e.g. set higher when
- * intentionally running a slow chain-of-thought on a small model).
- */
-const DEFAULT_SUBPROCESS_TIMEOUT_MS = 120_000;
-
-function subprocessTimeoutMs(): number {
-    try {
-        // Lazy require — subprocess module loads vault module which loads paths
-        // module; doing this at module top would force eager init in test envs
-        // that don't construct a vault.
-        // eslint-disable-next-line @typescript-eslint/no-require-imports
-        const { getVault } = require("../core/vault.js") as typeof import("../core/vault.js");
-        const raw = getVault().get("SUBPROCESS_TIMEOUT_MS");
-        const n = raw ? parseInt(raw, 10) : NaN;
-        if (Number.isFinite(n) && n > 1_000) return n;
-    } catch { /* vault unavailable in some test contexts; fall through */ }
-    return DEFAULT_SUBPROCESS_TIMEOUT_MS;
-}
-
-const realSpawnPiPrint: SpawnPiPrint = (kickoff, sessionFile, extraArgs, signal) =>
-    new Promise<SpawnResult>((resolve) => {
-        const proc = spawn(
-            "npx",
-            ["pi", "-p", kickoff, "--session", sessionFile, ...extraArgs],
-            {
-                cwd: process.cwd(),
-                // ORI2_SCHEDULER_SUBPROCESS=1 prevents the child's scheduler
-                // extension from rehydrating the parent's jobs dir into its
-                // own node-schedule. Parent owns job lifecycle; subprocesses
-                // are just transient executors. See scheduler.ts session_start.
-                env: { ...process.env, ORI2_SCHEDULER_SUBPROCESS: "1" },
-                stdio: ["ignore", "pipe", "pipe"],
-                detached: false,
-            },
-        );
-        let stdout = "";
-        let stderr = "";
-        let timedOut = false;
-        proc.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
-        proc.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
-
-        // Watchdog — kill the subprocess if it runs longer than the ceiling.
-        // SIGTERM first; if it doesn't die in 5s, SIGKILL. Captured output
-        // (whatever Pi printed before hanging) IS still in stdout/stderr and
-        // gets returned via the close handler so the caller / errors.jsonl
-        // sees what the subprocess was doing before it stalled.
-        const watchdog = setTimeout(() => {
-            timedOut = true;
-            try { proc.kill("SIGTERM"); } catch { /* already gone */ }
-            setTimeout(() => { try { proc.kill("SIGKILL"); } catch { /* already gone */ } }, 5_000).unref();
-        }, subprocessTimeoutMs());
-        watchdog.unref();
-
-        proc.on("close", (code) => {
-            clearTimeout(watchdog);
-            if (timedOut) {
-                stderr += `\n[channelRouter] WATCHDOG: subprocess exceeded ${subprocessTimeoutMs()}ms — sent SIGTERM. ` +
-                          `Captured stdout (${stdout.length}B) and stderr (${stderr.length}B) up to that point are returned.`;
-            }
-            resolve({ stdout, stderr, exitCode: code });
-        });
-        proc.on("error", (e) => {
-            clearTimeout(watchdog);
-            resolve({ stdout, stderr: `${stderr}\nspawn error: ${e.message}`, exitCode: null });
-        });
-
-        const onAbort = () => {
-            // SIGTERM gives the process a chance to flush. Pi's SessionManager
-            // writes on each entry via appendFileSync, so partial state is on
-            // disk regardless — SIGKILL would only risk a torn JSONL line.
-            try { proc.kill("SIGTERM"); } catch { /* already dead */ }
-        };
-        if (signal.aborted) onAbort();
-        else signal.addEventListener("abort", onAbort, { once: true });
+export function installChannelRouter(): void {
+    const d = getDispatcher();
+    // Passive ingests serialize per channel so concurrent passives on the
+    // same channel don't interleave.
+    d.setOnPassiveContext((msg) => {
+        enqueueForChannel(msg.platform, msg.channelId, () => doPassiveContext(msg));
     });
-
-async function doActiveResponse(msg: Message, spawnFn: SpawnPiPrint): Promise<void> {
-    const key = channelKey(msg.platform, msg.channelId);
-    const sessionFile = getChannelSessions().getOrCreateSessionFile(msg.platform, msg.channelId);
-
-    // ---------------- Mid-flight interrupt (ori/-style) ----------------
-    //
-    // If a subprocess is already running for this channel, cut it off:
-    // save the prior kickoff as a passive context entry (so the agent later
-    // sees what the user had been asking when interrupted), then abort the
-    // AbortController to SIGTERM the child. The serialization enqueue
-    // pattern would otherwise make us wait 5+ seconds for the prior turn
-    // to complete — fine for scheduled work, awful for chat UX.
-    //
-    // Pattern port reference: ori/interfaces/telegram_poller.py:731-756.
-    const prev = activeSubprocesses.get(key);
-    if (prev) {
-        try {
-            const psm = SessionManager.open(sessionFile);
-            psm.appendCustomMessageEntry(
-                PASSIVE_CUSTOM_TYPE,
-                `${prev.kickoffMsg.senderDisplayName} (interrupted): ${prev.kickoffMsg.text}`,
-                false,
-                {
-                    platform: prev.kickoffMsg.platform,
-                    channelId: prev.kickoffMsg.channelId,
-                    senderId: prev.kickoffMsg.senderId,
-                    senderDisplayName: prev.kickoffMsg.senderDisplayName,
-                    timestamp: prev.kickoffMsg.timestamp,
-                    interrupted: true,
-                },
-            );
-            persistSessionNow(psm, sessionFile);
-        } catch (e) {
-            logWarning("channelRouter", "failed to save interrupted kickoff as context", {
+    // Active responses delegate to channelRuntime. channelRuntime keeps a
+    // long-lived AgentSession per channel and uses Pi's followUp queue to
+    // serialize concurrent inbound within the same channel; replies are
+    // delivered via the agent_end event subscription back to dispatcher.send.
+    d.setOnActiveResponse((msg) => {
+        void getChannelRuntime().handleActiveInbound(msg).catch((e) => {
+            logError("channelRouter", "channelRuntime.handleActiveInbound threw", {
                 err: e instanceof Error ? e.message : String(e),
                 platform: msg.platform,
                 channelId: msg.channelId,
             });
-        }
-        prev.controller.abort();
-        activeSubprocesses.delete(key);
-    }
-
-    // Seed a transport-origin CustomEntry before spawning so that tools in
-    // the subprocess can call currentOrigin() and learn who this active turn
-    // came from (e.g. schedule_reminder needs deliverTarget; admin_gate
-    // checks msg origin against the whitelist). Without this, the channel
-    // session has only `chat-context` CustomMessageEntries with embedded
-    // sender attribution in text — not machine-readable, and not at the
-    // type the identity helper looks for (see src/core/identity.ts).
-    try {
-        const sm = SessionManager.open(sessionFile);
-        sm.appendCustomEntry("transport-origin", {
-            platform: msg.platform,
-            channelId: msg.channelId,
-            ...(msg.threadId !== undefined ? { threadId: msg.threadId } : {}),
-            senderId: msg.senderId,
-            senderDisplayName: msg.senderDisplayName,
-            timestamp: msg.timestamp,
         });
-        persistSessionNow(sm, sessionFile);
-    } catch (e) {
-        // Seeding origin is best-effort — spawn proceeds even if it fails.
-        // Worst case: subprocess tools fall back to CLI origin, which still
-        // works for the common summarization path (no tools that need the
-        // per-message origin are invoked).
-        logWarning("channelRouter", "transport-origin seed failed — proceeding", {
-            err: e instanceof Error ? e.message : String(e),
-            platform: msg.platform,
-            channelId: msg.channelId,
-        });
-    }
-
-    const kickoff = formatActiveKickoff(msg);
-
-    // Per-channel model preference, set by agent tools (see
-    // .pi/extensions/agent_introspection.ts → set_channel_model). Absent =
-    // use Pi's default from settings.json for the spawned subprocess.
-    // Pi's --model flag accepts "<provider>/<modelId>" and an optional
-    // ":<thinkingLevel>" suffix, verified at
-    // node_modules/@mariozechner/pi-coding-agent/dist/cli/args.js:41-66.
-    const extraArgs: string[] = [];
-    const modelPref = getChannelModels().get(msg.platform, msg.channelId);
-    if (modelPref) {
-        const suffix = modelPref.thinkingLevel ? `:${modelPref.thinkingLevel}` : "";
-        extraArgs.push("--model", `${modelPref.provider}/${modelPref.modelId}${suffix}`);
-    }
-
-    // Bot-wide thinking level — vault key THINKING_LEVEL accepts Pi's values
-    // (off / minimal / low / medium / high / xhigh). Default is "off" because
-    // thinking-mode models on small inputs ("hey") burn 30+ seconds before
-    // emitting any text — bad UX for chat. Operators / agents toggle via
-    // the set_thinking_mode tool. Per-channel modelPref's thinkingLevel
-    // (if set) wins over this bot-wide default.
-    if (!modelPref?.thinkingLevel) {
-        const level = (getVault().get("THINKING_LEVEL") ?? "off").toLowerCase();
-        if (VALID_THINKING_LEVELS.has(level)) {
-            extraArgs.push("--thinking", level);
-        }
-    }
-
-    // Typing indicator — fires every 4s while the subprocess runs so the
-    // user sees the bot is alive. Cancelled in finally{} below regardless
-    // of outcome (success, abort, timeout, exception). Pattern ported from
-    // amazon_manager/interfaces/telegram_poller.py:284-289.
-    const adapter = getDispatcher().getAdapter(msg.platform);
-    let typingTimer: NodeJS.Timeout | null = null;
-    if (adapter?.sendTyping) {
-        const fire = () => { void adapter.sendTyping!(msg.channelId).catch(() => {}); };
-        fire(); // immediate first ping so user sees it within ~50ms, not 4s
-        typingTimer = setInterval(fire, 4_000);
-        typingTimer.unref();
-    }
-
-    const controller = new AbortController();
-    activeSubprocesses.set(key, { controller, kickoffMsg: msg });
-    let result: SpawnResult;
-    try {
-        result = await spawnFn(kickoff, sessionFile, extraArgs, controller.signal);
-    } finally {
-        if (typingTimer) clearInterval(typingTimer);
-        // Only clear if we're still the registered controller — a later
-        // interrupt may have replaced us with a fresh one.
-        const current = activeSubprocesses.get(key);
-        if (current && current.controller === controller) {
-            activeSubprocesses.delete(key);
-        }
-    }
-
-    // If we were aborted, the subprocess was killed — DON'T deliver its
-    // truncated stdout. The next active response (already enqueued by the
-    // same interrupt that killed us) will produce the real answer.
-    if (controller.signal.aborted) return;
-
-    // Distinguish watchdog-timeout vs other errors so we can give the user
-    // a useful message instead of silence (which trains them to think the
-    // bot just doesn't reply). Watchdog signature is in the stderr tail.
-    const timedOut = result.stderr.includes("WATCHDOG:");
-    if (timedOut) {
-        logError("channelRouter", "subprocess WATCHDOG timeout — sending user-facing failure", {
-            platform: msg.platform,
-            channelId: msg.channelId,
-            stdout_tail: result.stdout.slice(-500),
-            stderr_tail: result.stderr.slice(-500),
-        });
-        try {
-            await getDispatcher().send(msg.platform, msg.channelId, {
-                text: `⏱  I took too long to respond and was interrupted. Try again, simplify the request, or check /log recent for what got stuck.`,
-                ...(msg.threadId ? { replyToMessageId: msg.threadId } : {}),
-            });
-        } catch { /* best effort */ }
-        return;
-    }
-    if (result.exitCode !== 0) {
-        logError("channelRouter", "subprocess non-zero exit — sending user-facing failure", {
-            platform: msg.platform,
-            channelId: msg.channelId,
-            exitCode: result.exitCode,
-            stderr_tail: result.stderr.slice(-500),
-        });
-        try {
-            await getDispatcher().send(msg.platform, msg.channelId, {
-                text: `⚠️  Sorry, internal error processing your message (subprocess exit ${result.exitCode}). Operator can check /log recent / errors.jsonl.`,
-                ...(msg.threadId ? { replyToMessageId: msg.threadId } : {}),
-            });
-        } catch { /* best effort */ }
-        return;
-    }
-    const text = result.stdout.trim();
-    if (!text) {
-        logError("channelRouter", "subprocess produced no stdout — sending user-facing failure", {
-            platform: msg.platform,
-            channelId: msg.channelId,
-            stderr_tail: result.stderr.slice(-500),
-        });
-        try {
-            await getDispatcher().send(msg.platform, msg.channelId, {
-                text: `🤔  My agent ran but produced no reply. Please retry or rephrase. (Operator: check errors.jsonl for the stderr tail.)`,
-                ...(msg.threadId ? { replyToMessageId: msg.threadId } : {}),
-            });
-        } catch { /* best effort */ }
-        return;
-    }
-    try {
-        const resp: { text: string; replyToMessageId?: string } = { text };
-        if (msg.threadId) resp.replyToMessageId = msg.threadId;
-        await getDispatcher().send(msg.platform, msg.channelId, resp);
-    } catch (e) {
-        logError("channelRouter", "delivery failed", {
-            err: e instanceof Error ? e.message : String(e),
-            platform: msg.platform,
-            channelId: msg.channelId,
-        });
-    }
-}
-
-/**
- * Wire the channel router into the dispatcher. Call once during bootstrap
- * AFTER adapters are registered (so dispatcher.send() has the target
- * adapter) and AFTER channelSessions is available.
- *
- * `spawnFn` is test-injectable; production callers pass no arg and get the
- * real `npx pi -p` spawn.
- */
-export function installChannelRouter(spawnFn: SpawnPiPrint = realSpawnPiPrint): void {
-    const d = getDispatcher();
-    // Passive ingests serialize per channel so concurrent passives on the
-    // same channel don't interleave (quick, never blocks the adapter).
-    d.setOnPassiveContext((msg) => {
-        enqueueForChannel(msg.platform, msg.channelId, () => doPassiveContext(msg));
-    });
-    // Active responses DO NOT serialize. A new mention on a channel that's
-    // already running a subprocess must interrupt it — queueing behind would
-    // mean the user waits 5s+ for their "never mind" / "actually something
-    // else" to even start being processed. doActiveResponse handles the
-    // kill-prior + spawn-new pattern inline (see its body).
-    d.setOnActiveResponse((msg) => {
-        void doActiveResponse(msg, spawnFn);
     });
 }
 
+// ----- test helpers (passive path; active uses channelRuntime test surface) -----
+
 /**
- * Test-only: wait for all currently queued per-channel work to drain. Lets
- * tests assert on post-enqueue state without busy-polling.
+ * Test-only: wait for all currently queued passive per-channel work to drain.
  */
 export async function __drainChannelLocksForTests(): Promise<void> {
-    // Snapshot — channelLocks may be reassigned during drain as new work
-    // enqueues behind existing promises.
     const all = Array.from(channelLocks.values());
     await Promise.allSettled(all);
 }
 
-/** Test-only: clear the per-channel lock state. */
+/** Test-only: clear the per-channel passive lock state. */
 export function __resetChannelLocksForTests(): void {
     channelLocks.clear();
 }
