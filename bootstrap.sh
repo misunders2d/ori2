@@ -372,21 +372,30 @@ fi
 step "Writing start.sh launcher"
 cat > "$INSTALL_DIR/start.sh" <<'LAUNCHER_EOF'
 #!/usr/bin/env bash
-# ori2 launcher. Sources nvm if it's installed but not yet on PATH (typical
-# right after bootstrap.sh runs in the same shell), then `npm run start`s
-# from the bot's install dir. Pass-through args go to npm.
+# ori2 launcher. ALWAYS sources nvm if it's installed — system Node may
+# exist on PATH but be too old (Debian/Ubuntu ships Node 18, ori2 needs
+# 22+). Sourcing nvm and `nvm use` puts the nvm-managed Node first on PATH.
+# After that we verify the active Node is 22+ and fail loud if not.
 set -e
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$DIR"
-if ! command -v node >/dev/null 2>&1; then
-    if [[ -s "$HOME/.nvm/nvm.sh" ]]; then
-        export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
-        # shellcheck source=/dev/null
-        . "$NVM_DIR/nvm.sh"
-    fi
+if [[ -s "$HOME/.nvm/nvm.sh" ]]; then
+    export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+    # shellcheck source=/dev/null
+    . "$NVM_DIR/nvm.sh"
+    # Use the most recent installed Node >= 22 if any. nvm-use without an
+    # arg picks the default-aliased version; fall back to explicit 22.
+    nvm use --lts >/dev/null 2>&1 || nvm use 22 >/dev/null 2>&1 || true
 fi
-if ! command -v npm >/dev/null 2>&1; then
-    echo "✖ npm not found. Install Node 22+ (see INSTALL.md) and re-run." >&2
+if ! command -v node >/dev/null 2>&1; then
+    echo "✖ Node not found. Install Node 22+ (see INSTALL.md) and re-run." >&2
+    exit 1
+fi
+NODE_MAJOR=$(node -p "process.versions.node.split('.')[0]" 2>/dev/null || echo 0)
+if [[ "$NODE_MAJOR" -lt 22 ]]; then
+    echo "✖ ori2 needs Node 22+. Active Node is $(node -v)." >&2
+    echo "  If you installed via nvm, run: nvm install 22 && nvm use 22" >&2
+    echo "  Then retry ./start.sh" >&2
     exit 1
 fi
 exec npm run start -- "$@"
@@ -534,10 +543,11 @@ printf '\n'
 printf '%s──────────── WHAT TO DO NEXT — pick one ────────────%s\n' "$C_BOLD$C_CYAN" "$C_RESET"
 printf '\n'
 if [[ "$INSTALLED_NVM" -eq 1 ]]; then
-    printf '%s! Node was just installed via nvm in this terminal session.%s\n' "$C_YELLOW" "$C_RESET"
-    printf '  Bare %snpm%s commands will not work here until you open a NEW terminal\n' "$C_BOLD" "$C_RESET"
-    printf '  (or run %ssource ~/.nvm/nvm.sh%s).  The %s./start.sh%s launcher below\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
-    printf '  sources nvm for you, so it works in either case.\n'
+    printf '%s! Node 22+ was just installed via nvm in this terminal session.%s\n' "$C_YELLOW" "$C_RESET"
+    printf '  Your CURRENT terminal still resolves %snode%s/%snpm%s to the OLD version\n' "$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET"
+    printf '  (or none at all) — nvm only auto-loads in NEW shells.  Use\n'
+    printf '  %s./start.sh%s below: it sources nvm itself and picks the right Node.\n' "$C_BOLD" "$C_RESET"
+    printf '  %s(Or open a new terminal first, then `npm run start` works too.)%s\n' "$C_DIM" "$C_RESET"
     printf '\n'
 fi
 printf '%s▸ TALK TO IT IN YOUR TERMINAL%s %s(simplest)%s\n' "$C_BOLD$C_YELLOW" "$C_RESET" "$C_DIM" "$C_RESET"

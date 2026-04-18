@@ -7,6 +7,7 @@
     "postinstall": "node scripts/postinstall-prewarm.cjs",
     "prewarm": "node scripts/postinstall-prewarm.cjs",
     "test": "node --import tsx --test --test-reporter=spec $(find src -type f -name '*.test.ts')",
+    "prestart": "node scripts/check-node.cjs",
     "start": "tsx src/index.ts"
   },
   "keywords": [],
