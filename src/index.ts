@@ -27,7 +27,7 @@ import path from "node:path";
 import { randomBytes } from "node:crypto";
 import { getA2AAdapter } from "./a2a/adapter.js";
 import { setA2AServerHandle, startA2AServer, type A2AServerHandle } from "./a2a/server.js";
-import { TunnelManager, type TunnelMode } from "./a2a/tunnel.js";
+import { TunnelManager, resolveCloudflaredPath, type TunnelMode } from "./a2a/tunnel.js";
 import { broadcastAddressUpdate } from "./a2a/broadcaster.js";
 import { logError, logWarning } from "./core/errorLog.js";
 import { startProactiveDiagnostics } from "./core/proactiveDiagnostics.js";
@@ -340,10 +340,26 @@ async function bootstrap() {
 
 async function startA2A(botName: string): Promise<void> {
     const vault = getVault();
-    const mode = ((vault.get("A2A_TUNNEL_MODE") ?? "cloudflared") as TunnelMode);
+
+    // Mode resolution:
+    //   - vault.A2A_TUNNEL_MODE explicit override (cloudflared / external / disabled)
+    //   - else: auto — "cloudflared" if the binary is detected on the system,
+    //     else "disabled" (no scary ENOENT, no diagnostic DEGRADED).
+    const explicitMode = vault.get("A2A_TUNNEL_MODE");
+    const cfPath = resolveCloudflaredPath(vault.get("A2A_CLOUDFLARED_PATH"));
+    const mode: TunnelMode = (explicitMode as TunnelMode | undefined)
+        ?? (cfPath ? "cloudflared" : "disabled");
+
     if (mode === "disabled") {
-        console.log("🛰  A2A: disabled via vault A2A_TUNNEL_MODE=disabled");
+        if (explicitMode === "disabled") {
+            console.log("🛰  A2A: disabled (vault A2A_TUNNEL_MODE=disabled).");
+        } else {
+            console.log("🛰  A2A: disabled (no cloudflared binary detected). Install cloudflared to enable peer federation, OR set vault A2A_TUNNEL_MODE=external + A2A_BASE_URL if you have your own tunnel.");
+        }
         return;
+    }
+    if (mode === "cloudflared" && cfPath) {
+        console.log(`🛰  A2A: cloudflared resolved at ${cfPath}`);
     }
 
     const externalUrl = vault.get("A2A_BASE_URL");
@@ -413,11 +429,14 @@ async function startA2A(botName: string): Promise<void> {
     vault.set("A2A_BIND_PORT", String(handle.boundPort));
     console.log(`🛰  A2A: server bound on ${bindHost}:${handle.boundPort}`);
 
-    // Tunnel.
+    // Tunnel. Pass the resolved cloudflared path so we don't fall back to a
+    // bare "cloudflared" PATH lookup at spawn time (which fails on systemd /
+    // launchd / minimal-PATH contexts even when the binary is installed).
     const tunnel = new TunnelManager({
         mode,
         localPort: handle.boundPort,
         ...(externalUrl !== undefined ? { externalUrl } : {}),
+        ...(cfPath ? { cloudflaredPath: cfPath } : {}),
     });
     tunnel.on("url-ready", (url: string) => {
         vault.set("A2A_BASE_URL", url);

@@ -207,7 +207,7 @@ function a2aHealthLocal(): HealthReport["a2a"] {
     const handle = getA2AServerHandle();
     const adapter = getA2AAdapter();
     const friends = getFriends().list();
-    const tunnelMode = getVault().get("A2A_TUNNEL_MODE") ?? "cloudflared";
+    const tunnelMode = getVault().get("A2A_TUNNEL_MODE") ?? "disabled";
     const out: HealthReport["a2a"] = {
         running: !!handle,
         friend_count: friends.length,

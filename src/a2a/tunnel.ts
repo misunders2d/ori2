@@ -1,4 +1,5 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { accessSync, constants as fsConstants } from "node:fs";
 import { EventEmitter } from "node:events";
 import { writeHeartbeat } from "../core/heartbeat.js";
 import { logError, logWarning } from "../core/errorLog.js";
@@ -33,8 +34,52 @@ export interface TunnelOptions {
     localPort: number;
     /** For mode="external" — the URL the operator already configured. */
     externalUrl?: string;
-    /** Path to cloudflared binary. Default: "cloudflared" (resolved on PATH). */
+    /** Path to cloudflared binary. Default: resolveCloudflaredPath() — searches
+     *  PATH and a list of common install locations. Set explicitly only when
+     *  the binary is in a non-standard location. */
     cloudflaredPath?: string;
+}
+
+/**
+ * Locate the cloudflared binary, searching:
+ *   1. The supplied override (if any).
+ *   2. PATH (`which cloudflared` equivalent via spawnSync).
+ *   3. Common install locations operators forget to add to PATH:
+ *      /usr/local/bin, /usr/bin, /opt/homebrew/bin (mac arm),
+ *      /home/linuxbrew/.linuxbrew/bin, $HOME/.local/bin,
+ *      /opt/cloudflared/cloudflared, /snap/bin.
+ *
+ * Returns the first existing executable path, or null if none found.
+ * Pure / sync — safe to call at startup.
+ */
+export function resolveCloudflaredPath(override?: string): string | null {
+    const candidates: string[] = [];
+    if (override && override.trim()) candidates.push(override.trim());
+    // PATH search via `command -v` is more portable than `which` (busybox/Alpine).
+    try {
+        const r = spawnSync("/bin/sh", ["-c", "command -v cloudflared"], { encoding: "utf-8" });
+        const found = r.stdout?.trim();
+        if (r.status === 0 && found) candidates.push(found);
+    } catch { /* fall through to fixed-path probes */ }
+    // Common install locations.
+    candidates.push(
+        "/usr/local/bin/cloudflared",
+        "/usr/bin/cloudflared",
+        "/opt/homebrew/bin/cloudflared",
+        "/home/linuxbrew/.linuxbrew/bin/cloudflared",
+        `${process.env["HOME"] ?? ""}/.local/bin/cloudflared`,
+        "/opt/cloudflared/cloudflared",
+        "/snap/bin/cloudflared",
+    );
+    // Sync fs probe — accept the first that exists and is executable.
+    for (const p of candidates) {
+        if (!p) continue;
+        try {
+            accessSync(p, fsConstants.X_OK);
+            return p;
+        } catch { /* try next */ }
+    }
+    return null;
 }
 
 const BACKOFF_SCHEDULE_MS = [1000, 2000, 4000, 8000, 16000, 32000, 60000];
@@ -62,7 +107,14 @@ export class TunnelManager extends EventEmitter {
         this.mode = opts.mode;
         this.localPort = opts.localPort;
         this.externalUrl = opts.externalUrl;
-        this.cloudflaredPath = opts.cloudflaredPath ?? "cloudflared";
+        // Resolve at construction so the spawn site doesn't fail with a
+        // cryptic ENOENT when cloudflared is installed but not in PATH.
+        // Fall back to bare "cloudflared" only when nothing was found —
+        // spawn will then ENOENT loudly with a path resolution we can't help.
+        this.cloudflaredPath =
+            (opts.cloudflaredPath && opts.cloudflaredPath.trim())
+            || resolveCloudflaredPath()
+            || "cloudflared";
     }
 
     /**
