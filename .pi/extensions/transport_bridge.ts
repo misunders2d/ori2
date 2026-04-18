@@ -226,14 +226,28 @@ export default function (pi: ExtensionAPI) {
             let me: BotInfo | null = null;
             try {
                 const res = await fetch(`https://api.telegram.org/bot${token}/getMe`);
-                const json = (await res.json()) as { ok: boolean; result?: BotInfo; description?: string };
+                const json = (await res.json()) as { ok: boolean; result?: BotInfo; description?: string; error_code?: number };
                 if (!json.ok || !json.result) {
-                    ctx.ui.notify(`Invalid token: ${json.description ?? "Telegram rejected the token"}`, "error");
+                    // Disambiguate the most common cause: Telegram returns
+                    // `"description":"Not Found"` (bare, no context) when the
+                    // token doesn't match any bot. Operators read that as
+                    // "vault not found" — actually it means BotFather doesn't
+                    // recognize this token.
+                    const desc = (json.description ?? "").trim();
+                    let msg: string;
+                    if (json.error_code === 401 || /unauthorized/i.test(desc)) {
+                        msg = `Telegram says the token is unauthorized. Likely revoked — get a fresh one from @BotFather.`;
+                    } else if (json.error_code === 404 || /^not found$/i.test(desc)) {
+                        msg = `Telegram says no bot exists for this token. Causes: (1) copy-paste truncated the token, (2) wrong bot selected in @BotFather, (3) token revoked. The token format is "<digits>:<letters/digits/dashes>" e.g. 123456789:AAH-token-here.`;
+                    } else {
+                        msg = `Telegram rejected the token (HTTP ${json.error_code ?? "?"}): ${desc || "no description"}.`;
+                    }
+                    ctx.ui.notify(msg, "error");
                     return;
                 }
                 me = json.result;
             } catch (e) {
-                ctx.ui.notify(`Failed to reach Telegram API: ${e instanceof Error ? e.message : String(e)}`, "error");
+                ctx.ui.notify(`Failed to reach Telegram API (network problem, not a token problem): ${e instanceof Error ? e.message : String(e)}`, "error");
                 return;
             }
             // TS flow-narrows `me` to its initialised type — re-typed local escapes.
