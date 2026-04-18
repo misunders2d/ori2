@@ -353,11 +353,39 @@ npm install --no-fund --no-audit
 # reaches the wizard or systemd unit. Halt loudly on failure — never silently
 # proceed to register a service unit pointing at code that fails its own
 # regression suite.
+#
+# Output is captured to a temp file, NOT streamed live: spec-reporter prints
+# one line per test (600+ lines) which overflows shell scrollback and pushes
+# the wizard's passcode banner + the post-install panel out of view. On
+# success we print a one-line summary; on failure we tail the log so the
+# operator sees what broke.
+#
+# Verbose override: ORI2_VERBOSE_TESTS=1 streams live (for CI / debugging).
 step "Running baseline test suite"
-if ! npm test --silent; then
-    echo
-    echo "❌ Baseline tests failed. Aborting bootstrap."
-    echo "   Inspect the failures above. Re-run the bootstrap once they are green."
+TEST_LOG="$(mktemp /tmp/ori2-baseline-tests-XXXXXX.log)"
+if [[ "${ORI2_VERBOSE_TESTS:-0}" == "1" ]]; then
+    if npm test; then
+        ok "Baseline tests passed."
+    else
+        TEST_FAILED=1
+    fi
+else
+    if npm test > "$TEST_LOG" 2>&1; then
+        PASS_COUNT="$(grep -E '^ℹ tests' "$TEST_LOG" | head -1 | awk '{print $3}')"
+        ok "Baseline tests passed (${PASS_COUNT:-?} tests). Full log: $TEST_LOG"
+    else
+        TEST_FAILED=1
+        echo
+        echo "❌ Baseline tests failed. Last 60 lines of test log:"
+        echo "─── $TEST_LOG ─────────────────────────────────────────"
+        tail -60 "$TEST_LOG"
+        echo "──────────────────────────────────────────────────────"
+        echo
+        echo "Full log: $TEST_LOG"
+        echo "Re-run with verbose output: ORI2_VERBOSE_TESTS=1 ./bootstrap.sh ..."
+    fi
+fi
+if [[ "${TEST_FAILED:-0}" == "1" ]]; then
     echo "   To skip (NOT recommended; bypasses the safety net): export ORI2_SKIP_TESTS=1"
     if [[ "${ORI2_SKIP_TESTS:-0}" != "1" ]]; then
         exit 1
@@ -542,40 +570,51 @@ if [[ -f "$PASSCODE_FILE" ]]; then
     PASSCODE="$(grep -E '^Passcode:' "$PASSCODE_FILE" 2>/dev/null | head -1 | awk '{print $2}')"
 fi
 
+# Use a single repeated unicode rule of fixed width. No width math against
+# ANSI-coloured strings — every previous attempt had broken right-borders
+# because escape codes count as bytes but render as zero columns. Boxes are
+# replaced with bold headings + indentation; alignment is now structural.
+RULE="━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+THIN="───────────────────────────────────────────────────────"
+
 printf '\n\n'
-printf '%s═══════════════════════════════════════════════════════════════%s\n' "$C_GREEN" "$C_RESET"
-printf '  %s🎉  %s — install complete%s\n' "$C_BOLD$C_GREEN" "$BOT_LABEL" "$C_RESET"
-printf '%s═══════════════════════════════════════════════════════════════%s\n' "$C_GREEN" "$C_RESET"
+printf '%s%s%s\n' "$C_GREEN" "$RULE" "$C_RESET"
+printf '%s🎉  %s — install complete%s\n' "$C_BOLD$C_GREEN" "$BOT_LABEL" "$C_RESET"
+printf '%s%s%s\n' "$C_GREEN" "$RULE" "$C_RESET"
 printf '\n'
 
 # ----- 1. PASSCODE — the single most important thing on this screen -----
 if [[ -n "$PASSCODE" ]]; then
-    printf '%s┌───────────────────────────────────────────────────────────┐%s\n' "$C_YELLOW$C_BOLD" "$C_RESET"
-    printf '%s│%s  %s🔑  ADMIN PASSCODE — SAVE THIS NOW%s%s│%s\n' "$C_YELLOW$C_BOLD" "$C_RESET" "$C_BOLD" "$C_RESET" "                        $C_YELLOW$C_BOLD" "$C_RESET"
-    printf '%s│%s%s│%s\n' "$C_YELLOW$C_BOLD" "                                                           " "$C_YELLOW$C_BOLD" "$C_RESET"
-    printf '%s│%s     %s%s%s     %s│%s\n' "$C_YELLOW$C_BOLD" "$C_RESET" "$C_BOLD$C_GREEN" "$PASSCODE" "$C_RESET" "$C_YELLOW$C_BOLD" "$C_RESET"
-    printf '%s│%s%s│%s\n' "$C_YELLOW$C_BOLD" "                                                           " "$C_YELLOW$C_BOLD" "$C_RESET"
-    printf '%s│%s  Backup file (auto-deleted after first /init):            %s│%s\n' "$C_YELLOW$C_BOLD" "$C_RESET" "$C_YELLOW$C_BOLD" "$C_RESET"
-    printf '%s│%s  %s%s%s\n' "$C_YELLOW$C_BOLD" "$C_RESET" "$C_DIM" "$PASSCODE_FILE" "$C_RESET"
-    printf '%s└───────────────────────────────────────────────────────────┘%s\n' "$C_YELLOW$C_BOLD" "$C_RESET"
+    printf '%s%s%s\n' "$C_YELLOW$C_BOLD" "$RULE" "$C_RESET"
+    printf '  %s🔑  ADMIN PASSCODE — SAVE THIS NOW%s\n' "$C_BOLD$C_YELLOW" "$C_RESET"
+    printf '\n'
+    printf '      %s%s%s\n' "$C_BOLD$C_GREEN" "$PASSCODE" "$C_RESET"
+    printf '\n'
+    printf '  %sBackup file (auto-deleted after first /init):%s\n' "$C_DIM" "$C_RESET"
+    printf '  %s%s%s\n' "$C_DIM" "$PASSCODE_FILE" "$C_RESET"
+    printf '%s%s%s\n' "$C_YELLOW$C_BOLD" "$RULE" "$C_RESET"
     printf '\n'
 fi
 
 # ----- 2. ONE primary action — start the bot -----
-printf '%s┌─ STEP 1 ── start the bot ─────────────────────────────────┐%s\n' "$C_CYAN$C_BOLD" "$C_RESET"
+printf '%s%s%s\n' "$C_CYAN" "$THIN" "$C_RESET"
+printf '%sSTEP 1%s — start the bot\n' "$C_BOLD$C_CYAN" "$C_RESET"
+printf '%s%s%s\n' "$C_CYAN" "$THIN" "$C_RESET"
 printf '\n'
 printf '   %scd %s%s\n' "$C_CYAN" "$INSTALL_DIR" "$C_RESET"
-printf '   %s./start.sh%s\n' "$C_CYAN$C_BOLD" "$C_RESET"
+printf '   %s./start.sh%s\n' "$C_BOLD$C_CYAN" "$C_RESET"
 printf '\n'
 if [[ "$INSTALLED_NVM" -eq 1 ]]; then
     printf '   %sNote:%s Node was just installed via nvm — bare %snpm%s commands\n' "$C_YELLOW" "$C_RESET" "$C_BOLD" "$C_RESET"
-    printf '   in this terminal won''t see it until you open a new shell.\n'
+    printf "   in this terminal won't see it until you open a new shell.\n"
     printf '   %s./start.sh%s sources nvm itself, so it works either way.\n' "$C_BOLD" "$C_RESET"
     printf '\n'
 fi
 
 # ----- 3. ONE secondary action — claim admin from chat -----
-printf '%s┌─ STEP 2 ── claim admin from your phone (optional) ────────┐%s\n' "$C_CYAN$C_BOLD" "$C_RESET"
+printf '%s%s%s\n' "$C_CYAN" "$THIN" "$C_RESET"
+printf '%sSTEP 2%s — claim admin from your phone (optional)\n' "$C_BOLD$C_CYAN" "$C_RESET"
+printf '%s%s%s\n' "$C_CYAN" "$THIN" "$C_RESET"
 printf '\n'
 printf '   1. @BotFather on Telegram → %s/newbot%s → save the token\n' "$C_BOLD" "$C_RESET"
 printf '   2. In your bot TUI: %s/connect-telegram <token>%s\n' "$C_CYAN" "$C_RESET"
@@ -583,12 +622,13 @@ printf '   3. DM your bot from your phone: %s/init %s%s\n' "$C_CYAN" "${PASSCODE
 printf '\n'
 
 # ----- 4. Tertiary: links + notes, condensed -----
-printf '%s──── help / docs ────%s\n' "$C_DIM" "$C_RESET"
-printf '   %sREADME.md%s   what ori2 does\n' "$C_BOLD" "$C_RESET"
-printf '   %sINSTALL.md%s  full deployment + headless mode (systemd/launchd)\n' "$C_BOLD" "$C_RESET"
-printf '   %s/help%s       commands list (run inside the bot TUI)\n' "$C_BOLD" "$C_RESET"
+printf '%shelp / docs%s\n' "$C_DIM" "$C_RESET"
+printf '   %sREADME.md%s    what ori2 does\n' "$C_BOLD" "$C_RESET"
+printf '   %sINSTALL.md%s   full deployment + headless mode (systemd/launchd)\n' "$C_BOLD" "$C_RESET"
+printf '   %s/help%s        commands list (run inside the bot TUI)\n' "$C_BOLD" "$C_RESET"
 printf '   %shttps://github.com/misunders2d/ori2/issues%s\n' "$C_BLUE" "$C_RESET"
 printf '\n'
-printf '%sFiles%s   data dir: %s%s/data/%s/%s\n' "$C_DIM" "$C_RESET" "$C_DIM" "$INSTALL_DIR" "$BOT_LABEL" "$C_RESET"
-printf '         vault:    %sdata/%s/.secret/vault.json%s (mode 0600 — keep private)\n' "$C_DIM" "$BOT_LABEL" "$C_RESET"
+printf '%sFiles%s\n' "$C_DIM" "$C_RESET"
+printf '   data dir:  %s%s/data/%s/%s\n' "$C_DIM" "$INSTALL_DIR" "$BOT_LABEL" "$C_RESET"
+printf '   vault:     %sdata/%s/.secret/vault.json%s (mode 0600 — keep private)\n' "$C_DIM" "$BOT_LABEL" "$C_RESET"
 printf '\n'

@@ -306,30 +306,27 @@ export async function runOnboardingFlow(): Promise<void> {
     console.log(`  ${C.dim}Pi settings:${C.reset}    ${path.join(piStateDir(), "settings.json")}`);
     console.log(`  ${C.dim}Runtime config:${C.reset} ${ENV_PATH}\n`);
 
-    // Loud passcode banner — separated from the rest with whitespace so it's
-    // impossible to lose in scrollback. bootstrap.sh ALSO reads the recovery
-    // file and embeds the passcode in the post-install panel for a second
-    // chance to see it.
+    // Loud passcode banner — uses simple horizontal rules instead of a box,
+    // because boxed layouts that include ANSI colour escapes break alignment
+    // (escape sequences count as bytes but render as zero columns, so the
+    // right border drifts).  bootstrap.sh ALSO reads the recovery file and
+    // re-displays the passcode in the post-install panel for a second chance
+    // to see it.
     if (passcode) {
         const recoveryFile = path.join(secretSubdir(), "INIT_PASSCODE.txt");
-        const w = 60;
-        const top = `${C.yellow}╔${"═".repeat(w)}╗${C.reset}`;
-        const bot = `${C.yellow}╚${"═".repeat(w)}╝${C.reset}`;
-        const pad = (s: string) => `${C.yellow}║${C.reset} ${s.padEnd(w - 2)} ${C.yellow}║${C.reset}`;
+        const rule = "━".repeat(60);
         console.log("");
-        console.log(top);
-        console.log(pad(""));
-        console.log(pad(`${C.bold}🔑 ADMIN PASSCODE — copy this NOW${C.reset}`));
-        console.log(pad(""));
-        console.log(pad(`   ${C.bold}${passcode}${C.reset}`));
-        console.log(pad(""));
-        console.log(pad(`After bot starts, DM it from Telegram and reply:`));
-        console.log(pad(`   ${C.cyan}/init ${passcode}${C.reset}`));
-        console.log(pad(""));
-        console.log(pad(`Backup: ${C.dim}${recoveryFile}${C.reset}`));
-        console.log(pad(`(deleted after first successful /init)`));
-        console.log(pad(""));
-        console.log(bot);
+        console.log(`${C.yellow}${C.bold}${rule}${C.reset}`);
+        console.log(`  ${C.bold}${C.yellow}🔑  ADMIN PASSCODE — copy this NOW${C.reset}`);
+        console.log("");
+        console.log(`      ${C.bold}${C.green}${passcode}${C.reset}`);
+        console.log("");
+        console.log(`  After bot starts, DM it from Telegram and reply:`);
+        console.log(`      ${C.cyan}/init ${passcode}${C.reset}`);
+        console.log("");
+        console.log(`  ${C.dim}Backup file (auto-deleted on first /init):${C.reset}`);
+        console.log(`  ${C.dim}${recoveryFile}${C.reset}`);
+        console.log(`${C.yellow}${C.bold}${rule}${C.reset}`);
         console.log("");
     }
 }
