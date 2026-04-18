@@ -41,6 +41,7 @@ INSTALL_DIR=""
 SKIP_SYSTEMD=0
 KEEP_UPSTREAM=0
 DID_CLONE=0
+INSTALLED_NVM=0   # set to 1 by install_node_via_nvm() — drives shell-reload heads-up at the end
 
 # -- colors -------------------------------------------------------------
 # Only emit ANSI escapes on a real TTY with color not explicitly disabled
@@ -172,6 +173,7 @@ install_node_via_nvm() {
     nvm use 22
     hash -r
     command -v node >/dev/null 2>&1 || err "Node install via nvm failed unexpectedly."
+    INSTALLED_NVM=1
 }
 
 step "Checking prerequisites"
@@ -363,6 +365,35 @@ if ! npm test --silent; then
     echo "   ORI2_SKIP_TESTS=1 set — proceeding despite failures (you've been warned)."
 fi
 
+# Generate a launcher that survives the most common post-install foot-gun:
+# nvm-installed Node isn't on PATH in the user's CURRENT shell because nvm's
+# rc-file source lines only fire on NEW shells. start.sh sources nvm itself
+# if it's there, so `./start.sh` works even immediately after bootstrap exits.
+step "Writing start.sh launcher"
+cat > "$INSTALL_DIR/start.sh" <<'LAUNCHER_EOF'
+#!/usr/bin/env bash
+# ori2 launcher. Sources nvm if it's installed but not yet on PATH (typical
+# right after bootstrap.sh runs in the same shell), then `npm run start`s
+# from the bot's install dir. Pass-through args go to npm.
+set -e
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$DIR"
+if ! command -v node >/dev/null 2>&1; then
+    if [[ -s "$HOME/.nvm/nvm.sh" ]]; then
+        export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+        # shellcheck source=/dev/null
+        . "$NVM_DIR/nvm.sh"
+    fi
+fi
+if ! command -v npm >/dev/null 2>&1; then
+    echo "✖ npm not found. Install Node 22+ (see INSTALL.md) and re-run." >&2
+    exit 1
+fi
+exec npm run start -- "$@"
+LAUNCHER_EOF
+chmod +x "$INSTALL_DIR/start.sh"
+ok "Wrote $INSTALL_DIR/start.sh"
+
 step "First-run setup"
 # Pre-write BOT_NAME to .env whenever --name is given. Without this, if .env
 # from a prior install already has a different BOT_NAME, index.ts's
@@ -502,16 +533,24 @@ printf '  %s%s%s\n' "$C_BOLD" "$INSTALL_DIR" "$C_RESET"
 printf '\n'
 printf '%s──────────── WHAT TO DO NEXT — pick one ────────────%s\n' "$C_BOLD$C_CYAN" "$C_RESET"
 printf '\n'
+if [[ "$INSTALLED_NVM" -eq 1 ]]; then
+    printf '%s! Node was just installed via nvm in this terminal session.%s\n' "$C_YELLOW" "$C_RESET"
+    printf '  Bare %snpm%s commands will not work here until you open a NEW terminal\n' "$C_BOLD" "$C_RESET"
+    printf '  (or run %ssource ~/.nvm/nvm.sh%s).  The %s./start.sh%s launcher below\n' "$C_CYAN" "$C_RESET" "$C_BOLD" "$C_RESET"
+    printf '  sources nvm for you, so it works in either case.\n'
+    printf '\n'
+fi
 printf '%s▸ TALK TO IT IN YOUR TERMINAL%s %s(simplest)%s\n' "$C_BOLD$C_YELLOW" "$C_RESET" "$C_DIM" "$C_RESET"
 printf '    %scd "%s"%s\n' "$C_CYAN" "$INSTALL_DIR" "$C_RESET"
-printf '    %snpm run start%s\n' "$C_CYAN" "$C_RESET"
+printf '    %s./start.sh%s\n' "$C_CYAN" "$C_RESET"
 printf '  Type messages, press ENTER. Type %s/exit%s to quit.\n' "$C_BOLD" "$C_RESET"
+printf '  %s(`npm run start` works too, once your shell can see Node.)%s\n' "$C_DIM" "$C_RESET"
 printf '\n'
 printf '%s▸ CONNECT IT TO TELEGRAM%s %s(chat from your phone)%s\n' "$C_BOLD$C_YELLOW" "$C_RESET" "$C_DIM" "$C_RESET"
 printf '    1. Open Telegram, search for %sBotFather%s (the official @BotFather).\n' "$C_BOLD" "$C_RESET"
 printf '    2. Send %s/newbot%s. It asks for a name, then a @username. Save\n' "$C_BOLD" "$C_RESET"
 printf '       the token it gives you (looks like %s123456:AAH...%s).\n' "$C_DIM" "$C_RESET"
-printf '    3. Start your bot:  %scd "%s" && npm run start%s\n' "$C_CYAN" "$INSTALL_DIR" "$C_RESET"
+printf '    3. Start your bot:  %scd "%s" && ./start.sh%s\n' "$C_CYAN" "$INSTALL_DIR" "$C_RESET"
 printf '    4. In the bot TUI, type:\n'
 printf '         %s/connect-telegram <paste-your-BotFather-token>%s\n' "$C_CYAN" "$C_RESET"
 printf '    5. Open your bot in Telegram, send any message.\n'
@@ -534,5 +573,5 @@ printf '  %s•%s Bot name: %s%s%s (change in .env if needed)\n' "$C_DIM" "$C_RE
 printf '  %s•%s Data lives in %s%s/data/%s/%s\n' "$C_DIM" "$C_RESET" "$C_DIM" "$INSTALL_DIR" "$BOT_LABEL" "$C_RESET"
 printf '  %s•%s Vault: %sdata/%s/vault.json%s (mode 0600 — keep private)\n' "$C_DIM" "$C_RESET" "$C_DIM" "$BOT_LABEL" "$C_RESET"
 printf '  %s•%s Daemon mode auto-detects no-TTY (systemd, ssh, docker).\n' "$C_DIM" "$C_RESET"
-printf '    Force interactive with: %sORI2_DAEMON=false npm run start%s\n' "$C_CYAN" "$C_RESET"
+printf '    Force interactive with: %sORI2_DAEMON=false ./start.sh%s\n' "$C_CYAN" "$C_RESET"
 printf '\n'
