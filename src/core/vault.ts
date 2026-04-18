@@ -124,7 +124,16 @@ class Vault {
     }
 
     get(key: string): string | undefined {
-        return this.load().data[key];
+        const v = this.load().data[key];
+        if (v !== undefined) {
+            // Lazy-import to avoid pulling the access log at vault load time
+            // (some test fixtures reset the singleton registry between tests).
+            try {
+                const { getSecretAccessLog } = require("./secretAccessLog.js") as typeof import("./secretAccessLog.js");
+                getSecretAccessLog().record(`vault:${key}`);
+            } catch { /* access log unavailable — vault still works */ }
+        }
+        return v;
     }
 
     has(key: string): boolean {

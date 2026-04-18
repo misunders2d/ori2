@@ -8,6 +8,7 @@ import { getWhitelist } from "../../src/core/whitelist.js";
 import { evaluate as evaluatePolicy, type Decision } from "../../src/core/policy.js";
 import * as totp from "../../src/core/totp.js";
 import { getAdminNotifier } from "../../src/core/adminNotify.js";
+import { getSecretAccessLog } from "../../src/core/secretAccessLog.js";
 
 // =============================================================================
 // admin_gate — policy enforcement tying whitelist + roles + tool ACL +
@@ -783,6 +784,53 @@ export default function (pi: ExtensionAPI) {
             }
 
             ctx.ui.notify("Usage: /totp setup | verify <code> | status | disable", "info");
+        },
+    });
+
+    pi.registerCommand("secrets-audit", {
+        description:
+            "Show secret-access stats: top-N most-accessed secrets, recent reads, " +
+            "current per-secret reads-per-minute. Admin only. Usage: /secrets-audit [recent N]",
+        handler: async (args, ctx) => {
+            const origin = currentOrigin(ctx.sessionManager) ?? inferOriginFromCli(ctx);
+            if (origin && !whitelist.isAdmin(origin.platform, origin.senderId)) {
+                ctx.ui.notify("Only admins can view secret access audit.", "error");
+                return;
+            }
+            const log = getSecretAccessLog();
+            const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
+            const recentMode = parts[0]?.toLowerCase() === "recent";
+            const recentN = recentMode ? Number(parts[1] ?? "20") : 0;
+
+            if (recentMode) {
+                const recent = log.recentReads(Number.isFinite(recentN) && recentN > 0 ? recentN : 20);
+                if (recent.length === 0) { ctx.ui.notify("No secret reads recorded this session.", "info"); return; }
+                const lines = ["Recent secret reads (newest first):", ""];
+                for (const r of recent) {
+                    const ago = Math.round((Date.now() - r.when) / 1000);
+                    lines.push(`  ${ago.toString().padStart(5)}s ago  ${r.source.padEnd(40)} caller=${r.caller || "(unknown)"}`);
+                }
+                ctx.ui.notify(lines.join("\n"), "info");
+                return;
+            }
+
+            const top = log.topReads(50);
+            if (top.length === 0) {
+                ctx.ui.notify("No secret reads recorded yet this process lifetime.\n(/secrets-audit recent N for raw event log.)", "info");
+                return;
+            }
+            const lines = [
+                `Secret access audit — ${log.distinctSources()} distinct secret(s) read this session.`,
+                "",
+                "  reads  rpm60s   secret",
+                "  -----  ------   ------",
+            ];
+            for (const t of top) {
+                const rpm = log.rate(t.source, 60_000).toFixed(2);
+                lines.push(`  ${String(t.count).padStart(5)}  ${rpm.padStart(6)}   ${t.source}`);
+            }
+            lines.push("", "Try: /secrets-audit recent 20  for the raw event log + caller hints.");
+            ctx.ui.notify(lines.join("\n"), "info");
         },
     });
 

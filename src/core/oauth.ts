@@ -377,6 +377,11 @@ export class OAuthService {
         const tok = this.tokens.get(id);
         if (!tok) throw new OAuthError("not_connected", `Platform "${id}" has no tokens. Use /oauth connect ${id}.`);
 
+        try {
+            const { getSecretAccessLog } = require("./secretAccessLog.js") as typeof import("./secretAccessLog.js");
+            getSecretAccessLog().record(`oauth:${id}:access`);
+        } catch { /* access log unavailable — oauth still works */ }
+
         const needsRefresh = tok.expires_at != null && tok.expires_at - REFRESH_BUFFER_MS < Date.now();
         if (!needsRefresh) return tok.access_token;
 

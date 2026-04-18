@@ -247,6 +247,10 @@ export class Credentials {
         this.load();
         const cred = this.store.get(id);
         if (!cred) throw new Error(`[credentials] "${id}" not found`);
+        try {
+            const { getSecretAccessLog } = require("./secretAccessLog.js") as typeof import("./secretAccessLog.js");
+            getSecretAccessLog().record(`cred:${id}`);
+        } catch { /* access log unavailable — credentials still work */ }
         return cred.secret;
     }
 
