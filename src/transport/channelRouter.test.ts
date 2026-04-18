@@ -155,7 +155,7 @@ describe("channelRouter — active path", () => {
         assert.equal(tg.sent[0]!.response.text, "Here is the summary you asked for.");
     });
 
-    it("skips delivery on non-zero exit code", async () => {
+    it("sends a user-facing failure message on non-zero exit code", async () => {
         const d = TransportDispatcher.instance();
         const tg = new FakeAdapter("telegram");
         d.register(tg);
@@ -170,10 +170,14 @@ describe("channelRouter — active path", () => {
         await tg.simulateInbound(baseMsg());
         await __drainChannelLocksForTests();
 
-        assert.equal(tg.sent.length, 0);
+        // CONTRACT: silent failure trains users to think the bot just doesn't
+        // reply. Always surface a message so they know to retry / report.
+        assert.equal(tg.sent.length, 1);
+        assert.match(tg.sent[0]!.response.text, /internal error/i);
+        assert.match(tg.sent[0]!.response.text, /subprocess exit 1/);
     });
 
-    it("skips delivery when stdout is empty (whitespace only)", async () => {
+    it("sends a user-facing failure message when stdout is empty (whitespace only)", async () => {
         const d = TransportDispatcher.instance();
         const tg = new FakeAdapter("telegram");
         d.register(tg);
@@ -183,7 +187,26 @@ describe("channelRouter — active path", () => {
         await tg.simulateInbound(baseMsg());
         await __drainChannelLocksForTests();
 
-        assert.equal(tg.sent.length, 0);
+        assert.equal(tg.sent.length, 1);
+        assert.match(tg.sent[0]!.response.text, /no reply/i);
+    });
+
+    it("sends a watchdog-timeout message when subprocess stderr signals WATCHDOG", async () => {
+        const d = TransportDispatcher.instance();
+        const tg = new FakeAdapter("telegram");
+        d.register(tg);
+
+        installChannelRouter(async () => ({
+            stdout: "",
+            stderr: "[channelRouter] WATCHDOG: subprocess exceeded 120000ms — sent SIGTERM.",
+            exitCode: null,
+        }));
+
+        await tg.simulateInbound(baseMsg());
+        await __drainChannelLocksForTests();
+
+        assert.equal(tg.sent.length, 1);
+        assert.match(tg.sent[0]!.response.text, /took too long/i);
     });
 
     it("passes msg.threadId through as replyToMessageId on delivery", async () => {

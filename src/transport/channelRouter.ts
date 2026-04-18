@@ -263,6 +263,31 @@ export type SpawnPiPrint = (
     signal: AbortSignal,
 ) => Promise<SpawnResult>;
 
+/**
+ * Hard ceiling on how long a single subprocess turn may take before we
+ * SIGTERM it. Beyond this, the user is staring at "thinking" with no signal
+ * for too long. 120s covers slow models + warm-up; anything longer is
+ * almost certainly a hang (network stall, embedder init wedge, deadlock).
+ *
+ * Operator override via vault SUBPROCESS_TIMEOUT_MS (e.g. set higher when
+ * intentionally running a slow chain-of-thought on a small model).
+ */
+const DEFAULT_SUBPROCESS_TIMEOUT_MS = 120_000;
+
+function subprocessTimeoutMs(): number {
+    try {
+        // Lazy require — subprocess module loads vault module which loads paths
+        // module; doing this at module top would force eager init in test envs
+        // that don't construct a vault.
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        const { getVault } = require("../core/vault.js") as typeof import("../core/vault.js");
+        const raw = getVault().get("SUBPROCESS_TIMEOUT_MS");
+        const n = raw ? parseInt(raw, 10) : NaN;
+        if (Number.isFinite(n) && n > 1_000) return n;
+    } catch { /* vault unavailable in some test contexts; fall through */ }
+    return DEFAULT_SUBPROCESS_TIMEOUT_MS;
+}
+
 const realSpawnPiPrint: SpawnPiPrint = (kickoff, sessionFile, extraArgs, signal) =>
     new Promise<SpawnResult>((resolve) => {
         const proc = spawn(
@@ -281,10 +306,34 @@ const realSpawnPiPrint: SpawnPiPrint = (kickoff, sessionFile, extraArgs, signal)
         );
         let stdout = "";
         let stderr = "";
+        let timedOut = false;
         proc.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
         proc.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
-        proc.on("close", (code) => resolve({ stdout, stderr, exitCode: code }));
-        proc.on("error", (e) => resolve({ stdout, stderr: `${stderr}\nspawn error: ${e.message}`, exitCode: null }));
+
+        // Watchdog — kill the subprocess if it runs longer than the ceiling.
+        // SIGTERM first; if it doesn't die in 5s, SIGKILL. Captured output
+        // (whatever Pi printed before hanging) IS still in stdout/stderr and
+        // gets returned via the close handler so the caller / errors.jsonl
+        // sees what the subprocess was doing before it stalled.
+        const watchdog = setTimeout(() => {
+            timedOut = true;
+            try { proc.kill("SIGTERM"); } catch { /* already gone */ }
+            setTimeout(() => { try { proc.kill("SIGKILL"); } catch { /* already gone */ } }, 5_000).unref();
+        }, subprocessTimeoutMs());
+        watchdog.unref();
+
+        proc.on("close", (code) => {
+            clearTimeout(watchdog);
+            if (timedOut) {
+                stderr += `\n[channelRouter] WATCHDOG: subprocess exceeded ${subprocessTimeoutMs()}ms — sent SIGTERM. ` +
+                          `Captured stdout (${stdout.length}B) and stderr (${stderr.length}B) up to that point are returned.`;
+            }
+            resolve({ stdout, stderr, exitCode: code });
+        });
+        proc.on("error", (e) => {
+            clearTimeout(watchdog);
+            resolve({ stdout, stderr: `${stderr}\nspawn error: ${e.message}`, exitCode: null });
+        });
 
         const onAbort = () => {
             // SIGTERM gives the process a chance to flush. Pi's SessionManager
@@ -402,21 +451,54 @@ async function doActiveResponse(msg: Message, spawnFn: SpawnPiPrint): Promise<vo
     // truncated stdout. The next active response (already enqueued by the
     // same interrupt that killed us) will produce the real answer.
     if (controller.signal.aborted) return;
+
+    // Distinguish watchdog-timeout vs other errors so we can give the user
+    // a useful message instead of silence (which trains them to think the
+    // bot just doesn't reply). Watchdog signature is in the stderr tail.
+    const timedOut = result.stderr.includes("WATCHDOG:");
+    if (timedOut) {
+        logError("channelRouter", "subprocess WATCHDOG timeout — sending user-facing failure", {
+            platform: msg.platform,
+            channelId: msg.channelId,
+            stdout_tail: result.stdout.slice(-500),
+            stderr_tail: result.stderr.slice(-500),
+        });
+        try {
+            await getDispatcher().send(msg.platform, msg.channelId, {
+                text: `⏱  I took too long to respond and was interrupted. Try again, simplify the request, or check /log recent for what got stuck.`,
+                ...(msg.threadId ? { replyToMessageId: msg.threadId } : {}),
+            });
+        } catch { /* best effort */ }
+        return;
+    }
     if (result.exitCode !== 0) {
-        logWarning("channelRouter", "subprocess non-zero exit — no delivery", {
+        logError("channelRouter", "subprocess non-zero exit — sending user-facing failure", {
             platform: msg.platform,
             channelId: msg.channelId,
             exitCode: result.exitCode,
             stderr_tail: result.stderr.slice(-500),
         });
+        try {
+            await getDispatcher().send(msg.platform, msg.channelId, {
+                text: `⚠️  Sorry, internal error processing your message (subprocess exit ${result.exitCode}). Operator can check /log recent / errors.jsonl.`,
+                ...(msg.threadId ? { replyToMessageId: msg.threadId } : {}),
+            });
+        } catch { /* best effort */ }
         return;
     }
     const text = result.stdout.trim();
     if (!text) {
-        logWarning("channelRouter", "subprocess produced no stdout", {
+        logError("channelRouter", "subprocess produced no stdout — sending user-facing failure", {
             platform: msg.platform,
             channelId: msg.channelId,
+            stderr_tail: result.stderr.slice(-500),
         });
+        try {
+            await getDispatcher().send(msg.platform, msg.channelId, {
+                text: `🤔  My agent ran but produced no reply. Please retry or rephrase. (Operator: check errors.jsonl for the stderr tail.)`,
+                ...(msg.threadId ? { replyToMessageId: msg.threadId } : {}),
+            });
+        } catch { /* best effort */ }
         return;
     }
     try {
