@@ -185,15 +185,21 @@ describe("security pipeline — Layer 1: Access gate (blacklist + whitelist + ch
         // Zero whitelist, zero channel allow.
         const adapter = new FakeAdapter("telegram");
         TransportDispatcher.instance().register(adapter);
+
+        // The hook returns { block: true, reason: "" } to signal silent
+        // drop. The dispatcher honors empty-reason as "no user-facing
+        // reply" — we don't want to confirm to a probing stranger that
+        // a bot is here. Block invariance is verified via the post-block
+        // hook (which fires for every pre-hook block regardless of reason).
+        const blocks: string[] = [];
+        TransportDispatcher.instance().addPostBlockHook((_m, reason) => {
+            blocks.push(reason);
+        });
+
         await adapter.simulateInbound(baseMsg({ senderId: "stranger" }));
 
-        // The hook returns { block: true, reason: "" } to signal silent drop.
-        // The dispatcher's adapter.send is called but with an empty 🚫
-        // text — the adapter sees a reply with only the emoji. A future
-        // refinement could skip adapter.send entirely for empty reason,
-        // but today's contract is "silent" = empty reason string.
-        assert.equal(adapter.sent.length, 1);
-        assert.equal(adapter.sent[0]!.response.text, "🚫 ");
+        assert.equal(adapter.sent.length, 0, "silent block must not surface anything to the stranger");
+        assert.deepEqual(blocks, [""], "post-block hook must fire exactly once with the silent-block sentinel");
     });
 
     it("allows whitelisted (non-admin) user", async () => {
@@ -247,6 +253,10 @@ describe("security pipeline — Layer 1: Access gate (blacklist + whitelist + ch
 
         const adapter = new FakeAdapter("telegram");
         TransportDispatcher.instance().register(adapter);
+        let activeRouted = 0;
+        TransportDispatcher.instance().setOnActiveResponse(() => { activeRouted++; });
+        const blocks: string[] = [];
+        TransportDispatcher.instance().addPostBlockHook((_m, reason) => { blocks.push(reason); });
 
         await adapter.simulateInbound(baseMsg({
             senderId: "random-member",
@@ -255,8 +265,8 @@ describe("security pipeline — Layer 1: Access gate (blacklist + whitelist + ch
         }));
         // Must be blocked — random users can't trigger responses just because
         // the channel is allowlisted.
-        assert.equal(adapter.sent.length, 1);
-        assert.equal(adapter.sent[0]!.response.text, "🚫 ");
+        assert.equal(activeRouted, 0, "active routing must not fire for blocked sender");
+        assert.deepEqual(blocks, [""], "silent-block sentinel must fire");
     });
 
     it("BLOCKS PASSIVE (addressedToBot=false) from unlisted sender in UNLISTED channel", async () => {
@@ -265,13 +275,18 @@ describe("security pipeline — Layer 1: Access gate (blacklist + whitelist + ch
 
         const adapter = new FakeAdapter("telegram");
         TransportDispatcher.instance().register(adapter);
+        let passiveRouted = 0;
+        TransportDispatcher.instance().setOnPassiveContext(() => { passiveRouted++; });
+        const blocks: string[] = [];
+        TransportDispatcher.instance().addPostBlockHook((_m, reason) => { blocks.push(reason); });
 
         await adapter.simulateInbound(baseMsg({
             senderId: "random-member",
             channelId: "-100random",
             addressedToBot: false,
         }));
-        assert.equal(adapter.sent.length, 1, "unlisted channel + unlisted sender must block");
+        assert.equal(passiveRouted, 0, "passive routing must not fire — unlisted channel + unlisted sender must block");
+        assert.deepEqual(blocks, [""], "silent-block sentinel must fire");
     });
 });
 
@@ -589,12 +604,15 @@ describe("security pipeline — wiring invariants (cannot be silently removed)",
         factory(fake.api as any);
 
         // The pre-dispatch hook is installed on the singleton dispatcher.
-        // Verify by firing an inbound — if the hook is missing the message
-        // goes straight through to routing (no block-reply).
+        // Verify by firing an inbound and observing the post-block hook —
+        // if the access gate is missing, the message would route through
+        // to onActiveResponse and the post-block hook would never fire.
         const adapter = new FakeAdapter("telegram");
         TransportDispatcher.instance().register(adapter);
+        let blocks = 0;
+        TransportDispatcher.instance().addPostBlockHook(() => { blocks++; });
         await adapter.simulateInbound(baseMsg({ senderId: "totally-unlisted-stranger" }));
-        assert.equal(adapter.sent.length, 1, "access gate hook must have intercepted the unlisted sender");
+        assert.equal(blocks, 1, "access gate hook must have intercepted the unlisted sender");
     });
 
     it("admin_gate factory registers a tool_call handler (tool ACL gate)", async () => {
@@ -661,8 +679,10 @@ describe("security pipeline — wiring invariants (cannot be silently removed)",
         // above, now with both extensions loaded.
         const adapter = new FakeAdapter("telegram");
         TransportDispatcher.instance().register(adapter);
+        let blocks = 0;
+        TransportDispatcher.instance().addPostBlockHook(() => { blocks++; });
         await adapter.simulateInbound(baseMsg({ senderId: "ghost" }));
-        assert.equal(adapter.sent.length, 1, "access gate must survive combined load");
+        assert.equal(blocks, 1, "access gate must survive combined load");
 
         __setEmbedderForTests(null);
     });

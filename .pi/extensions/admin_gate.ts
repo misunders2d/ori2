@@ -7,6 +7,7 @@ import { getDispatcher } from "../../src/transport/dispatcher.js";
 import { getWhitelist } from "../../src/core/whitelist.js";
 import { evaluate as evaluatePolicy, type Decision } from "../../src/core/policy.js";
 import * as totp from "../../src/core/totp.js";
+import { getAdminNotifier } from "../../src/core/adminNotify.js";
 
 // =============================================================================
 // admin_gate — policy enforcement tying whitelist + roles + tool ACL +
@@ -126,7 +127,12 @@ export default function (pi: ExtensionAPI) {
         console.log(
             `[admin_gate] BLOCKED unlisted inbound from ${msg.platform}:${msg.senderId} (${msg.senderDisplayName}) in ${msg.channelId} — use /whitelist add ${msg.platform} ${msg.senderId} to permit, or /channel-allow ${msg.platform} ${msg.channelId} for group context`,
         );
-        return { block: true, reason: "" }; // empty reason → dispatcher logs but adapter's send-back will not be useful; we want silence here
+        // Fire-and-forget admin notification. Cooldown + GC live in
+        // AdminNotifier; failures must not block this pre-hook.
+        void getAdminNotifier().notifyUnknownUser(msg).catch((e) => {
+            console.warn(`[admin_gate] adminNotifier failed: ${e instanceof Error ? e.message : String(e)}`);
+        });
+        return { block: true, reason: "" }; // empty reason → dispatcher skips reply (silent); see TransportDispatcher.dispatch
     });
 
     // ---------------- input event ----------------

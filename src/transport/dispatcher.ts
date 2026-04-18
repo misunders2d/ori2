@@ -253,12 +253,18 @@ export class TransportDispatcher {
             const result = await hook(msg);
             if (result && "block" in result && result.block) {
                 console.log(`[transport] msg blocked by hook: ${result.reason}`);
-                // Tell the adapter to surface the block to the user.
-                const adapter = this.adapters.get(msg.platform);
-                if (adapter) {
-                    try {
-                        await adapter.send(msg.channelId, { text: `🚫 ${result.reason}` });
-                    } catch { /* best effort */ }
+                // Tell the adapter to surface the block to the user — UNLESS
+                // the hook returned an empty reason, which is the "silent
+                // block" convention (see admin_gate's unlisted-sender branch:
+                // we don't want to confirm to a probing stranger that a bot
+                // is even here).
+                if (result.reason !== "") {
+                    const adapter = this.adapters.get(msg.platform);
+                    if (adapter) {
+                        try {
+                            await adapter.send(msg.channelId, { text: `🚫 ${result.reason}` });
+                        } catch { /* best effort */ }
+                    }
                 }
                 // Fire post-block hooks so observers (audit log) see the block.
                 // Exceptions in observers must not mask the original block.
