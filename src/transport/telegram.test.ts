@@ -8,6 +8,7 @@ import {
     type TelegramUser,
 } from "./telegram.js";
 import { clearRegistryForTests } from "../core/singletons.js";
+import { getVault } from "../core/vault.js";
 import type { Message, MessageHandler } from "./types.js";
 
 const bot: TelegramUser = {
@@ -378,5 +379,132 @@ describe("TelegramAdapter attachment pipeline", () => {
         const msg = delivered[0]!;
         assert.equal(msg.text, "is this cheese or plastic");
         assert.equal(msg.attachments![0]!.kind, "image");
+    });
+});
+
+// =============================================================================
+// Markdown send with plain-text fallback.
+//
+// Telegram rejects malformed Markdown with HTTP 400 (description like
+// "Bad Request: can't parse entities"). The old code sent plain text
+// always; users wanted bold/italic/code/links to render. New behavior:
+//   attempt 1 — parse_mode="Markdown" (legacy; forgiving subset).
+//   attempt 2 (only if 1 threw) — no parse_mode; user gets raw text
+//                                  instead of nothing.
+// These tests capture each sendMessage call against a fake API so we
+// can assert the exact parse_mode progression.
+// =============================================================================
+
+interface ApiCall { method: string; body: Record<string, unknown> }
+
+function captureSendFetch(seq: Array<{ ok: boolean; description?: string }>): {
+    fetch: typeof fetch;
+    calls: ApiCall[];
+} {
+    const calls: ApiCall[] = [];
+    let idx = 0;
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
+        const url = typeof input === "string" ? input : input.toString();
+        const m = url.match(/\/bot[^/]+\/([A-Za-z]+)$/);
+        const method = m?.[1] ?? "unknown";
+        const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : {};
+        calls.push({ method, body });
+        const scripted = seq[idx] ?? { ok: true };
+        idx += 1;
+        return new Response(
+            JSON.stringify(scripted.ok
+                ? { ok: true, result: { message_id: 1 } }
+                : { ok: false, description: scripted.description ?? "Bad Request" }),
+            {
+                status: scripted.ok ? 200 : 400,
+                headers: { "content-type": "application/json" },
+            },
+        );
+    }) as typeof fetch;
+    return { fetch: fetchImpl, calls };
+}
+
+describe("TelegramAdapter.send — markdown first, plain fallback on error", () => {
+    let adapter: TelegramAdapter;
+
+    beforeEach(() => {
+        clearRegistryForTests();
+        adapter = new TelegramAdapter();
+        getVault().set("TELEGRAM_BOT_TOKEN", "TESTTOKEN");
+    });
+
+    afterEach(() => {
+        __setTelegramFetchForTests(null);
+        clearRegistryForTests();
+    });
+
+    it("first attempt sets parse_mode=Markdown when Telegram accepts it", async () => {
+        const { fetch: f, calls } = captureSendFetch([{ ok: true }]);
+        __setTelegramFetchForTests(f);
+
+        await adapter.send("-100", { text: "**hello**" });
+
+        assert.equal(calls.length, 1, "should only have tried once");
+        assert.equal(calls[0]!.method, "sendMessage");
+        assert.equal(calls[0]!.body["parse_mode"], "Markdown");
+        assert.equal(calls[0]!.body["text"], "**hello**");
+    });
+
+    it("falls back to plain-text (no parse_mode) when Telegram returns 400 on Markdown", async () => {
+        const { fetch: f, calls } = captureSendFetch([
+            { ok: false, description: "Bad Request: can't parse entities" },
+            { ok: true }, // plain-text retry succeeds
+        ]);
+        __setTelegramFetchForTests(f);
+
+        await adapter.send("-100", { text: "weird *unclosed bold" });
+
+        assert.equal(calls.length, 2, "must retry once after the 400");
+        assert.equal(calls[0]!.body["parse_mode"], "Markdown");
+        assert.equal(calls[1]!.body["parse_mode"], undefined, "retry must omit parse_mode");
+        assert.equal(calls[1]!.body["text"], "weird *unclosed bold");
+    });
+
+    it("sends each chunk through the markdown-then-plain progression independently", async () => {
+        // Long text forces chunking; test that each chunk gets its own
+        // attempt pair (markdown then plain-on-fail).
+        const long = "x".repeat(4100);
+        const { fetch: f, calls } = captureSendFetch([
+            { ok: false }, // chunk 1 markdown → 400
+            { ok: true },  // chunk 1 plain retry
+            { ok: true },  // chunk 2 markdown (success — no retry)
+        ]);
+        __setTelegramFetchForTests(f);
+
+        await adapter.send("-100", { text: long });
+
+        assert.equal(calls.length, 3);
+        assert.equal(calls[0]!.body["parse_mode"], "Markdown");
+        assert.equal(calls[1]!.body["parse_mode"], undefined);
+        assert.equal(calls[2]!.body["parse_mode"], "Markdown");
+    });
+
+    it("includes reply_to_message_id only on the first chunk", async () => {
+        const long = "y".repeat(4100);
+        const { fetch: f, calls } = captureSendFetch([{ ok: true }, { ok: true }]);
+        __setTelegramFetchForTests(f);
+
+        await adapter.send("-100", { text: long, replyToMessageId: "42" });
+
+        assert.equal(calls[0]!.body["reply_to_message_id"], 42);
+        assert.equal(calls[1]!.body["reply_to_message_id"], undefined);
+    });
+
+    it("throws when the plain-text fallback also fails (so the caller sees the error)", async () => {
+        const { fetch: f } = captureSendFetch([
+            { ok: false, description: "markdown broke" },
+            { ok: false, description: "plain also broke" },
+        ]);
+        __setTelegramFetchForTests(f);
+
+        await assert.rejects(
+            () => adapter.send("-100", { text: "will fail both times" }),
+            /plain also broke/,
+        );
     });
 });

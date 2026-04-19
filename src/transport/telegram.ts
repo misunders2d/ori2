@@ -208,11 +208,28 @@ export class TelegramAdapter implements TransportAdapter {
         const chunks = chunkText(text, MAX_TELEGRAM_TEXT);
         const replyTo = response.replyToMessageId ? Number(response.replyToMessageId) : undefined;
         for (let i = 0; i < chunks.length; i++) {
-            const params: Record<string, unknown> = { chat_id: chatId, text: chunks[i] };
+            const base: Record<string, unknown> = { chat_id: chatId, text: chunks[i] };
             if (i === 0 && replyTo !== undefined && Number.isFinite(replyTo)) {
-                params["reply_to_message_id"] = replyTo;
+                base["reply_to_message_id"] = replyTo;
             }
-            await this.callApi(token, "sendMessage", params);
+            // Attempt 1: send with parse_mode=Markdown so bold/italic/code/
+            // links from the LLM render. Telegram's legacy Markdown mode is
+            // forgiving but still 400s on malformed tokens (unmatched `*`,
+            // bare `[`, etc.). Attempt 2 retries without parse_mode so the
+            // user ALWAYS gets the message — they'd rather see raw asterisks
+            // than nothing. We log a one-line warning on the fallback path
+            // so the operator can grep errors.jsonl for chronic markdown
+            // failures (indicates the agent is emitting broken syntax).
+            try {
+                await this.callApi(token, "sendMessage", { ...base, parse_mode: "Markdown" });
+            } catch (e) {
+                const errMsg = e instanceof Error ? e.message : String(e);
+                logWarning("telegram", "markdown send failed, retrying as plain text", {
+                    chatId,
+                    err: errMsg,
+                });
+                await this.callApi(token, "sendMessage", base);
+            }
         }
 
         // Send any attachments AFTER the text so the user has context.

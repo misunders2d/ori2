@@ -13,6 +13,7 @@ import { getDispatcher } from "./dispatcher.js";
 import { logError, logInfo, logWarning } from "../core/errorLog.js";
 import { getOrCreate } from "../core/singletons.js";
 import type { Message } from "./types.js";
+import { formatInboundHeader } from "./inboundHeader.js";
 
 // =============================================================================
 // channelRuntime — IN-PROCESS per-channel AgentSession orchestration.
@@ -572,12 +573,13 @@ function seedTransportOrigin(session: AgentSession, msg: Message): void {
     }
 }
 
-/** Format the inbound message into the agent's prompt text. Mirrors the
- *  format the old channelRouter subprocess kickoff used so session JSONL
- *  history stays consistent. */
+/** Header + newline pair that prefixes the prompt body. Uses the shared
+ *  inboundHeader helper so admin_gate's stripInboundHeader can reliably
+ *  peel it off before matching user-typed commands like /init or
+ *  `Approve ACT-XYZ`. The `\n\n` separator is load-bearing — don't change
+ *  it without updating src/transport/inboundHeader.ts in lockstep. */
 function formatActiveKickoff(msg: Message): string {
-    const sender = msg.senderDisplayName || msg.senderId;
-    return `[${msg.platform} inbound | from: ${sender} (${msg.senderId}) | channel: ${msg.channelId}]\n${msg.text}`;
+    return `${formatInboundHeader(msg)}\n\n${msg.text}`;
 }
 
 /**

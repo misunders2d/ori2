@@ -10,6 +10,7 @@ import * as totp from "../../src/core/totp.js";
 import { getAdminNotifier } from "../../src/core/adminNotify.js";
 import { getSecretAccessLog } from "../../src/core/secretAccessLog.js";
 import { getSingleton, setSingleton } from "../../src/core/singletons.js";
+import { stripInboundHeader } from "../../src/transport/inboundHeader.js";
 
 // Dispatcher hooks are GLOBAL (one dispatcher singleton across every Pi
 // session). Per-channel sessions re-load this extension; without this
@@ -191,7 +192,7 @@ export default function (pi: ExtensionAPI) {
         // Strip transport_bridge's metadata header so user-typed "/init" or
         // "Approve ACT-..." at the start of the actual body still matches.
         // For terminal input (no header) this is a no-op.
-        const text = stripMetadataHeader(event.text).trim();
+        const text = stripInboundHeader(event.text).trim();
 
         // /init for the CLI operator: dispatcher pre-hook only sees inbound
         // through registered adapters, and InteractiveMode bypasses that.
@@ -891,16 +892,9 @@ export default function (pi: ExtensionAPI) {
 // -------------- helpers --------------
 
 /**
- * transport_bridge prepends inbound chat messages with a metadata header:
- *   `[Inbound | platform: ... | from: ... | ...]\n\n<actual body>`
- * Strip it so admin_gate's input handlers can match user-typed prefixes
- * (/init, Approve ACT-...) at the body's start. CLI input has no header,
- * so this is a no-op for terminal users.
- */
-function stripMetadataHeader(text: string): string {
-    const m = text.match(/^\[Inbound \|[^\]]*\]\s*\n\n([\s\S]*)$/);
-    return m ? m[1]! : text;
-}
+// stripMetadataHeader moved to src/transport/inboundHeader.ts so
+// channelRuntime (non-CLI writer), transport_bridge (CLI writer), and
+// this gate (reader) share one contract and can't silently drift.
 
 /** Synthesise an InboundOrigin for the CLI operator. Used when no chat origin is persisted. */
 function inferOriginFromCli(_ctx: unknown): InboundOrigin | null {

@@ -83,7 +83,7 @@ describe("buildPromptFromMessage", () => {
         const msg = makeMsg("hello bot");
         const { text, images } = buildPromptFromMessage(msg, visionModel());
         assert.match(text, /hello bot/);
-        assert.match(text, /telegram inbound/i);
+        assert.match(text, /^\[Inbound \| platform: telegram/);
         assert.equal(images.length, 0);
         // Must NOT mention attachments when there are none.
         assert.doesNotMatch(text, /\[Attachments\]/);

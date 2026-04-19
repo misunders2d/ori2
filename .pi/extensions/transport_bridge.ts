@@ -1,6 +1,7 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { getDispatcher } from "../../src/transport/dispatcher.js";
 import type { Message } from "../../src/transport/types.js";
+import { formatInboundHeader } from "../../src/transport/inboundHeader.js";
 import { getVault } from "../../src/core/vault.js";
 import { getWhitelist } from "../../src/core/whitelist.js";
 import { logError } from "../../src/core/errorLog.js";
@@ -53,15 +54,9 @@ interface OriginEntry {
     timestamp: number;
 }
 
-function formatMetadataHeader(msg: Message): string {
-    const parts: string[] = [`platform: ${msg.platform}`];
-    if (msg.senderDisplayName) parts.push(`from: ${msg.senderDisplayName}`);
-    parts.push(`sender_id: ${msg.senderId}`);
-    parts.push(`channel: ${msg.channelId}`);
-    if (msg.threadId) parts.push(`thread: ${msg.threadId}`);
-    parts.push(`time: ${new Date(msg.timestamp).toISOString()}`);
-    return `[Inbound | ${parts.join(" | ")}]`;
-}
+// Header format lives in ../../src/transport/inboundHeader.ts now so
+// channelRuntime (non-CLI inbound) and this bridge (CLI inbound) can't
+// drift — drift is what broke chat-side /init + Approve in the past.
 
 function formatAttachmentsForPi(msg: Message): string {
     if (!msg.attachments || msg.attachments.length === 0) return "";
@@ -165,7 +160,7 @@ export default function (pi: ExtensionAPI) {
             };
             pi.appendEntry(ENTRY_TYPE, GLOBAL_LAST_ORIGIN);
 
-            const header = formatMetadataHeader(msg);
+            const header = formatInboundHeader(msg);
             const attach = formatAttachmentsForPi(msg);
             const body = `${header}\n\n${msg.text}${attach}`;
             // Use followUp so the message is queued and triggers a turn.
