@@ -218,6 +218,38 @@ export class ChannelRuntime {
         return Array.from(this.channels.keys()).sort();
     }
 
+    /**
+     * Hard-abort any in-flight turn for this channel. Returns true if an
+     * abort was actually issued (there was something to abort), false if
+     * the channel was idle or absent. Used by the /stop | /cancel | /abort
+     * pre-dispatch hook so a user can kill a runaway turn without waiting
+     * for it to settle through the followUp queue. Matches the old ori
+     * Python behavior (telegram_poller.py:731-756 — referenced in
+     * channelRouter.ts@f69bb81^:72-91) which killed the prior subprocess
+     * whenever new input arrived; we make it opt-in so a chatty user
+     * doesn't accidentally drop their own reply.
+     *
+     * Never throws — abort failures log and return false. Caller decides
+     * the user-facing message.
+     */
+    async abort(platform: string, channelId: string): Promise<boolean> {
+        const entry = this.channels.get(channelKey(platform, channelId));
+        if (!entry) return false;
+        if (!entry.session.isStreaming) return false;
+        try {
+            await entry.session.abort();
+            this.stopTyping(entry);
+            return true;
+        } catch (e) {
+            logError("channelRuntime", "session.abort threw", {
+                platform,
+                channelId,
+                err: e instanceof Error ? e.message : String(e),
+            });
+            return false;
+        }
+    }
+
     /** Test-only — clear in-memory state. Caller must call stop() first. */
     reset(): void {
         this.channels.clear();

@@ -148,16 +148,60 @@ function persistSessionNow(sm: SessionManager, sessionFile: string): void {
     }
 }
 
+// Explicit-interrupt commands. Whole-message /stop, /cancel, or /abort
+// (case-insensitive). Restored the ori-era "kill the current turn" option
+// that the f69bb81 refactor dropped — new inbound no longer auto-
+// interrupts (it joins Pi's followUp queue), so without this hook a user
+// had no way to stop a runaway turn short of waiting it out or killing
+// the daemon.
+//
+// Deliberate string-equality check (not regex): the arch invariant in
+// src/arch/invariants.test.ts forbids regex-based intent classification
+// because that locks out non-English speakers. These tokens are STRUCTURAL
+// slash commands (same category as /init, /whitelist), but we still
+// prefer equality here over a regex literal to keep the invariant's
+// detector narrow. Users in any language can still type "/stop".
+const STOP_COMMANDS = new Set(["/stop", "/cancel", "/abort"]);
+function isStopCommand(text: string): boolean {
+    return STOP_COMMANDS.has(text.trim().toLowerCase());
+}
+
+/**
+ * Pre-dispatch hook: catch /stop|/cancel|/abort and abort the channel's
+ * in-flight turn. Runs AFTER admin_gate's whitelist check (hook ordering
+ * is registration order; admin_gate wires first during daemon session
+ * load), so only whitelisted users can issue these — random probers
+ * can't DoS an admin mid-turn.
+ */
+async function stopCommandHook(msg: import("./types.js").Message): Promise<{ block: true; reason: string } | { block: false }> {
+    if (!isStopCommand(msg.text)) return { block: false };
+    // /stop only makes sense on non-CLI channels. CLI uses the TUI's
+    // built-in Esc / Ctrl-C to abort; routing /stop through here would
+    // double-handle it.
+    if (msg.platform === "cli") return { block: false };
+    const aborted = await getChannelRuntime().abort(msg.platform, msg.channelId);
+    return {
+        block: true,
+        reason: aborted
+            ? "✅ Stopped the current turn. Send a new message when you're ready."
+            : "Nothing is running right now — no turn to stop.",
+    };
+}
+
 /**
  * Wire the dispatcher's two non-CLI handlers. Call ONCE at boot AFTER adapters
  * are registered (so dispatcher.send() has the target adapters available).
  *
  * Active path delegates to channelRuntime — the in-process per-channel
  * AgentSession orchestrator. Passive path runs inline (just appends to the
- * channel's JSONL).
+ * channel's JSONL). Also installs the stop-command pre-dispatch hook.
  */
 export function installChannelRouter(): void {
     const d = getDispatcher();
+    // Explicit-interrupt command (/stop, /cancel, /abort). Registered
+    // here rather than in admin_gate because the logic belongs with
+    // channelRuntime's lifecycle, not the ACL layer.
+    d.addPreDispatchHook(stopCommandHook);
     // Passive ingests serialize per channel so concurrent passives on the
     // same channel don't interleave.
     d.setOnPassiveContext((msg) => {
