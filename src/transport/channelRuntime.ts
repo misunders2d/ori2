@@ -5,7 +5,7 @@ import {
     type AgentSession,
     type AgentSessionServices,
 } from "@mariozechner/pi-coding-agent";
-import type { Model } from "@mariozechner/pi-ai";
+import type { ImageContent, Model } from "@mariozechner/pi-ai";
 import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
 import { getChannelSessions } from "../core/channelSessions.js";
 import { getChannelModels, type ChannelModelBinding } from "../core/channelModels.js";
@@ -69,6 +69,11 @@ interface ChannelEntry {
      *  revert when a binding is later cleared — without it we'd be stuck on
      *  whatever override was last applied. */
     defaultModel?: Model<any>;
+    /** Thread id of the last inbound message for this channel. Carried across
+     *  the async gap between prompt() and agent_end so the reply can be
+     *  routed back as a reply-to / thread-reply on platforms that support it
+     *  (Telegram topic threads, Slack threads, etc.). */
+    lastThreadId?: string;
 }
 
 export class ChannelRuntime {
@@ -109,6 +114,13 @@ export class ChannelRuntime {
         const key = channelKey(msg.platform, msg.channelId);
         const entry = await this.getOrCreate(msg.platform, msg.channelId);
         entry.lastActivity = Date.now();
+        // Remember the thread so deliverAgentEnd can reply-to it on
+        // platforms that thread (Telegram topics, Slack thread_ts, etc.).
+        if (msg.threadId !== undefined) {
+            entry.lastThreadId = msg.threadId;
+        } else {
+            delete entry.lastThreadId;
+        }
 
         // Seed a transport-origin custom entry on the channel session BEFORE
         // prompt() so tools that call currentOrigin(ctx.sessionManager)
@@ -135,16 +147,24 @@ export class ChannelRuntime {
         // as broken "on-the-fly" model switching.
         await this.applyChannelModelBinding(entry, msg.platform, msg.channelId);
 
+        // Build prompt (text + images) from the inbound Message. Attachments
+        // that the current model CAN'T ingest natively (binaries; images
+        // against a text-only model) get demoted to textual references so
+        // the LLM knows they exist without the API rejecting the payload.
+        // This is what kept the conversation moving when someone drops a
+        // pptx into Telegram: we describe it instead of uploading it.
+        const { text, images } = buildPromptFromMessage(msg, entry.session.model);
+
         // Pi's `prompt(text)` runs ONE agent turn. If a turn is already
         // running for this channel, we use Pi's queue: enqueue the new
         // input as a follow-up so it joins after the current turn settles.
         // This mirrors the prior subprocess model's "interrupt-replace"
         // semantics — but BETTER, because the user's prior message gets
         // its reply instead of being dropped on abort.
-        const text = formatActiveKickoff(msg);
         try {
             await entry.session.prompt(text, {
                 streamingBehavior: "followUp",
+                ...(images.length > 0 ? { images } : {}),
             });
         } catch (e) {
             const err = e instanceof Error ? e.message : String(e);
@@ -154,12 +174,40 @@ export class ChannelRuntime {
                 key,
                 err,
             });
-            try {
-                await getDispatcher().send(msg.platform, msg.channelId, {
-                    text: `⚠️  Internal error processing your message: ${err.slice(0, 200)}. Operator can check errors.jsonl.`,
-                    ...(msg.threadId ? { replyToMessageId: msg.threadId } : {}),
-                });
-            } catch { /* best effort */ }
+            // Pi's prompt throws on transport/API errors (provider rate-limit,
+            // network, model-rejected payload, etc). The session state is
+            // left idle — subsequent prompts work — so we just tell the user
+            // what happened and invite them to try again. Do NOT recreate
+            // the session here; we'd lose conversation history for what's
+            // likely a transient failure.
+            await this.safeSend(msg.platform, msg.channelId, entry.lastThreadId, {
+                text: userFacingError(err),
+            });
+        }
+    }
+
+    /**
+     * Thin wrapper around dispatcher.send that never throws — delivery
+     * failures log + move on. All outbound paths (agent_end reply,
+     * prompt-error warning, agent_end error warning) go through this.
+     */
+    private async safeSend(
+        platform: string,
+        channelId: string,
+        threadId: string | undefined,
+        response: { text: string },
+    ): Promise<void> {
+        try {
+            await getDispatcher().send(platform, channelId, {
+                text: response.text,
+                ...(threadId ? { replyToMessageId: threadId } : {}),
+            });
+        } catch (e) {
+            logError("channelRuntime", "delivery failed", {
+                platform,
+                channelId,
+                err: e instanceof Error ? e.message : String(e),
+            });
         }
     }
 
@@ -338,21 +386,34 @@ export class ChannelRuntime {
         channelId: string,
         event: { type: "agent_end"; messages: ReadonlyArray<unknown> },
     ): Promise<void> {
+        const entry = this.channels.get(channelKey(platform, channelId));
+        const threadId = entry?.lastThreadId;
+
+        // Inspect the turn's final assistant message for an error stop reason.
+        // Pi sets stopReason="error" (or "aborted") with an optional
+        // errorMessage when the provider/API rejected the payload mid-turn
+        // (unsupported media type, content filter, quota, transient 5xx).
+        // prompt() doesn't throw in that case — the turn settles with an
+        // error-carrying message. Surface it to the user so they know the
+        // turn failed and can retry; the session itself is fine.
+        const errorInfo = extractAssistantError(event.messages);
         const text = extractAssistantText(event.messages);
-        if (!text) {
-            logWarning("channelRuntime", "agent_end with no assistant text — nothing to deliver", {
-                platform, channelId,
+
+        if (text) {
+            await this.safeSend(platform, channelId, threadId, { text });
+            return;
+        }
+        if (errorInfo) {
+            await this.safeSend(platform, channelId, threadId, {
+                text: userFacingError(errorInfo, { reason: errorInfo.reason }),
             });
             return;
         }
-        try {
-            await getDispatcher().send(platform, channelId, { text });
-        } catch (e) {
-            logError("channelRuntime", "delivery failed", {
-                platform, channelId,
-                err: e instanceof Error ? e.message : String(e),
-            });
-        }
+        // No text, no error — silent turn. Shouldn't normally happen; log
+        // for operator visibility but don't bother the user.
+        logWarning("channelRuntime", "agent_end with no assistant text and no error — nothing to deliver", {
+            platform, channelId,
+        });
     }
 
     private sweep(): void {
@@ -452,6 +513,105 @@ function seedTransportOrigin(session: AgentSession, msg: Message): void {
 function formatActiveKickoff(msg: Message): string {
     const sender = msg.senderDisplayName || msg.senderId;
     return `[${msg.platform} inbound | from: ${sender} (${msg.senderId}) | channel: ${msg.channelId}]\n${msg.text}`;
+}
+
+/**
+ * Build what we send to Pi's prompt(): the text body (kickoff header +
+ * message text + textual attachment summaries) and the image array for
+ * vision-capable models. Non-ingestible attachments (binaries, images
+ * against a text-only model) become text references so the LLM at least
+ * knows they exist — critical for "I sent you a pptx" style messages
+ * where the model would otherwise have no idea anything was attached.
+ *
+ * The old subprocess router did a similar thing pre-spawn (kickoff text
+ * only, no images — images were just referenced). Passing vision
+ * content as real ImageContent is a capability gain over the old path.
+ */
+function buildPromptFromMessage(
+    msg: Message,
+    model: Model<any> | undefined,
+): { text: string; images: ImageContent[] } {
+    const modelAcceptsImages = !!model && Array.isArray(model.input) && model.input.includes("image");
+
+    const lines: string[] = [formatActiveKickoff(msg)];
+    const images: ImageContent[] = [];
+
+    const atts = msg.attachments ?? [];
+    if (atts.length > 0) {
+        lines.push("", "[Attachments]");
+        for (const a of atts) {
+            if (a.kind === "text") {
+                // Adapter already extracted the text (PDFs, CSVs, .txt etc.).
+                // Inline it so the LLM can read it as plain context.
+                lines.push(`--- ${a.filename ?? a.mimeType} (${a.sourceBytes ?? "?"} bytes) ---`);
+                lines.push(a.text);
+                lines.push("---");
+            } else if (a.kind === "image") {
+                if (modelAcceptsImages) {
+                    images.push({ type: "image", mimeType: a.mimeType, data: a.data });
+                    lines.push(`[Image: ${a.filename ?? a.mimeType} — sent to the vision model]`);
+                } else {
+                    // Current model is text-only. Describe rather than send
+                    // so the provider doesn't reject the call; the LLM can
+                    // still acknowledge the image or ask the user to
+                    // switch channel model.
+                    lines.push(`[Image attachment: ${a.filename ?? a.mimeType} — current model has no vision; ask the user to switch channel model if needed]`);
+                }
+            } else {
+                // Binary — pptx, xlsx, zip, etc. Path reference only; the
+                // agent can choose to invoke a tool (e.g. bash unzip) to
+                // process it, but Pi's prompt() won't try to upload it.
+                lines.push(`[Binary attachment: ${a.filename ?? a.mimeType} (${a.sizeBytes} bytes) at ${a.localPath}]`);
+            }
+        }
+    }
+    return { text: lines.join("\n"), images };
+}
+
+/**
+ * If the final assistant message settled with stopReason="error" or
+ * "aborted", extract its errorMessage + reason so we can surface it to
+ * the user. Pi doesn't throw from prompt() in this case — it just lands
+ * an error-marked AssistantMessage in the turn. Without this, the user
+ * saw nothing when the provider rejected their payload.
+ */
+interface AssistantErrorInfo { reason: "error" | "aborted"; errorMessage?: string }
+function extractAssistantError(messages: ReadonlyArray<unknown>): AssistantErrorInfo | null {
+    // Inspect from the end — the ERROR-causing message is the last one in
+    // the turn on Pi's model (partial earlier messages are legit output).
+    for (let i = messages.length - 1; i >= 0; i--) {
+        const m = messages[i];
+        if (!m || typeof m !== "object") continue;
+        const am = m as { role?: string; stopReason?: string; errorMessage?: string };
+        if (am.role !== "assistant") continue;
+        if (am.stopReason === "error" || am.stopReason === "aborted") {
+            return {
+                reason: am.stopReason,
+                ...(typeof am.errorMessage === "string" && am.errorMessage.length > 0 ? { errorMessage: am.errorMessage } : {}),
+            };
+        }
+        return null; // most recent assistant message is fine — no error
+    }
+    return null;
+}
+
+/**
+ * Turn an error (from a prompt() throw OR an agent_end error-stopped
+ * message) into a one-liner the user sees in chat. Keep the surface
+ * small: "something went wrong, try again" + the raw reason truncated.
+ * The point is the user can keep talking — not a full stack trace.
+ */
+function userFacingError(
+    err: string | AssistantErrorInfo,
+    opts: { reason?: "error" | "aborted" } = {},
+): string {
+    if (typeof err === "string") {
+        const short = err.length > 200 ? err.slice(0, 200) + "…" : err;
+        return `⚠️ I hit an error processing that: ${short}\n\nYou can just try again — the conversation is still alive. Operator can check errors.jsonl.`;
+    }
+    const label = opts.reason === "aborted" ? "The turn was aborted" : "The model call failed";
+    const detail = err.errorMessage ? `: ${err.errorMessage.slice(0, 200)}` : "";
+    return `⚠️ ${label}${detail}.\n\nYou can just try again — the conversation is still alive.`;
 }
 
 /** Pull the assistant's textual reply out of the agent_end event's messages.
