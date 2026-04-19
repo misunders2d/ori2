@@ -54,7 +54,7 @@ const IDLE_TTL_MS = 15 * 60 * 1000;     // dispose channel sessions idle for 15 
 const SWEEP_INTERVAL_MS = 60 * 1000;    // check for idle sessions every minute
 const MAX_TURN_TIMEOUT_MS = 300_000;    // 5 min max per turn — safety net only
 
-interface ChannelEntry {
+export interface ChannelEntry {
     session: AgentSession;
     sessionFile: string;
     lastActivity: number;
@@ -278,6 +278,16 @@ export class ChannelRuntime {
         this.channels.clear();
         this.services = null;
         this.servicesPromise = null;
+    }
+
+    /**
+     * Test-only: inject a pre-built ChannelEntry so tests can drive
+     * handleActiveInbound without touching Pi's real AgentSession factory.
+     * The test provides a minimal AgentSession stub and asserts what
+     * handleActiveInbound calls on it (session.prompt with images etc).
+     */
+    __injectChannelEntryForTests(platform: string, channelId: string, entry: ChannelEntry): void {
+        this.channels.set(channelKey(platform, channelId), entry);
     }
 
     private async getOrCreate(platform: string, channelId: string): Promise<ChannelEntry> {
@@ -582,7 +592,8 @@ function formatActiveKickoff(msg: Message): string {
  * only, no images — images were just referenced). Passing vision
  * content as real ImageContent is a capability gain over the old path.
  */
-function buildPromptFromMessage(
+// Exported for tests. Production code calls via handleActiveInbound only.
+export function buildPromptFromMessage(
     msg: Message,
     model: Model<any> | undefined,
 ): { text: string; images: ImageContent[] } {

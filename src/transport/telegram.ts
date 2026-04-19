@@ -367,10 +367,16 @@ export class TelegramAdapter implements TransportAdapter {
         const fileInfo = await this.callApi<{ file_path: string }>(token, "getFile", { file_id: fileId });
         if (!fileInfo.file_path) throw new Error(`getFile returned no file_path for ${fileId}`);
         const url = `${TELEGRAM_API_BASE}/file/bot${token}/${fileInfo.file_path}`;
-        const res = await fetch(url);
+        const fetchImpl = __testFetch ?? fetch;
+        const res = await fetchImpl(url);
         if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`);
         const buf = await res.arrayBuffer();
         return Buffer.from(buf);
+    }
+
+    /** Test-only: drive handleIncoming directly without a real poll loop. */
+    async __handleIncomingForTests(token: string, m: TelegramMessage): Promise<void> {
+        return this.handleIncoming(token, m);
     }
 
     private async sendAttachment(token: string, chatId: number, att: MediaPayload): Promise<void> {
@@ -406,7 +412,8 @@ export class TelegramAdapter implements TransportAdapter {
             body: JSON.stringify(params),
         };
         if (signal) init.signal = signal;
-        const res = await fetch(url, init);
+        const fetchImpl = __testFetch ?? fetch;
+        const res = await fetchImpl(url, init);
         const json = (await res.json()) as TelegramApiResponse<T>;
         if (!json.ok) {
             throw new Error(`Telegram API ${method}: ${json.description ?? `HTTP ${res.status}`}`);
@@ -416,7 +423,8 @@ export class TelegramAdapter implements TransportAdapter {
 
     private async callApiForm<T>(token: string, method: string, form: FormData): Promise<T> {
         const url = `${TELEGRAM_API_BASE}/bot${token}/${method}`;
-        const res = await fetch(url, { method: "POST", body: form });
+        const fetchImpl = __testFetch ?? fetch;
+        const res = await fetchImpl(url, { method: "POST", body: form });
         const json = (await res.json()) as TelegramApiResponse<T>;
         if (!json.ok) {
             throw new Error(`Telegram API ${method}: ${json.description ?? `HTTP ${res.status}`}`);
@@ -441,6 +449,15 @@ export class TelegramAdapter implements TransportAdapter {
             console.error("[telegram] failed to persist offset:", e);
         }
     }
+}
+
+// Test-only fetch injection seam. Tests substitute a mock fetch here so
+// they can drive the whole adapter (getFile + file/ download + getUpdates)
+// without opening real network connections. Production code uses the
+// global fetch directly; a null binding here is the default.
+let __testFetch: typeof fetch | null = null;
+export function __setTelegramFetchForTests(f: typeof fetch | null): void {
+    __testFetch = f;
 }
 
 /**
