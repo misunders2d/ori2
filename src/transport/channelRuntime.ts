@@ -110,6 +110,22 @@ export class ChannelRuntime {
         const entry = await this.getOrCreate(msg.platform, msg.channelId);
         entry.lastActivity = Date.now();
 
+        // Seed a transport-origin custom entry on the channel session BEFORE
+        // prompt() so tools that call currentOrigin(ctx.sessionManager)
+        // (admin_gate.tool_call, agent_introspection.resolveTargetAndAdmin,
+        // memory_save, schedule_reminder, ...) learn who's actually driving
+        // this turn. Without this, identity.ts walks the branch, finds no
+        // matching entries, returns null, and callers fall back to
+        // inferOriginFromCli() — i.e. the CLI OS user, who is implicit
+        // admin. That silently upgrades every chat user to admin for
+        // tool_call ACL checks and breaks admin-only tools from chat
+        // (resolveTargetAndAdmin throws "cannot identify caller").
+        //
+        // The old subprocess-per-turn router seeded this before spawn
+        // (src/transport/channelRouter.ts@f69bb81^:406). The in-process
+        // refactor dropped it.
+        seedTransportOrigin(entry.session, msg);
+
         // Hot-swap the model if the channel's binding changed since the last
         // turn (or since session creation). Must happen BEFORE prompt() — Pi's
         // setModel updates agent state and session JSONL synchronously, so
@@ -401,6 +417,33 @@ function resolveBinding(
     }
     const thinkingLevel = binding.thinkingLevel as ThinkingLevel | undefined;
     return { binding, model, thinkingLevel };
+}
+
+/**
+ * Append a `transport-origin` custom entry to the channel session so
+ * currentOrigin(sm) can return the actual inbound speaker for this turn.
+ * Best-effort: failures are logged and swallowed so a corrupted session
+ * file doesn't block an answer. (Old router had the same best-effort
+ * policy — see src/transport/channelRouter.ts@f69bb81^:397-421.)
+ */
+function seedTransportOrigin(session: AgentSession, msg: Message): void {
+    try {
+        session.sessionManager.appendCustomEntry("transport-origin", {
+            platform: msg.platform,
+            channelId: msg.channelId,
+            ...(msg.threadId !== undefined ? { threadId: msg.threadId } : {}),
+            senderId: msg.senderId,
+            senderDisplayName: msg.senderDisplayName,
+            timestamp: msg.timestamp,
+        });
+    } catch (e) {
+        logWarning("channelRuntime", "transport-origin seed failed — proceeding without it", {
+            platform: msg.platform,
+            channelId: msg.channelId,
+            senderId: msg.senderId,
+            err: e instanceof Error ? e.message : String(e),
+        });
+    }
 }
 
 /** Format the inbound message into the agent's prompt text. Mirrors the
