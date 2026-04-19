@@ -511,6 +511,110 @@ describe("ChannelRuntime.applyChannelModel — live-apply after set_channel_mode
     });
 });
 
+// =============================================================================
+// Abort keyword ("stop" / "/stop") — pi-telegram convention.
+// Without this, "stop" queues as a new user message via followUp and the
+// current turn keeps streaming. User expectation + pi-telegram canonical
+// behavior: abort the live turn, reply "Stopped.", no prompt dispatch.
+// =============================================================================
+
+describe("ChannelRuntime.handleActiveInbound — 'stop' keyword aborts the live turn", () => {
+    beforeEach(() => {
+        TransportDispatcher.__resetForTests();
+    });
+
+    type SessionCall = { type: "prompt" | "abort"; arg?: unknown };
+
+    function rigForStop(channelKey: string): { rt: ChannelRuntime; sessionCalls: SessionCall[]; dispatchedTo: Array<{ channelId: string; text: string }> } {
+        const rt = new ChannelRuntime();
+        const sessionCalls: SessionCall[] = [];
+        const dispatchedTo: Array<{ channelId: string; text: string }> = [];
+
+        // Fake adapter records outbound sends.
+        const d = getDispatcher();
+        d.register({
+            platform: "telegram",
+            start: async () => {}, stop: async () => {},
+            send: async (channelId: string, response: AgentResponse) => {
+                dispatchedTo.push({ channelId, text: response.text });
+            },
+            setHandler: () => {},
+            status: () => ({ platform: "telegram", state: "running" }),
+        });
+
+        injectEntry(rt, channelKey, {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            session: {
+                prompt: async (text: string) => { sessionCalls.push({ type: "prompt", arg: text }); },
+                abort: async () => { sessionCalls.push({ type: "abort" }); },
+            } as any,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            sessionManager: { appendCustomEntry: () => "id", getBranch: () => [] } as any,
+            sessionFile: "/tmp/stop.jsonl",
+            lastActivity: 0,
+            unsubscribe: () => {},
+        });
+
+        return { rt, sessionCalls, dispatchedTo };
+    }
+
+    it("bare 'stop' → session.abort called; session.prompt NOT called; user gets 'Stopped.'", async () => {
+        const { rt, sessionCalls, dispatchedTo } = rigForStop("telegram:-100stop1");
+
+        await rt.handleActiveInbound({
+            platform: "telegram", channelId: "-100stop1", senderId: "u1",
+            senderDisplayName: "U", text: "stop", addressedToBot: true, timestamp: 1,
+        });
+        // Flush microtasks so the void-awaited abort lands.
+        await tick(2);
+
+        assert.equal(sessionCalls.filter((c) => c.type === "abort").length, 1);
+        assert.equal(sessionCalls.filter((c) => c.type === "prompt").length, 0,
+            "prompt MUST NOT be called — that would queue 'stop' as a followUp user message instead of aborting");
+        assert.equal(dispatchedTo.length, 1);
+        assert.equal(dispatchedTo[0]!.text, "Stopped.");
+    });
+
+    it("'/stop' (slash-command form) → same abort path, language-agnostic", async () => {
+        const { rt, sessionCalls } = rigForStop("telegram:-100stop2");
+        await rt.handleActiveInbound({
+            platform: "telegram", channelId: "-100stop2", senderId: "u1",
+            senderDisplayName: "U", text: "/stop", addressedToBot: true, timestamp: 1,
+        });
+        await tick(2);
+        assert.equal(sessionCalls.filter((c) => c.type === "abort").length, 1);
+        assert.equal(sessionCalls.filter((c) => c.type === "prompt").length, 0);
+    });
+
+    it("case-insensitive + trims surrounding whitespace — 'STOP ' and ' stop\\n' both abort", async () => {
+        const { rt, sessionCalls } = rigForStop("telegram:-100stop3");
+        await rt.handleActiveInbound({
+            platform: "telegram", channelId: "-100stop3", senderId: "u1",
+            senderDisplayName: "U", text: "STOP ", addressedToBot: true, timestamp: 1,
+        });
+        await rt.handleActiveInbound({
+            platform: "telegram", channelId: "-100stop3", senderId: "u1",
+            senderDisplayName: "U", text: " stop\n", addressedToBot: true, timestamp: 2,
+        });
+        await tick(2);
+        assert.equal(sessionCalls.filter((c) => c.type === "abort").length, 2);
+        assert.equal(sessionCalls.filter((c) => c.type === "prompt").length, 0);
+    });
+
+    it("partial match does NOT abort — 'stop doing X' goes through as a normal prompt", async () => {
+        const { rt, sessionCalls } = rigForStop("telegram:-100stop4");
+        await rt.handleActiveInbound({
+            platform: "telegram", channelId: "-100stop4", senderId: "u1",
+            senderDisplayName: "U", text: "stop doing that and tell me what model you are on",
+            addressedToBot: true, timestamp: 1,
+        });
+        await tick(2);
+        assert.equal(sessionCalls.filter((c) => c.type === "abort").length, 0,
+            "literal match only — partial 'stop ...' must NOT abort, the LLM interprets it");
+        assert.equal(sessionCalls.filter((c) => c.type === "prompt").length, 1);
+    });
+});
+
 describe("ChannelRuntime.resetChannel — cache eviction (bug-class guard)", () => {
     it("no cached session → reset:false, reason:no-active-session", async () => {
         const rt = new ChannelRuntime();

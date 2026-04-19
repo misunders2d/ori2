@@ -149,6 +149,33 @@ export class ChannelRuntime {
             timestamp: msg.timestamp,
         });
 
+        // Abort-keyword short-circuit. pi-telegram convention: bare "stop" or
+        // "/stop" as the ENTIRE message body aborts the currently-running turn
+        // instead of queuing a new user message via followUp. `/stop` is the
+        // language-agnostic form; bare "stop" is an English convenience.
+        // Deliberately literal-match (not semantic regex) — partial hits like
+        // "stop doing X and tell me Y" still go through normally.
+        const trimmedLower = (msg.text ?? "").trim().toLowerCase();
+        if (trimmedLower === "stop" || trimmedLower === "/stop") {
+            logInfo("channelRuntime", "abort keyword received", {
+                platform: msg.platform, channelId: msg.channelId, senderId: msg.senderId,
+            });
+            // Fire-and-forget the abort; Pi's abort() awaits agent idle but
+            // we don't block the user's confirmation on that settlement.
+            void entry.session.abort().catch((e) => {
+                logWarning("channelRuntime", "session.abort threw", {
+                    err: e instanceof Error ? e.message : String(e),
+                });
+            });
+            try {
+                await getDispatcher().send(msg.platform, msg.channelId, {
+                    text: "Stopped.",
+                    ...(msg.threadId ? { replyToMessageId: msg.threadId } : {}),
+                });
+            } catch { /* best effort */ }
+            return;
+        }
+
         // Pi's `prompt(text, { images })` runs ONE agent turn. If a turn
         // is already running for this channel, we use Pi's queue: enqueue
         // the new input as a follow-up so it joins after the current turn
