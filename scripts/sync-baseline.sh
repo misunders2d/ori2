@@ -4,36 +4,49 @@
 # in the upstream ori2 repo since the operator cloned + detached.
 #
 # Reads .ori2-baseline (created by bootstrap.sh at clone time) to know which
-# repo + commit the operator forked from. Temporarily adds `ori2-upstream`
-# as a remote, fetches, prints the new commits + a summary diff, then
-# removes the remote so the operator's repo stays detached. The operator
-# decides what to do with the info — merge, cherry-pick, or ignore.
+# repo + commit the operator forked from. Ensures `ori2-upstream` is
+# registered as a remote (bootstrap.sh adds it on clone-and-detach, but
+# we re-add it here for older installs and in case the operator dropped it),
+# fetches, prints the new commits + a summary diff, and leaves the remote in
+# place so `git cherry-pick <sha>` Just Works without a second setup step.
+# The operator decides what to do with the info — cherry-pick, merge, or
+# ignore.
 #
 # Usage:
-#   ./scripts/sync-baseline.sh             — fetch + print log/diff
+#   ./scripts/sync-baseline.sh             — fetch + print log/diff (remote stays)
 #   ./scripts/sync-baseline.sh --preview   — same as default (alias)
-#   ./scripts/sync-baseline.sh --remote    — fetch AND keep the remote (for
-#                                            when you genuinely want to do
-#                                            a merge yourself afterwards)
+#   ./scripts/sync-baseline.sh --drop      — fetch, print, then REMOVE the
+#                                            remote afterwards (pre-April-2026
+#                                            behavior; useful if you want the
+#                                            repo to look pristine-detached)
 #   ./scripts/sync-baseline.sh --mark <sha> — update .ori2-baseline's
 #                                            baseline_sha after a successful
 #                                            manual merge. Use git's resolved
 #                                            SHA (typically the one you merged).
 #
 # This script never auto-merges. Auto-merging after an operator has been
-# evolving their bot is a recipe for destroying their work.
+# evolving their bot is a recipe for destroying their work. Cherry-pick the
+# commits you want instead.
 #
 set -euo pipefail
 
 MARKER=".ori2-baseline"
 REMOTE_NAME="ori2-upstream"
-KEEP_REMOTE=0
+# Default: keep the remote registered. bootstrap.sh sets it up on
+# clone-and-detach, and `git cherry-pick ori2-upstream/...` requires the
+# remote to be present. `--drop` opts into the old pre-April-2026 behavior
+# where the remote gets torn down after the preview.
+DROP_REMOTE=0
+# --remote kept as an accepted-but-ignored flag so anyone who scripted it
+# pre-April-2026 doesn't break. It used to MEAN "keep the remote"; keeping
+# is now the default.
 MARK_SHA=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --preview) shift ;;            # default behaviour
-        --remote) KEEP_REMOTE=1; shift ;;
+        --remote) shift ;;             # compat-only; keeping is now the default
+        --drop) DROP_REMOTE=1; shift ;;
         --mark) MARK_SHA="$2"; shift 2 ;;
         -h|--help)
             sed -n 's/^# \?//p' "$0" | head -30
@@ -93,9 +106,11 @@ else
     git remote add "$REMOTE_NAME" "$UPSTREAM_REPO"
 fi
 
-# Clean up the remote on exit unless the operator asked us to keep it.
+# Tear down the remote on exit only when --drop was passed. Default
+# (since April 2026) is to keep it — bootstrap.sh sets it up on
+# clone-and-detach and cherry-pick needs it.
 cleanup() {
-    if [[ "$KEEP_REMOTE" -ne 1 ]]; then
+    if [[ "$DROP_REMOTE" -eq 1 ]]; then
         git remote remove "$REMOTE_NAME" 2>/dev/null || true
     fi
 }
@@ -131,15 +146,13 @@ echo "== Files changed =="
 git diff --stat "$COMMIT_RANGE" | tail -30 || true
 echo
 
-if [[ "$KEEP_REMOTE" -eq 1 ]]; then
-    echo "Remote '$REMOTE_NAME' preserved. To merge (careful — may conflict with"
-    echo "your evolutions):"
-    echo "    git merge $REMOTE_NAME/$UPSTREAM_BRANCH"
-    echo "Or cherry-pick specific commits:"
-    echo "    git cherry-pick <sha>"
+if [[ "$DROP_REMOTE" -eq 1 ]]; then
+    echo "Remote '$REMOTE_NAME' removed (--drop). Re-run this script (without"
+    echo "--drop) to re-attach and preview again."
+else
+    echo "Remote '$REMOTE_NAME' is attached. Use directly:"
+    echo "    git cherry-pick <sha>                         # take specific fixes"
+    echo "    git merge $REMOTE_NAME/$UPSTREAM_BRANCH       # full merge (may conflict)"
     echo "After merging, update the marker:"
     echo "    ./scripts/sync-baseline.sh --mark \$(git rev-parse HEAD)"
-else
-    echo "Remote dropped — your repo is detached again."
-    echo "To pull specific changes, re-run with --remote and use git directly."
 fi

@@ -305,6 +305,14 @@ fi
 # INSTALL.md "Publishing your evolved bot"). --keep-upstream opts out.
 # Only detaches freshly-cloned repos: if the operator ran bootstrap inside
 # their own checkout we leave their remotes alone.
+#
+# Detach semantics: we blow away .git (fresh history, no shared refs) so
+# the operator's commits never have upstream ancestry to leak, and their
+# `origin` slot is free for THEIR own remote. BUT we re-attach the
+# upstream as a NAMED remote (`ori2-upstream`) so they can still
+# `git fetch ori2-upstream && git cherry-pick <sha>` to pull specific
+# improvements on demand. No auto-merge, no background pull — the
+# remote is just there for the operator to use when they want.
 if [[ "$DID_CLONE" -eq 1 ]] && [[ "$KEEP_UPSTREAM" -ne 1 ]]; then
     step "Detaching from upstream (fresh git history for your fork)"
     UPSTREAM_SHA="$(git -C "$INSTALL_DIR" rev-parse HEAD)"
@@ -335,13 +343,24 @@ EOF
         git add -A
         git -c user.name="$GIT_USER_NAME" -c user.email="$GIT_USER_EMAIL" \
             commit -q -m "Initial snapshot from ori2 baseline ${UPSTREAM_DESC}"
+        # Attach upstream as a NAMED remote so the operator can fetch +
+        # cherry-pick without running sync-baseline.sh first. `origin` is
+        # still free for them to point at their own fork on GitHub.
+        # Idempotent: the fresh `git init` above guarantees no remote exists.
+        git remote add ori2-upstream "$REPO"
         echo "✓ Detached. New repo: $(git rev-parse --short HEAD) on branch $BRANCH."
         echo "  Baseline marker: .ori2-baseline (baseline_sha=${UPSTREAM_SHORT})"
+        echo "  Upstream remote: ori2-upstream → $REPO (fetch + cherry-pick ready;"
+        echo "                   never auto-pulled)"
         echo
         echo "  To publish this bot to your own GitHub:"
         echo "    git remote add origin git@github.com:YOU/YOUR-BOT.git"
         echo "    git push -u origin ${BRANCH}"
-        echo "  To pull future ori2 baseline updates:"
+        echo "  To pull improvements from upstream ori2:"
+        echo "    git fetch ori2-upstream ${BRANCH}"
+        echo "    git log HEAD..ori2-upstream/${BRANCH}       # see what's new"
+        echo "    git cherry-pick <sha>                       # take specific fixes"
+        echo "  For a guided preview + marker bookkeeping:"
         echo "    ./scripts/sync-baseline.sh"
     )
 fi
