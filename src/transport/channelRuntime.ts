@@ -54,6 +54,16 @@ const MAX_TURN_TIMEOUT_MS = 300_000;    // 5 min max per turn — safety net onl
 
 interface ChannelEntry {
     session: AgentSession;
+    /**
+     * The per-channel SessionManager — load-bearing for transport-origin
+     * tagging. Before every inbound turn we write a `transport-origin` custom
+     * entry here so `currentOrigin(ctx.sessionManager)` resolves correctly
+     * inside tool execute() calls. Without this, tools that use currentOrigin
+     * (set_channel_model, reset_channel_session, reload_extensions,
+     * hand_off_session, admin_gate's tool-ACL, memory attribution) all fail
+     * with "cannot identify caller" on non-CLI channels.
+     */
+    sessionManager: SessionManager;
     sessionFile: string;
     lastActivity: number;
     /** Unsubscribe handle returned by session.subscribe(...) */
@@ -63,6 +73,13 @@ interface ChannelEntry {
      *  adapter.sendTyping?() if the adapter implements it; no-op otherwise. */
     typingTimer?: NodeJS.Timeout;
 }
+
+/** Custom-entry type for inbound-origin tagging. See `src/core/identity.ts`
+ *  for the consumer-side `currentOrigin()` that walks the branch looking for
+ *  entries with this type. Kept as a literal here (not a shared constant) to
+ *  avoid an import cycle — identity.ts imports from multiple transport
+ *  modules indirectly. */
+const TRANSPORT_ORIGIN_TYPE = "transport-origin";
 
 export class ChannelRuntime {
     private services: AgentSessionServices | null = null;
@@ -102,6 +119,29 @@ export class ChannelRuntime {
         const key = channelKey(msg.platform, msg.channelId);
         const entry = await this.getOrCreate(msg.platform, msg.channelId);
         entry.lastActivity = Date.now();
+
+        // CRITICAL — write transport-origin BEFORE prompt. Downstream tools
+        // run inside the turn's execution and read origin via
+        // currentOrigin(ctx.sessionManager). If origin lands after prompt
+        // starts, the branch is empty when tools look up, and they fail
+        // with "cannot identify caller". Pre-f69bb81, this was written by
+        // transport_bridge's setPushToPi callback — but that callback is
+        // CLI-only; non-CLI (Telegram/Slack/A2A) goes through this method
+        // directly and skips pushToPi entirely. ChannelRuntime is the only
+        // choke-point that sees every non-CLI inbound.
+        //
+        // The entry is in-memory-immediately on the SessionManager (Pi's
+        // _appendEntry pushes to fileEntries + byId + leafId synchronously,
+        // then triggers lazy _persist). getBranch() traversal sees it
+        // without waiting for the disk flush.
+        entry.sessionManager.appendCustomEntry(TRANSPORT_ORIGIN_TYPE, {
+            platform: msg.platform,
+            channelId: msg.channelId,
+            ...(msg.threadId !== undefined ? { threadId: msg.threadId } : {}),
+            senderId: msg.senderId,
+            senderDisplayName: msg.senderDisplayName ?? msg.senderId,
+            timestamp: msg.timestamp,
+        });
 
         // Pi's `prompt(text)` runs ONE agent turn. If a turn is already
         // running for this channel, we use Pi's queue: enqueue the new
@@ -312,6 +352,7 @@ export class ChannelRuntime {
         // Session lives across many turns; this subscription does too.
         const entry: ChannelEntry = {
             session,
+            sessionManager: sm,
             sessionFile,
             lastActivity: Date.now(),
             // unsubscribe assigned below — TS needs the entry first.

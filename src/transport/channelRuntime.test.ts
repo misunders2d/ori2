@@ -15,6 +15,14 @@ interface FakeEntry {
     session: {
         reload?: () => Promise<void>;
         compact?: () => Promise<{ summary: string; firstKeptEntryId: string; tokensBefore: number }>;
+        prompt?: (text: string, opts?: unknown) => Promise<void>;
+    };
+    /** Optional for handOff / reload tests that don't exercise it; required
+     *  in production ChannelEntry. Typed loose so tests can stub only the
+     *  methods they need. */
+    sessionManager?: {
+        appendCustomEntry?: (customType: string, data: unknown) => string;
+        getBranch?: () => ReadonlyArray<unknown>;
     };
     sessionFile: string;
     lastActivity: number;
@@ -223,7 +231,7 @@ describe("ChannelRuntime.handOffChannel", () => {
     it("updates lastActivity when queueing a hand-off (don't evict mid-handoff)", async () => {
         const rt = new ChannelRuntime();
         const { getChannelSessions } = await import("../core/channelSessions.js");
-        const oldFile = getChannelSessions().getOrCreateSessionFile("telegram", "-100touch-ho");
+        const oldFile = getChannelSessions().getOrCreateSessionFile("telegram", "-100touch-ho-b");
         const entry: FakeEntry = {
             session: {
                 compact: async () => ({ summary: "brief", firstKeptEntryId: "x", tokensBefore: 100 }),
@@ -232,9 +240,153 @@ describe("ChannelRuntime.handOffChannel", () => {
             lastActivity: 0,
             unsubscribe: () => {},
         };
-        injectEntry(rt, "telegram:-100touch-ho", entry);
+        injectEntry(rt, "telegram:-100touch-ho-b", entry);
         const before = Date.now();
-        await rt.handOffChannel("telegram", "-100touch-ho");
+        await rt.handOffChannel("telegram", "-100touch-ho-b");
         assert.ok(entry.lastActivity >= before, "lastActivity must be refreshed");
+    });
+});
+
+// =============================================================================
+// REGRESSION GUARD: handleActiveInbound MUST write a transport-origin custom
+// entry to the per-channel session's SessionManager BEFORE invoking
+// session.prompt(). Without this, currentOrigin() returns null for tools
+// running in per-channel Telegram/Slack/A2A sessions — breaking
+// set_channel_model, reset_channel_session, reload_extensions, admin_gate's
+// tool-ACL, and memory attribution.
+//
+// Pre-f69bb81 (subprocess model), transport_bridge's setPushToPi callback
+// wrote the origin. Post-f69bb81 (in-process per-channel), non-CLI inbound
+// skips pushToPi entirely (it's CLI-only). channelRuntime is the ONLY choke-
+// point that sees every non-CLI inbound — it's the correct place to write.
+// =============================================================================
+
+describe("ChannelRuntime.handleActiveInbound — transport-origin tagging (regression guard for currentOrigin)", () => {
+    it("writes transport-origin to the per-channel SessionManager BEFORE calling session.prompt", async () => {
+        const rt = new ChannelRuntime();
+        const events: Array<string> = [];
+        const appended: Array<{ customType: string; data: Record<string, unknown> }> = [];
+        const promptCalls: Array<{ text: string }> = [];
+
+        const fakeSm = {
+            appendCustomEntry: (customType: string, data: unknown): string => {
+                events.push("append");
+                appended.push({ customType, data: data as Record<string, unknown> });
+                return "id-origin";
+            },
+            getBranch: () => [],
+        };
+        const fakeSession = {
+            prompt: async (text: string, _opts: unknown): Promise<void> => {
+                events.push("prompt");
+                promptCalls.push({ text });
+            },
+        };
+        injectEntry(rt, "telegram:-100msgguard", {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            session: fakeSession as any,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            sessionManager: fakeSm as any,
+            sessionFile: "/tmp/msgguard.jsonl",
+            lastActivity: 0,
+            unsubscribe: () => {},
+        });
+
+        await rt.handleActiveInbound({
+            platform: "telegram",
+            channelId: "-100msgguard",
+            senderId: "alice",
+            senderDisplayName: "Alice",
+            text: "switch to opus",
+            addressedToBot: true,
+            timestamp: 1713400000000,
+        });
+
+        // (a) Exactly one transport-origin entry written.
+        assert.equal(appended.length, 1, "exactly one transport-origin entry must be written per inbound");
+        assert.equal(appended[0]!.customType, "transport-origin");
+        // (b) Entry data matches the inbound message fields.
+        const data = appended[0]!.data;
+        assert.equal(data["platform"], "telegram");
+        assert.equal(data["channelId"], "-100msgguard");
+        assert.equal(data["senderId"], "alice");
+        assert.equal(data["senderDisplayName"], "Alice");
+        assert.equal(data["timestamp"], 1713400000000);
+        // (c) Ordering: append ran BEFORE prompt. This is load-bearing — if
+        //     prompt fires first, tools invoked during the turn still see an
+        //     empty branch and currentOrigin returns null.
+        assert.deepEqual(events, ["append", "prompt"], "append must happen before prompt");
+        assert.equal(promptCalls.length, 1, "prompt called exactly once");
+    });
+
+    it("preserves threadId when present on the inbound message", async () => {
+        const rt = new ChannelRuntime();
+        let captured: Record<string, unknown> | null = null;
+        injectEntry(rt, "telegram:-100thread", {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            session: { prompt: async () => {} } as any,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            sessionManager: {
+                appendCustomEntry: (_ct: string, data: unknown) => {
+                    captured = data as Record<string, unknown>;
+                    return "id";
+                },
+                getBranch: () => [],
+            } as any,
+            sessionFile: "/tmp/thread.jsonl",
+            lastActivity: 0,
+            unsubscribe: () => {},
+        });
+
+        await rt.handleActiveInbound({
+            platform: "telegram",
+            channelId: "-100thread",
+            threadId: "42",
+            senderId: "bob",
+            senderDisplayName: "Bob",
+            text: "hi in thread",
+            addressedToBot: true,
+            timestamp: 1713400001000,
+        });
+
+        assert.ok(captured, "appendCustomEntry must have been called");
+        assert.equal((captured as Record<string, unknown>)["threadId"], "42");
+    });
+
+    it("still writes origin even when session.prompt throws — origin must land before the prompt runs", async () => {
+        const rt = new ChannelRuntime();
+        let originWritten = false;
+        injectEntry(rt, "telegram:-100throw", {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            session: {
+                prompt: async () => { throw new Error("model API down"); },
+            } as any,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            sessionManager: {
+                appendCustomEntry: (ct: string, _d: unknown) => {
+                    if (ct === "transport-origin") originWritten = true;
+                    return "id";
+                },
+                getBranch: () => [],
+            } as any,
+            sessionFile: "/tmp/throw.jsonl",
+            lastActivity: 0,
+            unsubscribe: () => {},
+        });
+
+        // handleActiveInbound catches the throw internally and sends an error
+        // message to the user — it should NOT propagate. We still expect the
+        // origin to have been written before the throw hit.
+        await rt.handleActiveInbound({
+            platform: "telegram",
+            channelId: "-100throw",
+            senderId: "alice",
+            senderDisplayName: "Alice",
+            text: "x",
+            addressedToBot: true,
+            timestamp: 1713400002000,
+        });
+
+        assert.equal(originWritten, true, "origin must land before session.prompt runs (so even failed turns have an audit trail)");
     });
 });
