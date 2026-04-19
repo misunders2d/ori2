@@ -70,11 +70,13 @@ Before writing, check if somebody has already solved this. Most evolutions are a
 
 ### 2a. Three mandatory searches
 
-1. **Pi's own examples.** Fetch / read:
-   - `node_modules/@mariozechner/pi-coding-agent/docs/` (in this repo)
-   - `https://github.com/badlogic/pi-mono/tree/main/examples/extensions` via `web_fetch`
+1. **Pi's own examples — START HERE.** Load the `pi-ecosystem-prior-art` skill (`/skill pi-ecosystem-prior-art` or read `.pi/skills/pi-ecosystem-prior-art/SKILL.md`) — it's a curated index of bundled Pi examples + `badlogic/*` + `openclaw/*` repos keyed by what you're building. If your feature matches a filename there, read that file BEFORE running a WebSearch.
 
-   Look for extensions that demonstrate the pattern you need (subagent for long-running sub-tasks, protected-paths for write gating, etc.).
+   Raw sources (the skill points to specific files within these):
+   - `node_modules/@mariozechner/pi-coding-agent/examples/` (in this repo)
+   - `github.com/badlogic/pi-telegram`, `badlogic/pi-mom`, `badlogic/pi-mono` via `web_fetch` or `gh api`
+
+   Look for extensions that demonstrate the pattern you need (subagent for long-running sub-tasks, protected-paths for write gating, `pi-telegram` for transport/media-handling, etc.).
 
 2. **GitHub code search.** Use `web_search` / `web_fetch`:
    - `"pi.registerTool" <domain-keyword>` site:github.com
