@@ -3,13 +3,25 @@
 // without standing up a full Pi AgentSession.
 
 process.env["BOT_NAME"] = "_test_channel_runtime";
+// Force guardrails off for tests; each attachment test would otherwise pay
+// the fastembed ONNX boot cost (~25s first time, flaky in CI). The lazy-
+// import in buildKickoffContent catches the ModuleLoadError and proceeds
+// without tagging — which is exactly the path we're exercising here (the
+// regressions aren't about the tag content, they're about whether the
+// attachment reaches session.prompt at all).
+process.env["GUARDRAIL_DISABLED"] = "1";
 
 import { describe, it, before, after, beforeEach } from "node:test";
 import { strict as assert } from "node:assert";
 import fs from "node:fs";
-import { ChannelRuntime } from "./channelRuntime.js";
+import os from "node:os";
+import path from "node:path";
+import { ChannelRuntime, buildKickoffContent } from "./channelRuntime.js";
 import { botDir } from "../core/paths.js";
 import { ChannelSessions } from "../core/channelSessions.js";
+import { enqueuePending, __resetPendingAttachmentsForTests } from "../core/pendingAttachments.js";
+import { TransportDispatcher, getDispatcher } from "./dispatcher.js";
+import type { Message, MediaPayload, AgentResponse, TransportAdapter } from "./types.js";
 
 interface FakeEntry {
     session: {
@@ -388,5 +400,311 @@ describe("ChannelRuntime.handleActiveInbound — transport-origin tagging (regre
         });
 
         assert.equal(originWritten, true, "origin must land before session.prompt runs (so even failed turns have an audit trail)");
+    });
+});
+
+// =============================================================================
+// buildKickoffContent — pure helper. Unit-tests the multimodal wiring
+// (images → ImageContent[], text → inlined, binary → path+size mention).
+// =============================================================================
+
+describe("buildKickoffContent — multimodal wiring (regression guard for dropped attachments)", () => {
+    it("plain-text message (no attachments): text passes through, images=[]", async () => {
+        const { text, images } = await buildKickoffContent({
+            platform: "telegram", channelId: "-100plain", senderId: "u1",
+            senderDisplayName: "User One", text: "hello", addressedToBot: true,
+            timestamp: 1,
+        });
+        assert.equal(images.length, 0);
+        assert.match(text, /telegram inbound.*User One/);
+        assert.match(text, /hello/);
+        assert.doesNotMatch(text, /Attachments from this message/);
+    });
+
+    it("image attachment: becomes ImageContent in options.images + listed in prompt", async () => {
+        const { text, images } = await buildKickoffContent({
+            platform: "telegram", channelId: "-100img", senderId: "u1",
+            senderDisplayName: "U", text: "look at this", addressedToBot: true,
+            timestamp: 1,
+            attachments: [
+                { kind: "image", mimeType: "image/png", data: "BASE64IMG==", filename: "photo.png" },
+            ],
+        });
+        assert.equal(images.length, 1);
+        assert.equal(images[0]!.type, "image");
+        assert.equal(images[0]!.data, "BASE64IMG==");
+        assert.equal(images[0]!.mimeType, "image/png");
+        assert.match(text, /Attachments from this message/);
+        assert.match(text, /image "photo\.png"/);
+    });
+
+    it("text attachment (PDF/CSV text extracted at boundary): extracted text inlined in prompt", async () => {
+        const { text, images } = await buildKickoffContent({
+            platform: "telegram", channelId: "-100txt", senderId: "u1",
+            senderDisplayName: "U", text: "summarize", addressedToBot: true,
+            timestamp: 1,
+            attachments: [
+                {
+                    kind: "text",
+                    mimeType: "application/pdf",
+                    text: "Invoice #42\nTotal: $1234.56",
+                    filename: "invoice.pdf",
+                    sourceBytes: 51234,
+                },
+            ],
+        });
+        assert.equal(images.length, 0);
+        assert.match(text, /file "invoice\.pdf"/);
+        assert.match(text, /=== invoice\.pdf ===/);
+        assert.match(text, /Invoice #42/);
+        assert.match(text, /Total: \$1234\.56/);
+        assert.match(text, /=== end of invoice\.pdf ===/);
+    });
+
+    it("binary attachment: path + size mentioned, NOT inlined", async () => {
+        const { text, images } = await buildKickoffContent({
+            platform: "telegram", channelId: "-100bin", senderId: "u1",
+            senderDisplayName: "U", text: "", addressedToBot: true,
+            timestamp: 1,
+            attachments: [
+                {
+                    kind: "binary",
+                    mimeType: "application/x-executable",
+                    localPath: "/tmp/mystery.bin",
+                    sizeBytes: 8192,
+                    filename: "mystery.bin",
+                },
+            ],
+        });
+        assert.equal(images.length, 0);
+        assert.match(text, /file "mystery\.bin"/);
+        assert.match(text, /saved locally at \/tmp\/mystery\.bin/);
+        assert.match(text, /8192 bytes/);
+    });
+
+    it("mixed: image + PDF-text + binary produces single coherent prompt + one ImageContent", async () => {
+        const { text, images } = await buildKickoffContent({
+            platform: "telegram", channelId: "-100mix", senderId: "u1",
+            senderDisplayName: "U", text: "process these", addressedToBot: true,
+            timestamp: 1,
+            attachments: [
+                { kind: "image", mimeType: "image/jpeg", data: "JPEG==", filename: "pic.jpg" },
+                { kind: "text",  mimeType: "text/csv",   text: "a,b\n1,2", filename: "data.csv", sourceBytes: 8 },
+                { kind: "binary", mimeType: "application/zip", localPath: "/tmp/stuff.zip", sizeBytes: 1024, filename: "stuff.zip" },
+            ],
+        });
+        assert.equal(images.length, 1);
+        assert.match(text, /image "pic\.jpg"/);
+        assert.match(text, /file "data\.csv"/);
+        assert.match(text, /file "stuff\.zip"/);
+        assert.match(text, /=== data\.csv ===/);
+    });
+});
+
+// =============================================================================
+// handleActiveInbound — END-TO-END regression guard for the "images make it
+// into session.prompt options" contract. Without this test, the next refactor
+// that drops options.images would slip through type-checking (images is
+// optional) and we'd be back to week-one.
+// =============================================================================
+
+describe("ChannelRuntime.handleActiveInbound — attachments reach session.prompt", () => {
+    it("image attachment → session.prompt called with options.images", async () => {
+        const rt = new ChannelRuntime();
+        const captured: Array<{ text: string; opts: unknown }> = [];
+        injectEntry(rt, "telegram:-100atta", {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            session: {
+                prompt: async (text: string, opts: unknown) => { captured.push({ text, opts }); },
+            } as any,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            sessionManager: {
+                appendCustomEntry: () => "id",
+                getBranch: () => [],
+            } as any,
+            sessionFile: "/tmp/atta.jsonl",
+            lastActivity: 0,
+            unsubscribe: () => {},
+        });
+
+        await rt.handleActiveInbound({
+            platform: "telegram",
+            channelId: "-100atta",
+            senderId: "alice",
+            senderDisplayName: "Alice",
+            text: "look at this image",
+            addressedToBot: true,
+            timestamp: 1713500000000,
+            attachments: [
+                { kind: "image", mimeType: "image/png", data: "PNGBYTES==", filename: "photo.png" },
+            ],
+        });
+
+        assert.equal(captured.length, 1);
+        const opts = captured[0]!.opts as { images?: Array<{ type: string; data: string; mimeType: string }> };
+        assert.ok(opts.images, "options.images must be set when msg.attachments has an image");
+        assert.equal(opts.images!.length, 1);
+        assert.equal(opts.images![0]!.type, "image");
+        assert.equal(opts.images![0]!.data, "PNGBYTES==");
+        assert.equal(opts.images![0]!.mimeType, "image/png");
+        // Path also mentioned in the text prompt (belt-and-suspenders).
+        assert.match(captured[0]!.text, /image "photo\.png"/);
+    });
+
+    it("text-only message (no attachments) → options.images NOT set", async () => {
+        const rt = new ChannelRuntime();
+        const captured: Array<{ text: string; opts: unknown }> = [];
+        injectEntry(rt, "telegram:-100txtonly", {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            session: {
+                prompt: async (text: string, opts: unknown) => { captured.push({ text, opts }); },
+            } as any,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            sessionManager: {
+                appendCustomEntry: () => "id",
+                getBranch: () => [],
+            } as any,
+            sessionFile: "/tmp/txtonly.jsonl",
+            lastActivity: 0,
+            unsubscribe: () => {},
+        });
+
+        await rt.handleActiveInbound({
+            platform: "telegram",
+            channelId: "-100txtonly",
+            senderId: "bob",
+            senderDisplayName: "Bob",
+            text: "hello",
+            addressedToBot: true,
+            timestamp: 1713500001000,
+        });
+
+        assert.equal(captured.length, 1);
+        const opts = captured[0]!.opts as { images?: unknown[] };
+        assert.equal(opts.images, undefined, "no attachments → options.images must be undefined so Pi doesn't wire a no-op multimodal channel");
+    });
+});
+
+// =============================================================================
+// deliverAgentEnd — outbound contract: pendingAttachments drained and attached
+// to the AgentResponse sent via the dispatcher. This is the LLM → user path
+// that was completely absent pre-baseline (the agent could call attach_file
+// but no one drained).
+// =============================================================================
+
+describe("ChannelRuntime.deliverAgentEnd (via agent_end subscription) — pending attachments drain", () => {
+    beforeEach(() => {
+        __resetPendingAttachmentsForTests();
+        // Fresh dispatcher per test — otherwise a previous test's fake
+        // adapter (whose capture array is now GC-bound) steals send() calls
+        // from the current test's freshly-registered adapter.
+        TransportDispatcher.__resetForTests();
+    });
+
+    it("text reply + queued file path → dispatcher.send receives {text, attachments}", async () => {
+        // 1. Register a fake adapter that records the AgentResponse it gets.
+        const d = getDispatcher();
+        const captured: Array<{ channelId: string; response: AgentResponse }> = [];
+        const fake: TransportAdapter = {
+            platform: "telegram",
+            start: async () => {},
+            stop: async () => {},
+            send: async (channelId: string, response: AgentResponse) => {
+                captured.push({ channelId, response });
+            },
+            setHandler: () => {},
+            status: () => ({ platform: "telegram", state: "running" }),
+        };
+        d.register(fake);
+
+        // 2. Create a temp file the LLM "produced" and enqueue its path.
+        const tmp = path.join(os.tmpdir(), `ori2-test-outbound-${Date.now()}.txt`);
+        fs.writeFileSync(tmp, "generated content");
+        enqueuePending("telegram", "-100deliver", [tmp]);
+
+        // 3. Simulate agent_end by directly invoking the private delivery
+        //    method. Keeps the test focused on the drain+build+send logic
+        //    without needing a full Pi AgentSession boot.
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        await (new ChannelRuntime() as any).deliverAgentEnd("telegram", "-100deliver", {
+            type: "agent_end",
+            messages: [
+                { role: "assistant", content: [{ type: "text", text: "here is the file you asked for" }] },
+            ],
+        });
+
+        // Cleanup temp file
+        fs.unlinkSync(tmp);
+
+        const delivered = captured.filter((c) => c.channelId === "-100deliver");
+        assert.equal(delivered.length, 1, "exactly one send call for our channel");
+        const resp = delivered[0]!.response;
+        assert.equal(resp.text, "here is the file you asked for");
+        assert.ok(resp.attachments, "attachments must be populated");
+        assert.equal(resp.attachments!.length, 1);
+        // .txt → text/plain → binary kind (adapter uploads as document)
+        const att = resp.attachments![0]!;
+        assert.equal(att.kind, "binary");
+        assert.equal(att.mimeType, "text/plain");
+        assert.equal(att.filename, path.basename(tmp));
+    });
+
+    it("PNG path in queue → kind:\"image\" with base64 data so adapter can sendPhoto", async () => {
+        const d = getDispatcher();
+        const captured: Array<{ channelId: string; response: AgentResponse }> = [];
+        const fake: TransportAdapter = {
+            platform: "telegram",
+            start: async () => {}, stop: async () => {},
+            send: async (channelId, response) => { captured.push({ channelId, response }); },
+            setHandler: () => {},
+            status: () => ({ platform: "telegram", state: "running" }),
+        };
+        d.register(fake);
+
+        const tmp = path.join(os.tmpdir(), `ori2-test-img-${Date.now()}.png`);
+        // A minimal 1x1 PNG (magic bytes are sufficient for the sniff).
+        const pngMagic = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00]);
+        fs.writeFileSync(tmp, pngMagic);
+        enqueuePending("telegram", "-100img-out", [tmp]);
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        await (new ChannelRuntime() as any).deliverAgentEnd("telegram", "-100img-out", {
+            type: "agent_end",
+            messages: [{ role: "assistant", content: [{ type: "text", text: "chart:" }] }],
+        });
+
+        fs.unlinkSync(tmp);
+
+        const resp = captured.find((c) => c.channelId === "-100img-out")!.response;
+        assert.equal(resp.attachments!.length, 1);
+        const att = resp.attachments![0]! as Extract<MediaPayload, { kind: "image" }>;
+        assert.equal(att.kind, "image");
+        assert.equal(att.mimeType, "image/png");
+        assert.ok(att.data && att.data.length > 0, "base64 data populated");
+    });
+
+    it("no text, no attachments → nothing sent (no empty messages)", async () => {
+        const d = getDispatcher();
+        const captured: Array<{ channelId: string }> = [];
+        const fake: TransportAdapter = {
+            platform: "telegram",
+            start: async () => {}, stop: async () => {},
+            send: async (channelId) => { captured.push({ channelId }); },
+            setHandler: () => {},
+            status: () => ({ platform: "telegram", state: "running" }),
+        };
+        d.register(fake);
+
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        await (new ChannelRuntime() as any).deliverAgentEnd("telegram", "-100empty", {
+            type: "agent_end",
+            messages: [],
+        });
+
+        assert.equal(
+            captured.filter((c) => c.channelId === "-100empty").length,
+            0,
+            "empty agent_end must NOT trigger a send",
+        );
     });
 });

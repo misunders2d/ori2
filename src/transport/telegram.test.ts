@@ -1,6 +1,9 @@
+process.env["BOT_NAME"] = "_test_telegram";
+
 import { describe, it } from "node:test";
 import { strict as assert } from "node:assert";
-import { isAddressedToBot, type TelegramMessage, type TelegramUser } from "./telegram.js";
+import { isAddressedToBot, TelegramAdapter, type TelegramMessage, type TelegramUser } from "./telegram.js";
+import type { Message, MediaPayload } from "./types.js";
 
 const bot: TelegramUser = {
     id: 987654,
@@ -126,5 +129,106 @@ describe("Telegram isAddressedToBot", () => {
             entities: [{ type: "mention", offset: 0, length: 9 }],
         });
         assert.equal(isAddressedToBot(m, text, undefined), false);
+    });
+});
+
+// =============================================================================
+// Media-group (Telegram album) buffering. When a user sends N photos/videos
+// at once, Telegram delivers N separate updates all sharing a media_group_id.
+// The adapter MUST buffer (1200ms debounce per pi-telegram reference) and
+// dispatch a single logical Message with merged attachments[]. Without the
+// buffer, each album item would trigger its own agent turn — N replies to
+// ONE user intent.
+// =============================================================================
+
+describe("TelegramAdapter — media-group buffering", () => {
+    // Subclass that stubs the private network calls so tests don't hit Telegram.
+    // Keeps the buffering contract (media_group_id debounce + merge) as the
+    // sole behavior under test.
+    class TestTelegramAdapter extends TelegramAdapter {
+        public captured: Message[] = [];
+        constructor() {
+            super();
+            this.setHandler(async (msg) => { this.captured.push(msg); });
+        }
+        // Short-circuit file downloads — adapter shouldn't hit the network in unit tests.
+        protected async collectStub(_token: string, m: TelegramMessage): Promise<MediaPayload[]> {
+            // One fake image per message if it has a photo field.
+            if (m.photo && m.photo.length > 0) {
+                return [{ kind: "image", mimeType: "image/jpeg", data: `B64-${m.message_id}`, filename: `photo-${m.message_id}.jpg` }];
+            }
+            return [];
+        }
+    }
+
+    // Replace the private collectAttachments with our stub. Avoids fake-API-key boilerplate.
+    function rigAdapter(): TestTelegramAdapter {
+        const a = new TestTelegramAdapter();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (a as any).collectAttachments = (a as any).collectStub.bind(a);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (a as any).botInfo = bot;
+        return a;
+    }
+
+    // Bypass the getUpdates loop by calling handleIncoming directly.
+    async function feed(a: TestTelegramAdapter, m: TelegramMessage): Promise<void> {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        await (a as any).handleIncoming("dummy-token", m);
+    }
+
+    function photoMsg(message_id: number, caption: string | undefined, media_group_id: string | undefined): TelegramMessage {
+        const m: TelegramMessage = {
+            message_id,
+            from: { id: 111, is_bot: false, first_name: "Alice" },
+            chat: { id: -100, type: "supergroup", title: "Team" },
+            date: 1_700_000_000,
+            photo: [{ file_id: `f${message_id}`, file_unique_id: `u${message_id}`, width: 640, height: 480 }],
+        };
+        if (caption !== undefined) m.caption = caption;
+        if (media_group_id !== undefined) m.media_group_id = media_group_id;
+        return m;
+    }
+
+    it("single message (no media_group_id) dispatches immediately", async () => {
+        const a = rigAdapter();
+        await feed(a, photoMsg(1, "solo photo", undefined));
+        assert.equal(a.captured.length, 1);
+        assert.equal(a.captured[0]!.attachments?.length, 1);
+        assert.equal(a.captured[0]!.text, "solo photo");
+    });
+
+    it("two messages sharing a media_group_id → buffered, ONE dispatch after debounce with merged attachments", async () => {
+        const a = rigAdapter();
+        await feed(a, photoMsg(1, "album caption", "album-xyz"));
+        await feed(a, photoMsg(2, undefined,       "album-xyz"));
+
+        // Nothing dispatched yet — still buffering.
+        assert.equal(a.captured.length, 0, "must wait for debounce to flush");
+
+        // Wait past the debounce (1200ms) + small slack.
+        await new Promise((r) => setTimeout(r, 1350));
+
+        assert.equal(a.captured.length, 1, "flushed exactly one merged message");
+        const m = a.captured[0]!;
+        assert.equal(m.attachments?.length, 2, "both album items' attachments merged");
+        assert.match(m.text, /album caption/);
+    });
+
+    it("different media_group_ids don't collide — each gets its own buffer + flush", async () => {
+        const a = rigAdapter();
+        await feed(a, photoMsg(1, "A", "group-A"));
+        await feed(a, photoMsg(2, "B", "group-B"));
+        await new Promise((r) => setTimeout(r, 1350));
+        assert.equal(a.captured.length, 2, "two separate flushes");
+    });
+
+    it("a.stop() clears in-flight buffer timers — buffered album is silently dropped", async () => {
+        const a = rigAdapter();
+        await feed(a, photoMsg(1, "pending album", "group-dropped"));
+        // Stop before debounce fires.
+        await a.stop();
+        await new Promise((r) => setTimeout(r, 1350));
+        assert.equal(a.captured.length, 0, "stop() must cancel pending flush — no dispatch after adapter is torn down");
     });
 });

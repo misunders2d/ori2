@@ -107,6 +107,11 @@ export interface TelegramMessage {
     date: number;
     text?: string;
     caption?: string;
+    /** Set by Telegram on every message in a multi-photo/multi-video upload
+     *  ("album"). Messages with the same ID arrive as separate updates and
+     *  must be merged into one logical inbound so the agent sees all media
+     *  at once. */
+    media_group_id?: string;
     entities?: TelegramEntity[];
     caption_entities?: TelegramEntity[];
     photo?: TelegramPhotoSize[];
@@ -115,6 +120,15 @@ export interface TelegramMessage {
     voice?: TelegramDocument & { duration: number };
     video?: TelegramDocument & { duration: number; width: number; height: number };
     reply_to_message?: TelegramMessage;
+}
+
+/** Module-level debounce for albums. Source: pi-telegram (Pi SDK's own
+ *  Telegram extension) uses 1200ms; we match for consistency. */
+const MEDIA_GROUP_DEBOUNCE_MS = 1200;
+
+interface MediaGroupState {
+    messages: TelegramMessage[];
+    flushTimer: ReturnType<typeof setTimeout>;
 }
 
 interface TelegramUpdate {
@@ -144,6 +158,11 @@ export class TelegramAdapter implements TransportAdapter {
     private offset = 0;
     private offsetFile: string;
     private incomingDir: string;
+
+    /** Active media-group buffers keyed by `${chat.id}:${media_group_id}`.
+     *  Each entry accumulates messages until the debounce timer fires, then
+     *  flushes them as ONE logical inbound with merged attachments[]. */
+    private mediaGroups = new Map<string, MediaGroupState>();
 
     constructor() {
         const dir = botSubdir("");
@@ -195,6 +214,13 @@ export class TelegramAdapter implements TransportAdapter {
             try { await this.pollPromise; } catch { /* abort throws — expected */ }
             this.pollPromise = null;
         }
+        // Cancel any in-flight media-group debounce timers. Buffered messages
+        // are dropped — acceptable on shutdown (sender will just re-send on
+        // reconnect; the poll offset guarantees we don't replay).
+        for (const state of this.mediaGroups.values()) {
+            clearTimeout(state.flushTimer);
+        }
+        this.mediaGroups.clear();
     }
 
     async send(channelId: string, response: AgentResponse): Promise<void> {
@@ -294,11 +320,83 @@ export class TelegramAdapter implements TransportAdapter {
         if (!sender) return; // channel posts without a sender — ignore for now
         if (sender.is_bot) return; // ignore other bots
 
-        // Whitelist is enforced by the dispatcher's pre-dispatch hook
-        // (admin_gate.ts). This adapter just normalizes and forwards.
+        // Album buffering: when the user sends N photos/videos at once,
+        // Telegram delivers N separate updates all sharing a media_group_id.
+        // Forwarding each one through the dispatcher individually would
+        // kick off N separate agent turns and drown the bot (with the user
+        // having intended ONE message). Buffer by media_group_id for
+        // MEDIA_GROUP_DEBOUNCE_MS, then flush the batch as one logical
+        // inbound with merged attachments[]. Matches pi-telegram's 1200ms
+        // debounce (Pi SDK's own Telegram reference extension).
+        if (m.media_group_id) {
+            const key = `${m.chat.id}:${m.media_group_id}`;
+            const existing = this.mediaGroups.get(key);
+            if (existing) {
+                clearTimeout(existing.flushTimer);
+                existing.messages.push(m);
+                existing.flushTimer = setTimeout(() => {
+                    void this.flushMediaGroup(token, key);
+                }, MEDIA_GROUP_DEBOUNCE_MS);
+                existing.flushTimer.unref();
+            } else {
+                const state: MediaGroupState = {
+                    messages: [m],
+                    flushTimer: setTimeout(() => {
+                        void this.flushMediaGroup(token, key);
+                    }, MEDIA_GROUP_DEBOUNCE_MS),
+                };
+                state.flushTimer.unref();
+                this.mediaGroups.set(key, state);
+            }
+            return;
+        }
 
-        const text = m.text ?? m.caption ?? "";
-        const attachments = await this.collectAttachments(token, m);
+        await this.dispatchTelegramMessages(token, [m]);
+    }
+
+    /** Flush a media-group buffer — called when the debounce timer fires. */
+    private async flushMediaGroup(token: string, key: string): Promise<void> {
+        const state = this.mediaGroups.get(key);
+        if (!state) return;
+        this.mediaGroups.delete(key);
+        try {
+            await this.dispatchTelegramMessages(token, state.messages);
+        } catch (e) {
+            logError("telegram", "media-group flush failed", {
+                key,
+                count: state.messages.length,
+                err: e instanceof Error ? e.message : String(e),
+            });
+        }
+    }
+
+    /**
+     * Normalize a single message OR an album's worth of messages into one
+     * cross-platform `Message`. The first message's chat/sender/date anchors
+     * the logical inbound; captions and text are joined; attachments from
+     * every message in the album merge into `attachments[]`.
+     */
+    private async dispatchTelegramMessages(token: string, msgs: TelegramMessage[]): Promise<void> {
+        if (msgs.length === 0) return;
+        const head = msgs[0]!;
+        const sender = head.from;
+        if (!sender) return;
+
+        // Merge text: take the first non-empty text/caption across the group.
+        // Albums typically carry a single caption on one of the items.
+        const textParts: string[] = [];
+        for (const m of msgs) {
+            const t = (m.text ?? m.caption ?? "").trim();
+            if (t.length > 0) textParts.push(t);
+        }
+        const text = textParts.join("\n\n");
+
+        // Merge attachments: download each message's media in order.
+        const attachments: MediaPayload[] = [];
+        for (const m of msgs) {
+            const part = await this.collectAttachments(token, m);
+            attachments.push(...part);
+        }
 
         if (!this.handler) {
             console.log("[telegram] message received but no handler installed yet — dropping");
@@ -312,13 +410,13 @@ export class TelegramAdapter implements TransportAdapter {
 
         const incoming: Message = {
             platform: this.platform,
-            channelId: String(m.chat.id),
+            channelId: String(head.chat.id),
             senderId: String(sender.id),
             senderDisplayName,
-            timestamp: m.date * 1000,
+            timestamp: head.date * 1000,
             text,
-            addressedToBot: isAddressedToBot(m, text, this.botInfo),
-            raw: m,
+            addressedToBot: isAddressedToBot(head, text, this.botInfo),
+            raw: msgs.length === 1 ? head : msgs,
         };
         if (attachments.length > 0) incoming.attachments = attachments;
 

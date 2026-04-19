@@ -1,6 +1,9 @@
-import path from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { botDir } from "../../src/core/paths.js";
+import {
+    SENSITIVE_SUBSTRINGS,
+    containsSensitiveSubstring,
+    resolvedUnderBotDir,
+} from "../../src/core/secretFilesDeny.js";
 
 // =============================================================================
 // secret_files_guard — denies generic file tools (read/edit/write/grep/find/
@@ -46,23 +49,16 @@ const PATTERN_ARG_TOOLS = new Map<string, string[]>([
     ["grep", ["glob"]],
 ]);
 
-// Substrings that, if present in a bash command or a glob pattern, are
-// considered an attempt to reach bot-private state. Conservative list —
-// false positives are acceptable here (the LLM has dedicated tools for
-// every legitimate read).
-const SENSITIVE_SUBSTRINGS = [
-    "/.secret/",          // any path under .secret/
-    "data/",              // bot data dir prefix; combined with file names below
-    "vault.json",
-    "credentials.json",
-    "oauth_tokens.json",
-    "oauth_platforms.json",
-    "pending_actions.db",
-    "channel_log.db",
-    "memory.db",
-    ".pi-state",
-    "auth.json",          // Pi SDK's own secret store
-];
+// Tools whose params include a string[] of paths. Each element is validated
+// the same way as a single path arg for read/edit/write.
+const PATH_ARRAY_ARG_TOOLS = new Map<string, string[]>([
+    ["attach_file", ["paths"]],
+]);
+
+// Sensitive-substring list lives in src/core/secretFilesDeny.ts so
+// attach_file (and future call-sites) consume the same source of truth.
+// Re-export for tests that still import from this module.
+export { SENSITIVE_SUBSTRINGS };
 
 const SLASH_COMMAND_HINT =
     "Off limits. Use slash commands instead: " +
@@ -111,6 +107,25 @@ export function guard(event: ToolCallEvent): { block: true; reason: string } | u
         }
     }
 
+    // 1b. Path-ARRAY-arg tools (attach_file, future multi-file tools): same
+    //     check, iterated over each string in the array.
+    const arrayFields = PATH_ARRAY_ARG_TOOLS.get(toolName);
+    if (arrayFields) {
+        for (const f of arrayFields) {
+            const v = input[f];
+            if (!Array.isArray(v)) continue;
+            for (const item of v) {
+                if (typeof item !== "string") continue;
+                if (resolvedUnderBotDir(item)) {
+                    return { block: true, reason: `${toolName} target "${item}" is under the bot's private state dir. ${SLASH_COMMAND_HINT}` };
+                }
+                if (containsSensitiveSubstring(item)) {
+                    return { block: true, reason: `${toolName} target "${item}" looks like a secret-bearing path. ${SLASH_COMMAND_HINT}` };
+                }
+            }
+        }
+    }
+
     // 2. Pattern-arg tools (find.pattern, grep.glob): block patterns that
     //    name sensitive files / dirs.
     const patternFields = PATTERN_ARG_TOOLS.get(toolName);
@@ -143,23 +158,4 @@ function collectPathArgs(input: Record<string, unknown>): string[] {
         if (typeof v === "string" && v !== "") out.push(v);
     }
     return out;
-}
-
-function resolvedUnderBotDir(targetPath: string): boolean {
-    // path.resolve handles `..` traversal — `data/<bot>/../secret/x` resolves
-    // outside botDir() correctly; `.secret/x` inside botDir() does not. We
-    // check via path.relative which returns a leading `..` when outside.
-    const absTarget = path.resolve(process.cwd(), targetPath);
-    const absBot = botDir();
-    const rel = path.relative(absBot, absTarget);
-    if (rel === "" || rel === ".") return true;
-    return !rel.startsWith("..") && !path.isAbsolute(rel);
-}
-
-function containsSensitiveSubstring(s: string): boolean {
-    const lower = s.toLowerCase();
-    for (const sub of SENSITIVE_SUBSTRINGS) {
-        if (lower.includes(sub.toLowerCase())) return true;
-    }
-    return false;
 }
