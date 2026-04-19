@@ -5,7 +5,10 @@ import {
     type AgentSession,
     type AgentSessionServices,
 } from "@mariozechner/pi-coding-agent";
+import type { Model } from "@mariozechner/pi-ai";
+import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
 import { getChannelSessions } from "../core/channelSessions.js";
+import { getChannelModels, type ChannelModelBinding } from "../core/channelModels.js";
 import { getDispatcher } from "./dispatcher.js";
 import { logError, logWarning } from "../core/errorLog.js";
 import { getOrCreate } from "../core/singletons.js";
@@ -61,6 +64,11 @@ interface ChannelEntry {
      *  agent_start, cleared on agent_end. Platform-generic — fires
      *  adapter.sendTyping?() if the adapter implements it; no-op otherwise. */
     typingTimer?: NodeJS.Timeout;
+    /** The model this session fell back to when no channel binding was set.
+     *  Captured at session-create time before any binding is applied. Used to
+     *  revert when a binding is later cleared — without it we'd be stuck on
+     *  whatever override was last applied. */
+    defaultModel?: Model<any>;
 }
 
 export class ChannelRuntime {
@@ -101,6 +109,15 @@ export class ChannelRuntime {
         const key = channelKey(msg.platform, msg.channelId);
         const entry = await this.getOrCreate(msg.platform, msg.channelId);
         entry.lastActivity = Date.now();
+
+        // Hot-swap the model if the channel's binding changed since the last
+        // turn (or since session creation). Must happen BEFORE prompt() — Pi's
+        // setModel updates agent state and session JSONL synchronously, so
+        // the next turn runs on the new model. Without this, set_channel_model
+        // would only take effect the next time the channel session is
+        // recreated (15-min idle eviction), which the user correctly flagged
+        // as broken "on-the-fly" model switching.
+        await this.applyChannelModelBinding(entry, msg.platform, msg.channelId);
 
         // Pi's `prompt(text)` runs ONE agent turn. If a turn is already
         // running for this channel, we use Pi's queue: enqueue the new
@@ -158,12 +175,21 @@ export class ChannelRuntime {
         const sessionFile = getChannelSessions().getOrCreateSessionFile(platform, channelId);
         const sm = SessionManager.open(sessionFile);
 
+        // If the channel has a model binding, resolve it BEFORE session
+        // creation so turn 1 runs on the right model. If the binding resolves
+        // (model exists + auth configured), pass it to createAgentSession so
+        // the session boots on it; otherwise we fall back to the default and
+        // applyChannelModelBinding() on the next inbound will retry.
+        const initialBinding = resolveBinding(services, platform, channelId);
+
         // Per-channel AgentSession. Shares services with all other channels +
         // the parent (TUI / daemon) — extension code, model registry, settings,
         // and resource loader are reused.
         const result = await createAgentSessionFromServices({
             services,
             sessionManager: sm,
+            ...(initialBinding?.model ? { model: initialBinding.model } : {}),
+            ...(initialBinding?.thinkingLevel ? { thinkingLevel: initialBinding.thinkingLevel } : {}),
         });
         const session = result.session;
 
@@ -178,6 +204,13 @@ export class ChannelRuntime {
             session,
             sessionFile,
             lastActivity: Date.now(),
+            // When we seeded the session with a binding, the "default" is the
+            // model Pi would have chosen in the absence of any override —
+            // i.e. not what session.model currently is. We don't have easy
+            // access to that, so only capture defaultModel when we booted
+            // WITHOUT a binding. Clearing a binding set before first inbound
+            // won't auto-revert; that's an acceptable edge.
+            ...(!initialBinding && session.model ? { defaultModel: session.model } : {}),
             // unsubscribe assigned below — TS needs the entry first.
             unsubscribe: () => {},
         };
@@ -195,6 +228,73 @@ export class ChannelRuntime {
         entry.unsubscribe = unsubscribe;
         this.channels.set(key, entry);
         return entry;
+    }
+
+    /**
+     * Reconcile the live session's model with the channel's model binding.
+     * Called on every inbound before prompt(). Handles three cases:
+     *   - binding exists and matches session.model → no-op
+     *   - binding exists and differs → setModel + setThinkingLevel
+     *   - binding absent but session was overridden → revert to defaultModel
+     *
+     * Failures (unknown model, no auth, setModel throws) are logged and
+     * dropped — the turn still runs on whatever model the session had.
+     * Better to answer on the "wrong" model than refuse the user outright.
+     */
+    private async applyChannelModelBinding(
+        entry: ChannelEntry,
+        platform: string,
+        channelId: string,
+    ): Promise<void> {
+        const services = this.services;
+        if (!services) return;
+
+        const resolved = resolveBinding(services, platform, channelId);
+
+        // Pick the target. No binding + defaultModel captured → revert.
+        // No binding + no defaultModel → nothing to do (session was born with
+        // the binding already applied; clearing it mid-life can't recover the
+        // original default without a full session restart).
+        let targetModel: Model<any> | undefined;
+        let targetThinking: ThinkingLevel | undefined;
+        if (resolved?.model) {
+            targetModel = resolved.model;
+            targetThinking = resolved.thinkingLevel;
+        } else if (!resolved && entry.defaultModel) {
+            targetModel = entry.defaultModel;
+        }
+        if (!targetModel) return;
+
+        const current = entry.session.model;
+        const needsModel = !current
+            || current.provider !== targetModel.provider
+            || current.id !== targetModel.id;
+        if (needsModel) {
+            try {
+                await entry.session.setModel(targetModel);
+            } catch (e) {
+                logError("channelRuntime", "setModel failed — staying on current model", {
+                    platform,
+                    channelId,
+                    targetProvider: targetModel.provider,
+                    targetModelId: targetModel.id,
+                    err: e instanceof Error ? e.message : String(e),
+                });
+                return;
+            }
+        }
+        if (targetThinking !== undefined) {
+            try {
+                entry.session.setThinkingLevel(targetThinking);
+            } catch (e) {
+                logWarning("channelRuntime", "setThinkingLevel failed", {
+                    platform,
+                    channelId,
+                    level: targetThinking,
+                    err: e instanceof Error ? e.message : String(e),
+                });
+            }
+        }
     }
 
     /** Start the per-channel "typing…" loop. Platform-generic: dispatches to
@@ -264,6 +364,43 @@ export class ChannelRuntime {
 
 function channelKey(platform: string, channelId: string): string {
     return `${platform}:${channelId}`;
+}
+
+/**
+ * Load the channel's ChannelModelBinding and resolve it against the live
+ * ModelRegistry. Returns undefined when no binding is set. Returns
+ * `{ model: undefined }` when a binding exists but is unusable (unknown
+ * model, missing auth) — callers treat that as "ignore" rather than
+ * "no binding" so a misconfigured binding doesn't auto-revert.
+ */
+function resolveBinding(
+    services: AgentSessionServices,
+    platform: string,
+    channelId: string,
+): { binding: ChannelModelBinding; model: Model<any> | undefined; thinkingLevel: ThinkingLevel | undefined } | undefined {
+    const binding = getChannelModels().get(platform, channelId);
+    if (!binding) return undefined;
+    const model = services.modelRegistry.find(binding.provider, binding.modelId);
+    if (!model) {
+        logWarning("channelRuntime", "channel model binding references unknown model — ignoring", {
+            platform,
+            channelId,
+            provider: binding.provider,
+            modelId: binding.modelId,
+        });
+        return { binding, model: undefined, thinkingLevel: undefined };
+    }
+    if (!services.modelRegistry.hasConfiguredAuth(model)) {
+        logWarning("channelRuntime", "channel model binding has no configured auth — ignoring", {
+            platform,
+            channelId,
+            provider: binding.provider,
+            modelId: binding.modelId,
+        });
+        return { binding, model: undefined, thinkingLevel: undefined };
+    }
+    const thinkingLevel = binding.thinkingLevel as ThinkingLevel | undefined;
+    return { binding, model, thinkingLevel };
 }
 
 /** Format the inbound message into the agent's prompt text. Mirrors the

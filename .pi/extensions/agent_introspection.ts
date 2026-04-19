@@ -22,10 +22,11 @@ import { getChannelSessions } from "../../src/core/channelSessions.js";
 //     `ctx.getContextUsage()`, `ctx.compact()`) so tools can introspect the
 //     LIVE subprocess session without us re-implementing model resolution.
 //     Verified at node_modules/@mariozechner/pi-coding-agent/dist/core/extensions/types.d.ts:180-209.
-//   - Per-channel model override works by having channelRouter pass
-//     `--model provider/id[:thinking]` to the next `pi -p` subprocess spawn.
-//     Affects future turns, not the current one — Pi's AgentSession commits
-//     to its model at spawn time (verified in main.js args parsing).
+//   - Per-channel model override is stored in channelModels and applied by
+//     channelRuntime.applyChannelModelBinding() before every turn via
+//     session.setModel() / setThinkingLevel(). Takes effect starting with
+//     the NEXT turn on the same live session — no process/session restart
+//     required.
 // =============================================================================
 
 export default function (pi: ExtensionAPI) {
@@ -127,8 +128,10 @@ export default function (pi: ExtensionAPI) {
         label: "Set Channel Model",
         description:
             "Set the LLM model to use for FUTURE responses in a chat/channel. Takes effect on " +
-            "the NEXT message — the current response is still on the old model (the running " +
-            "subprocess can't be re-modeled mid-turn). " +
+            "the NEXT message — the current response is still on the old model (this tool " +
+            "runs as part of the current turn, which is already committed to its model). " +
+            "channelRuntime hot-swaps the live session's model via setModel() on the next " +
+            "inbound, so no restart is needed. " +
             "\n\n" +
             "Target resolution (in order): " +
             "(1) if you provide `target_platform` and `target_channel_id`, those are used — " +
@@ -209,7 +212,7 @@ export default function (pi: ExtensionAPI) {
                     text:
                         `Channel model for ${resolved.target.platform}:${resolved.target.channelId} set to ` +
                         `${params.provider}/${params.model_id}${suffix}. The next message in that channel ` +
-                        `runs on the new model.`,
+                        `hot-swaps the live session onto the new model — no restart needed.`,
                 }],
                 details: {
                     provider: params.provider,
