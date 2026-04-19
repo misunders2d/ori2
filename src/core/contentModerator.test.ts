@@ -130,8 +130,9 @@ describe("moderateMedia — verdict parsing", () => {
         assert.equal(r.transcript, "ok");
     });
 
-    it("fails closed when the moderator's reply is unparseable", async () => {
+    it("in STRICT mode, fails closed when the moderator's reply is unparseable", async () => {
         getVault().set("ANTHROPIC_API_KEY", "fake-key");
+        getVault().set("CONTENT_MODERATOR_REQUIRED", "true");
         __setFetchForTests((async () => ({
             ok: true,
             status: 200,
@@ -144,8 +145,23 @@ describe("moderateMedia — verdict parsing", () => {
         assert.match(r.failedClosed!.reason, /moderator-call-failed|not parseable/i);
     });
 
-    it("fails closed on HTTP error", async () => {
+    it("in ADVISORY mode (default), passes through when the moderator's reply is unparseable", async () => {
         getVault().set("ANTHROPIC_API_KEY", "fake-key");
+        // CONTENT_MODERATOR_REQUIRED not set → advisory
+        __setFetchForTests((async () => ({
+            ok: true,
+            status: 200,
+            json: async () => ({ content: [{ type: "text", text: "I refuse to comply with this request." }] }),
+            text: async () => "",
+        } as unknown as Response)) as unknown as typeof fetch);
+        const r = await moderateMedia(TINY_IMAGE, "image/png", "x.png");
+        assert.equal(r.injection, false);
+        assert.ok(!r.failedClosed);
+    });
+
+    it("in STRICT mode, fails closed on HTTP error", async () => {
+        getVault().set("ANTHROPIC_API_KEY", "fake-key");
+        getVault().set("CONTENT_MODERATOR_REQUIRED", "true");
         __setFetchForTests((async () => ({
             ok: false,
             status: 500,
@@ -155,6 +171,19 @@ describe("moderateMedia — verdict parsing", () => {
         const r = await moderateMedia(TINY_IMAGE, "image/png", "x.png");
         assert.equal(r.injection, true);
         assert.ok(r.failedClosed);
+    });
+
+    it("in ADVISORY mode (default), passes through on HTTP error", async () => {
+        getVault().set("ANTHROPIC_API_KEY", "fake-key");
+        __setFetchForTests((async () => ({
+            ok: false,
+            status: 500,
+            json: async () => ({}),
+            text: async () => "internal error",
+        } as unknown as Response)) as unknown as typeof fetch);
+        const r = await moderateMedia(TINY_IMAGE, "image/png", "x.png");
+        assert.equal(r.injection, false);
+        assert.ok(!r.failedClosed);
     });
 });
 

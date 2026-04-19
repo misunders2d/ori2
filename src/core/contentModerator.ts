@@ -134,10 +134,30 @@ export async function moderateMedia(
     try {
         return await callProvider(provider, modality, bytes, mimeType, filename);
     } catch (e) {
-        return failClosed(
-            "moderator-call-failed",
-            `${provider.name} moderator call failed: ${e instanceof Error ? e.message : String(e)}`,
+        const errMsg = e instanceof Error ? e.message : String(e);
+        // A provider CALL failure (network error, rate-limit, auth, malformed
+        // response) is operationally different from "the moderator detected
+        // an attack". In STRICT mode (CONTENT_MODERATOR_REQUIRED=true) we
+        // still fail closed — an unverified image can't reach the agent.
+        // In the DEFAULT advisory mode we pass the image through: the
+        // operator opted OUT of mandatory moderation, and silently dropping
+        // the user's image every time Gemini hiccups surprises everyone
+        // (user sees "bot doesn't see my images" with no hint that a
+        // sidecar service broke). Log loudly so the operator notices.
+        const required = (getVault().get("CONTENT_MODERATOR_REQUIRED") ?? "").toLowerCase();
+        if (required === "true" || required === "1") {
+            return failClosed(
+                "moderator-call-failed",
+                `${provider.name} moderator call failed: ${errMsg}`,
+            );
+        }
+        console.warn(
+            `[contentModerator] ${provider.name} moderator call failed — ` +
+            `passing ${modality} through (advisory mode). Set ` +
+            `CONTENT_MODERATOR_REQUIRED=true in vault to fail-closed instead. ` +
+            `Error: ${errMsg}`,
         );
+        return safe(provider.name, "");
     }
 }
 

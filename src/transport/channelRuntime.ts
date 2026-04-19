@@ -10,7 +10,7 @@ import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
 import { getChannelSessions } from "../core/channelSessions.js";
 import { getChannelModels, type ChannelModelBinding } from "../core/channelModels.js";
 import { getDispatcher } from "./dispatcher.js";
-import { logError, logWarning } from "../core/errorLog.js";
+import { logError, logInfo, logWarning } from "../core/errorLog.js";
 import { getOrCreate } from "../core/singletons.js";
 import type { Message } from "./types.js";
 
@@ -154,6 +154,29 @@ export class ChannelRuntime {
         // This is what kept the conversation moving when someone drops a
         // pptx into Telegram: we describe it instead of uploading it.
         const { text, images } = buildPromptFromMessage(msg, entry.session.model);
+
+        // Diagnostic: when users report "the bot doesn't see my image",
+        // the first question is always "did the attachment even arrive?".
+        // Log a single-line summary per inbound so the operator can grep
+        // errors.jsonl / stdout for attachment flow without enabling a
+        // verbose mode. No payload bytes — just kind counts.
+        if (msg.attachments && msg.attachments.length > 0) {
+            const kinds = msg.attachments.reduce<Record<string, number>>((acc, a) => {
+                acc[a.kind] = (acc[a.kind] ?? 0) + 1;
+                return acc;
+            }, {});
+            const modelAcceptsImages = !!entry.session.model
+                && Array.isArray(entry.session.model.input)
+                && entry.session.model.input.includes("image");
+            logInfo("channelRuntime", "inbound attachments", {
+                platform: msg.platform,
+                channelId: msg.channelId,
+                kinds,
+                modelAcceptsImages,
+                imagesForwarded: images.length,
+                modelId: entry.session.model?.id,
+            });
+        }
 
         // Pi's `prompt(text)` runs ONE agent turn. If a turn is already
         // running for this channel, we use Pi's queue: enqueue the new
