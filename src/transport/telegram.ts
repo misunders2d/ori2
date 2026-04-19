@@ -5,6 +5,7 @@ import { getVault } from "../core/vault.js";
 import { writeHeartbeat } from "../core/heartbeat.js";
 import { logError, logWarning } from "../core/errorLog.js";
 import { fileToPayload, type MediaSaveContext } from "./media.js";
+import { chunkParagraphs, toMarkdownV2, TELEGRAM_MAX_TEXT } from "./telegramFormatting.js";
 import type {
     AdapterStatus,
     AgentResponse,
@@ -55,7 +56,9 @@ import type {
 
 const TELEGRAM_API_BASE = "https://api.telegram.org";
 const POLL_TIMEOUT_SECS = 30;
-const MAX_TELEGRAM_TEXT = 4096; // Telegram message text limit
+// Telegram's hard per-message text cap. Exposed via telegramFormatting.TELEGRAM_MAX_TEXT
+// for any module that wants to compose without the adapter.
+const MAX_TELEGRAM_TEXT = TELEGRAM_MAX_TEXT;
 
 export interface TelegramUser {
     id: number;
@@ -229,16 +232,22 @@ export class TelegramAdapter implements TransportAdapter {
         const chatId = Number(channelId);
         if (!Number.isFinite(chatId)) throw new Error(`[telegram] invalid channelId: ${channelId}`);
 
-        // Telegram caps text at 4096 chars per message. Chunk if needed.
+        // Text path: paragraph-aware chunk → try MarkdownV2 → fall back to
+        // plain text on parse error. Converting + escaping happens PER CHUNK
+        // (each chunk must be independently parseable by Telegram), then
+        // send with parse_mode:"MarkdownV2". On 400 Bad Request from
+        // MarkdownV2 parsing, retry the same chunk without parse_mode so
+        // the user ALWAYS receives the content (worst case: raw markdown
+        // tokens, still readable).
         const text = response.text || "";
-        const chunks = chunkText(text, MAX_TELEGRAM_TEXT);
+        const chunks = chunkParagraphs(text, MAX_TELEGRAM_TEXT);
         const replyTo = response.replyToMessageId ? Number(response.replyToMessageId) : undefined;
         for (let i = 0; i < chunks.length; i++) {
-            const params: Record<string, unknown> = { chat_id: chatId, text: chunks[i] };
+            const baseParams: Record<string, unknown> = { chat_id: chatId };
             if (i === 0 && replyTo !== undefined && Number.isFinite(replyTo)) {
-                params["reply_to_message_id"] = replyTo;
+                baseParams["reply_to_message_id"] = replyTo;
             }
-            await this.callApi(token, "sendMessage", params);
+            await this.sendMessageWithMarkdownFallback(token, baseParams, chunks[i]!);
         }
 
         // Send any attachments AFTER the text so the user has context.
@@ -246,6 +255,43 @@ export class TelegramAdapter implements TransportAdapter {
             for (const att of response.attachments) {
                 await this.sendAttachment(token, chatId, att);
             }
+        }
+    }
+
+    /**
+     * Send one chunk: first attempt as MarkdownV2, on parse-error retry as
+     * plain. MarkdownV2's escaping rules are strict — even correct escaping
+     * can miss an edge case (nested entities, obscure emoji sequences).
+     * The retry guarantees delivery.
+     */
+    private async sendMessageWithMarkdownFallback(
+        token: string,
+        baseParams: Record<string, unknown>,
+        rawChunk: string,
+    ): Promise<void> {
+        const v2 = toMarkdownV2(rawChunk);
+        try {
+            await this.callApi(token, "sendMessage", {
+                ...baseParams,
+                text: v2,
+                parse_mode: "MarkdownV2",
+            });
+            return;
+        } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            // Telegram returns 400 Bad Request with a description like
+            // "can't parse entities: ..." on V2 parse failure. Non-parse
+            // errors (rate limit, network) should propagate; we only retry
+            // on the specific parse-error signal.
+            if (!/parse entities|can't parse|bad request/i.test(msg)) throw e;
+            logWarning("telegram", "MarkdownV2 send failed — retrying as plain text", {
+                err: msg.slice(0, 200),
+                chunkChars: rawChunk.length,
+            });
+            await this.callApi(token, "sendMessage", {
+                ...baseParams,
+                text: rawChunk,
+            });
         }
     }
 
@@ -577,15 +623,9 @@ export function isAddressedToBot(
     return false;
 }
 
-function chunkText(text: string, max: number): string[] {
-    if (text.length === 0) return [""];
-    if (text.length <= max) return [text];
-    const chunks: string[] = [];
-    for (let i = 0; i < text.length; i += max) {
-        chunks.push(text.slice(i, i + max));
-    }
-    return chunks;
-}
+// chunkText removed — superseded by chunkParagraphs in telegramFormatting.ts
+// (paragraph/line-boundary-aware split; the old brute-force char slice
+// broke mid-word and — post-MarkdownV2 — mid-entity).
 
 async function sleep(ms: number, signal?: AbortSignal): Promise<void> {
     return new Promise((resolve, reject) => {
