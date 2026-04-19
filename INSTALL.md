@@ -17,7 +17,7 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/misunders2d/ori2/master/
 The bootstrap will:
 1. Verify Node ≥ 22, git, npm
 2. Clone the repo (or pull if present)
-3. **Detach from upstream** — wipe `.git`, re-init with a fresh history, write `.ori2-baseline` (records which ori2 version you forked from, so `scripts/sync-baseline.sh` can show future updates). Skip with `--keep-upstream` if you're the upstream maintainer.
+3. **Detach from upstream** — wipe `.git`, re-init with a fresh history, write `.ori2-baseline` (records which ori2 version you forked from), and add the upstream repo back as a named remote `ori2-upstream` so `git fetch ori2-upstream && git cherry-pick <sha>` works without setup. `origin` stays unset so you can point it at your own GitHub fork. Skip the whole detach with `--keep-upstream` if you're the upstream maintainer.
 4. Run `npm install` (postinstall pre-warms the fastembed model into `.cache/fastembed/`)
 5. Run `npm test` — halts the install if any baseline test fails. To override (NOT recommended), `export ORI2_SKIP_TESTS=1` before re-running.
 6. Launch the first-run wizard (asks for bot name, optional admin IDs, primary AI provider key)
@@ -302,25 +302,31 @@ Full reference: `/dna help` and `/a2a help` from any chat session.
 
 ### Your own bot (detached — the default)
 
-After bootstrap, your bot lives on its own git timeline. `git pull` from upstream **does nothing** because there's no origin pointing at upstream anymore. That's by design — your evolutions are yours, no surprise merges overwriting them.
+After bootstrap, your bot lives on its own git timeline. `git pull` (i.e. from `origin`) **does nothing** because `origin` isn't set — that slot is reserved for your own GitHub fork. That's by design: your evolutions are yours, no surprise merges overwriting them.
 
-To see and optionally pull in new features from the canonical ori2 baseline:
+But the upstream ori2 repo is still attached as a named remote called `ori2-upstream` (set up by `bootstrap.sh` on clone-and-detach). So pulling specific fixes is direct — no helper script needed:
 
 ```bash
 cd /path/to/ori2
-./scripts/sync-baseline.sh
-# → temporarily adds ori2-upstream as a remote, fetches, prints the log/diff,
-#   drops the remote. Your repo stays detached.
+git fetch ori2-upstream main
+git log HEAD..ori2-upstream/main         # see what's new
+git cherry-pick <sha>                    # take a specific fix
+# resolve any conflicts with your evolutions
 ```
 
-The script never auto-merges. If you want to merge upstream changes:
+For a guided preview + baseline-marker bookkeeping there's still:
 
 ```bash
-./scripts/sync-baseline.sh --remote        # keeps the temporary remote
-git merge ori2-upstream/master             # or: git cherry-pick <sha>
-# resolve any conflicts with your evolutions
-./scripts/sync-baseline.sh --mark $(git rev-parse HEAD)   # update baseline marker
-git remote remove ori2-upstream            # optional — tidy up
+./scripts/sync-baseline.sh                       # fetch + print log/diff (remote stays attached)
+./scripts/sync-baseline.sh --mark $(git rev-parse HEAD)   # after a merge, record the new baseline
+./scripts/sync-baseline.sh --drop                # tear down the ori2-upstream remote (rare)
+```
+
+The script never auto-merges. If you want to merge upstream wholesale (riskier than cherry-pick — may conflict with your evolutions):
+
+```bash
+git merge ori2-upstream/main
+./scripts/sync-baseline.sh --mark $(git rev-parse HEAD)
 ```
 
 ### Publishing your bot to your own GitHub

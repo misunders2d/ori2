@@ -130,7 +130,7 @@ Ori knows how she's doing and tells you when something drifts — you shouldn't 
 
 ### 1. Claiming an Egg
 
-You **do not need to fork on GitHub first**. The one-liner installer (above) clones the canonical repo, then immediately detaches — wipes `.git`, starts a fresh commit history, drops a `.ori2-baseline` marker so future upstream-sync calls know where she hatched from. From that moment on, your bot's code belongs to *you*, not to the upstream repo. Evolution lives on your own timeline with zero risk of any self-evolution writing to someone else's GitHub.
+You **do not need to fork on GitHub first**. The one-liner installer (above) clones the canonical repo, then immediately detaches — wipes `.git`, starts a fresh commit history, drops a `.ori2-baseline` marker so future upstream-sync calls know where she hatched from, and re-attaches the upstream repo as a named remote `ori2-upstream` so cherry-picking later fixes stays one command away. From that moment on, your bot's code belongs to *you*, not to the upstream repo: `origin` is unset (yours to claim), nothing pulls or merges automatically, and self-evolution can't write to someone else's GitHub.
 
 When you're ready to publish your evolved bot somewhere — your own private repo, a team-shared repo, a public fork:
 
@@ -254,12 +254,20 @@ Two bots with different Telegram tokens can run side-by-side under one OS user u
 
 ## 🔄 Pulling Upstream Baseline Updates (optional)
 
-Because your bot is detached, `git pull` doesn't grab upstream changes. That's the point — your evolutions can't be clobbered by a background sync. To see what's new upstream when you want to:
+Because your bot is detached, `git pull` (from `origin`) doesn't grab upstream changes — that's the point: your evolutions can't be clobbered by a background sync. But the upstream repo is still attached as a named remote called `ori2-upstream` (set up by `bootstrap.sh` on clone), so cherry-picks are direct:
 
 ```bash
-./scripts/sync-baseline.sh             # prints log + diff since your baseline, drops the remote
-./scripts/sync-baseline.sh --remote    # keeps the remote so you can merge/cherry-pick
-./scripts/sync-baseline.sh --mark <sha>  # update the baseline marker after a merge
+git fetch ori2-upstream main
+git log HEAD..ori2-upstream/main          # see what's new
+git cherry-pick <sha>                     # take a specific fix
+```
+
+For a guided preview + baseline-marker bookkeeping:
+
+```bash
+./scripts/sync-baseline.sh                            # fetch + print log/diff (remote stays attached)
+./scripts/sync-baseline.sh --mark $(git rev-parse HEAD)  # after a merge, record the new baseline
+./scripts/sync-baseline.sh --drop                     # tear down the ori2-upstream remote (rare)
 ```
 
 The script never auto-merges. You're in charge of what upstream features (if any) land in your bot.
