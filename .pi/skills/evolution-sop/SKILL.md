@@ -42,4 +42,8 @@ You are under a strict TDD Global Directive.
 1. You are forbidden from telling the user "I am done" until the tests pass.
 2. Call the `verify_and_commit` tool with a clear commit message.
 3. If the tool rejects your commit (because a test failed), you must fix the code and try again.
-4. Once the commit succeeds, inform the user that the evolution is complete and structurally secure. Tell them if they need to add any new keys to their `.env` file and run `/reload`.
+4. Once the commit succeeds, inform the user that the evolution is complete and structurally secure. Tell them if they need to add any new keys.
+5. Activate the new extension's tools in the live session:
+   - **From chat (Telegram/Slack/A2A):** call the `reload_extensions` tool (admin-only). No terminal trip required. New tools become callable on the NEXT message.
+   - **From the TUI:** the operator types `/reload` directly.
+   - **Source-level changes** (anything outside `.pi/` — e.g. `src/transport/`): require a full process restart; neither reload path covers them.

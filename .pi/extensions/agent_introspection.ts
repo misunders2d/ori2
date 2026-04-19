@@ -4,6 +4,7 @@ import { currentOrigin } from "../../src/core/identity.js";
 import { getWhitelist } from "../../src/core/whitelist.js";
 import { getChannelModels } from "../../src/core/channelModels.js";
 import { getChannelSessions } from "../../src/core/channelSessions.js";
+import { getChannelRuntime } from "../../src/transport/channelRuntime.js";
 
 // =============================================================================
 // agent_introspection — tools the agent uses to answer questions about itself
@@ -309,6 +310,73 @@ export default function (pi: ExtensionAPI) {
                         : `No session binding existed for ${resolved.target.platform}:${resolved.target.channelId} — nothing to reset.`,
                 }],
                 details: { reset: had, ...resolved.target },
+            };
+        },
+    });
+
+    // ---------------- reload_extensions (admin-only) ----------------
+    //
+    // Chat-native equivalent of Pi's TUI `/reload` slash command. Closes the
+    // last terminal-dependent step in the evolve-from-chat loop: after the
+    // agent writes a new `.pi/extensions/*.ts` file via Pi's `write` tool, it
+    // calls this tool and the new extension's tools become callable on the
+    // NEXT message — no operator intervention required.
+    //
+    // Pi SDK only exposes reload() on ExtensionCommandContext (user-initiated
+    // slash commands), not on ExtensionContext (tool execute). This tool
+    // bypasses that by going directly through ChannelRuntime, which owns the
+    // per-channel AgentSession instances. Each channel reloads independently.
+    //
+    // Deferred via setImmediate in ChannelRuntime.reloadChannel so the current
+    // turn (the one calling this tool) finishes cleanly before Pi emits
+    // session_shutdown and rebuilds the runtime. Mirrors Pi's own compact()
+    // fire-and-forget pattern.
+
+    pi.registerTool({
+        name: "reload_extensions",
+        label: "Reload Extensions",
+        description:
+            "Reload Pi extensions, skills, APPEND_SYSTEM prompt, and themes for this channel — " +
+            "without restarting the process. Call IMMEDIATELY after writing a new " +
+            ".pi/extensions/*.ts file (via Pi's `write` tool) so the new extension's tools " +
+            "become callable here. Chat-native equivalent of Pi's TUI `/reload` slash command. " +
+            "ADMIN-ONLY. The reload runs AFTER this turn completes; new tools show up on the " +
+            "NEXT message. Applies to THIS channel only — other channels pick up changes on " +
+            "their next activity, or can invoke this tool themselves. " +
+            "\n\n" +
+            "From the TUI (CliAdapter), use Pi's /reload slash command directly — this tool " +
+            "only manages per-channel chat sessions.",
+        parameters: Type.Object({
+            target_platform: Type.Optional(Type.String({ description: "Platform of the target channel. Optional; defaults to current chat." })),
+            target_channel_id: Type.Optional(Type.String({ description: "Channel id on target_platform. Optional; defaults to current chat." })),
+        }),
+        async execute(_id, params, _signal, _onUpdate, ctx) {
+            const resolved = resolveTargetAndAdmin(ctx, {
+                targetPlatform: params.target_platform,
+                targetChannelId: params.target_channel_id,
+                toolName: "reload_extensions",
+            });
+            if (resolved.target.platform === "cli") {
+                return {
+                    content: [{
+                        type: "text",
+                        text: "You're on the TUI — type Pi's `/reload` slash command directly into the input. This tool only reloads per-channel chat sessions.",
+                    }],
+                    details: { queued: false, ...resolved.target, reason: "cli-uses-native-reload" },
+                };
+            }
+            const result = await getChannelRuntime().reloadChannel(
+                resolved.target.platform,
+                resolved.target.channelId,
+            );
+            return {
+                content: [{
+                    type: "text",
+                    text: result.queued
+                        ? `Reload queued for ${resolved.target.platform}:${resolved.target.channelId}. Extensions, skills, and prompts will be re-imported after this turn completes. Your new tools will be callable on the NEXT message.`
+                        : `Nothing to reload for ${resolved.target.platform}:${resolved.target.channelId}: ${result.reason ?? "unknown"}.`,
+                }],
+                details: { ...result, ...resolved.target },
             };
         },
     });

@@ -183,6 +183,7 @@ natural language; pick the matching tool — no slash command required:
 | "think hard" / "think step by step" / "don't overthink" / "be quick" | `set_thinking_mode` |
 | "what's your thinking level right now?" | `get_thinking_mode` |
 | "fresh start" / "clear our conversation" / "reset" | `reset_channel_session` (admin-only) |
+| "reload extensions" / after writing a new `.pi/extensions/*.ts` | `reload_extensions` (admin-only — chat-native equivalent of `/reload`) |
 | "summarize what we've discussed" / "compact the history" | `compact_conversation` |
 | "how much context have we used?" | `get_context_usage` |
 

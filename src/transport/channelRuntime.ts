@@ -137,6 +137,40 @@ export class ChannelRuntime {
         return Array.from(this.channels.keys()).sort();
     }
 
+    /**
+     * Reload extensions/skills/prompts for a channel's AgentSession — chat-native
+     * equivalent of Pi's TUI `/reload` slash command. Deferred via setImmediate
+     * so the current in-flight turn (typically the tool call that invoked this)
+     * finishes cleanly before Pi emits session_shutdown + rebuilds the runtime.
+     * New tools / skills become callable on the NEXT message in this channel.
+     *
+     * Returns { queued: true } if an active session exists (reload is scheduled
+     * post-turn), { queued: false, reason } otherwise. Never throws — errors
+     * during the deferred reload land in the error ledger.
+     */
+    async reloadChannel(
+        platform: string,
+        channelId: string,
+    ): Promise<{ queued: boolean; reason?: string }> {
+        const key = channelKey(platform, channelId);
+        const entry = this.channels.get(key);
+        if (!entry) {
+            return { queued: false, reason: "no active session for this channel" };
+        }
+        setImmediate(() => {
+            void entry.session.reload().catch((err: unknown) => {
+                logError("channelRuntime", "deferred reload failed", {
+                    platform,
+                    channelId,
+                    key,
+                    err: err instanceof Error ? err.message : String(err),
+                });
+            });
+        });
+        entry.lastActivity = Date.now();
+        return { queued: true };
+    }
+
     /** Test-only — clear in-memory state. Caller must call stop() first. */
     reset(): void {
         this.channels.clear();
