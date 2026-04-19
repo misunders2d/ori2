@@ -6,9 +6,11 @@ import {
     type AgentSessionServices,
 } from "@mariozechner/pi-coding-agent";
 import type { ImageContent } from "@mariozechner/pi-ai";
+import type { ThinkingLevel } from "@mariozechner/pi-agent-core";
 import fs from "node:fs";
 import path from "node:path";
 import { getChannelSessions } from "../core/channelSessions.js";
+import { getChannelModels, type ChannelModelBinding } from "../core/channelModels.js";
 import { getDispatcher } from "./dispatcher.js";
 import { logError, logInfo, logWarning } from "../core/errorLog.js";
 import { getOrCreate } from "../core/singletons.js";
@@ -303,6 +305,89 @@ export class ChannelRuntime {
     }
 
     /**
+     * Apply the CURRENT `channel-models.json` binding to the LIVE cached
+     * session. Called after `set_channel_model` writes the new binding, so
+     * the running session's next turn picks up the new model instead of
+     * waiting for cache eviction (15 min idle, or process restart).
+     *
+     * Class-of-bug context: every session-management tool that mutates
+     * per-channel disk state (models, thinking level, whitelist/blacklist
+     * reloads, etc.) needs to either hot-apply to the cached session OR
+     * evict the cached session so next inbound lazy-rebuilds. Pre-fix,
+     * `set_channel_model` persisted the binding but the cached AgentSession
+     * kept running on the old model silently. Source of several bug reports.
+     */
+    async applyChannelModel(platform: string, channelId: string): Promise<{ applied: boolean; reason?: string }> {
+        const key = channelKey(platform, channelId);
+        const entry = this.channels.get(key);
+        if (!entry) {
+            // No cached session — next inbound will lazy-create and read the
+            // binding from channel-models.json at that point. No action needed.
+            return { applied: false, reason: "no-active-session" };
+        }
+        if (!this.services) {
+            return { applied: false, reason: "services-not-initialized" };
+        }
+        const binding = getChannelModels().get(platform, channelId);
+        const opts = resolveChannelModelOpts(this.services, binding);
+        if (!opts.model && binding) {
+            logWarning("channelRuntime", "applyChannelModel: binding present but model unresolvable", {
+                platform, channelId, provider: binding.provider, modelId: binding.modelId,
+            });
+            return { applied: false, reason: "model-not-in-registry" };
+        }
+        try {
+            if (opts.model) {
+                await entry.session.setModel(opts.model);
+            }
+            if (opts.thinkingLevel !== undefined) {
+                entry.session.setThinkingLevel(opts.thinkingLevel);
+            }
+            entry.lastActivity = Date.now();
+            logInfo("channelRuntime", "applyChannelModel: live-applied", {
+                platform, channelId,
+                provider: binding?.provider, modelId: binding?.modelId,
+                thinkingLevel: opts.thinkingLevel,
+            });
+            return { applied: true };
+        } catch (e) {
+            logError("channelRuntime", "applyChannelModel: setModel/setThinkingLevel threw", {
+                platform, channelId,
+                err: e instanceof Error ? e.message : String(e),
+            });
+            return { applied: false, reason: e instanceof Error ? e.message : String(e) };
+        }
+    }
+
+    /**
+     * Drop the cached session for a channel so the NEXT inbound lazy-
+     * creates a fresh one. Called after `reset_channel_session` wipes the
+     * `channelSessions` binding — without this, the cached ChannelEntry
+     * kept the OLD session alive and the reset was invisible to the user.
+     *
+     * Same class-of-bug as `applyChannelModel`: disk-state mutation must
+     * be followed by cache invalidation on the live ChannelRuntime.
+     *
+     * Caller retains responsibility for wiping `channelSessions` (the
+     * platform/channelId → sessionFile map) — we only tear down the
+     * in-memory session entry here.
+     */
+    async resetChannel(platform: string, channelId: string): Promise<{ reset: boolean; reason?: string }> {
+        const key = channelKey(platform, channelId);
+        const entry = this.channels.get(key);
+        if (!entry) {
+            return { reset: false, reason: "no-active-session" };
+        }
+        this.stopTyping(entry);
+        this.channels.delete(key);
+        try { entry.unsubscribe(); } catch { /* best effort */ }
+        logInfo("channelRuntime", "resetChannel: cached session evicted", {
+            platform, channelId, previousSessionFile: entry.sessionFile,
+        });
+        return { reset: true };
+    }
+
+    /**
      * Reload extensions/skills/prompts for a channel's AgentSession — chat-native
      * equivalent of Pi's TUI `/reload` slash command. Deferred via setImmediate
      * so the current in-flight turn (typically the tool call that invoked this)
@@ -357,12 +442,28 @@ export class ChannelRuntime {
         const sessionFile = getChannelSessions().getOrCreateSessionFile(platform, channelId);
         const sm = SessionManager.open(sessionFile);
 
+        // Per-channel model override — honor set_channel_model. Before
+        // f69bb81 this was consumed by the subprocess `--model` flag; after
+        // the in-process rewrite nobody was reading it, which is why
+        // `set_channel_model` appeared to work but the bot kept answering
+        // on the default model. Resolve now, pass to createAgentSessionFromServices.
+        const override = getChannelModels().get(platform, channelId);
+        const modelOpts = resolveChannelModelOpts(services, override);
+        if (override && !modelOpts.model) {
+            logWarning("channelRuntime", "channel model override could not be resolved — falling back to default", {
+                platform, channelId,
+                provider: override.provider, modelId: override.modelId,
+            });
+        }
+
         // Per-channel AgentSession. Shares services with all other channels +
         // the parent (TUI / daemon) — extension code, model registry, settings,
         // and resource loader are reused.
         const result = await createAgentSessionFromServices({
             services,
             sessionManager: sm,
+            ...(modelOpts.model !== undefined ? { model: modelOpts.model } : {}),
+            ...(modelOpts.thinkingLevel !== undefined ? { thinkingLevel: modelOpts.thinkingLevel } : {}),
         });
         const session = result.session;
 
@@ -687,6 +788,43 @@ function sniffMimeFromPath(filePath: string): string {
 }
 
 void MAX_TURN_TIMEOUT_MS;
+
+/**
+ * Resolve a ChannelModelBinding (the JSON persisted by set_channel_model)
+ * into Pi's session-creation options. Returns empty opts when there's no
+ * binding OR when the binding's provider/modelId can't be found in the
+ * ModelRegistry (e.g. operator removed the API key since the override was
+ * set — fall back to default rather than crash at session create).
+ *
+ * ThinkingLevel strings stored on disk are validated against Pi's accepted
+ * set and narrowed to the ThinkingLevel type. Unknown strings are dropped
+ * (logged at the call site).
+ */
+function resolveChannelModelOpts(
+    services: AgentSessionServices,
+    binding: ChannelModelBinding | undefined,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+): { model?: import("@mariozechner/pi-ai").Model<any>; thinkingLevel?: ThinkingLevel } {
+    if (!binding) return {};
+    const model = services.modelRegistry.find(binding.provider, binding.modelId);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const opts: { model?: import("@mariozechner/pi-ai").Model<any>; thinkingLevel?: ThinkingLevel } = {};
+    if (model) opts.model = model;
+    const tl = narrowThinkingLevel(binding.thinkingLevel);
+    if (tl !== undefined) opts.thinkingLevel = tl;
+    return opts;
+}
+
+const VALID_THINKING_LEVELS: ReadonlyArray<ThinkingLevel> = [
+    "off", "minimal", "low", "medium", "high", "xhigh",
+];
+
+function narrowThinkingLevel(v: string | undefined): ThinkingLevel | undefined {
+    if (v === undefined) return undefined;
+    return (VALID_THINKING_LEVELS as ReadonlyArray<string>).includes(v)
+        ? (v as ThinkingLevel)
+        : undefined;
+}
 
 export function getChannelRuntime(): ChannelRuntime {
     return getOrCreate("channelRuntime", () => new ChannelRuntime());

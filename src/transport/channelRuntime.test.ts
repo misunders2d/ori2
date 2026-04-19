@@ -404,6 +404,143 @@ describe("ChannelRuntime.handleActiveInbound — transport-origin tagging (regre
 });
 
 // =============================================================================
+// REGRESSION GUARD — cached-runtime ↔ disk-state consistency boundary.
+//
+// CLASS OF BUG: session-management tools (set_channel_model,
+// reset_channel_session, set_thinking_mode, future equivalents) mutate disk
+// state. Pre-fix, the CACHED AgentSession in ChannelRuntime.channels kept
+// running on the old state indefinitely — "set_channel_model" returned
+// success, the JSON was written, but the bot kept answering on the old
+// model until the idle-sweep evicted the cache 15min later.
+//
+// Why the old tests missed it: they verified disk persistence (getChannelModels
+// returns what we set) but never asserted that the cached live session was
+// updated. The disk layer was tested in isolation. These tests sit on the
+// SEAM between disk state and live runtime — that's where the bug lived.
+//
+// Required invariants:
+//   - applyChannelModel: after set_channel_model writes disk, the cached
+//     session.setModel is called with the right model.
+//   - resetChannel: evicts the cached ChannelEntry so next inbound rebuilds.
+//   - getOrCreate: if a binding exists at session-create time, Pi's
+//     createAgentSessionFromServices receives it as `{ model, thinkingLevel }`.
+// =============================================================================
+
+describe("ChannelRuntime.applyChannelModel — live-apply after set_channel_model (bug-class guard)", () => {
+    beforeEach(() => {
+        TransportDispatcher.__resetForTests();
+    });
+
+    it("no cached session → applied:false, reason:no-active-session (lazy path)", async () => {
+        const rt = new ChannelRuntime();
+        const result = await rt.applyChannelModel("telegram", "-100absent");
+        assert.equal(result.applied, false);
+        assert.equal(result.reason, "no-active-session");
+    });
+
+    it("cached session + binding present → session.setModel/setThinkingLevel invoked on the live session", async () => {
+        const rt = new ChannelRuntime();
+        const calls: Array<{ type: "setModel" | "setThinking"; value: unknown }> = [];
+        const fakeModel = { provider: "google", id: "gemini-3-flash-preview" };
+        const fakeRegistry = {
+            find: (provider: string, modelId: string) => {
+                if (provider === "google" && modelId === "gemini-3-flash-preview") return fakeModel;
+                return undefined;
+            },
+        };
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (rt as any).services = { modelRegistry: fakeRegistry };
+        injectEntry(rt, "telegram:-100live", {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            session: {
+                setModel: async (m: unknown) => { calls.push({ type: "setModel", value: m }); },
+                setThinkingLevel: (l: unknown) => { calls.push({ type: "setThinking", value: l }); },
+            } as any,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            sessionManager: { appendCustomEntry: () => "id", getBranch: () => [] } as any,
+            sessionFile: "/tmp/live.jsonl",
+            lastActivity: 0,
+            unsubscribe: () => {},
+        });
+        // Seed the binding as if set_channel_model just wrote it.
+        const { getChannelModels, ChannelModels } = await import("../core/channelModels.js");
+        ChannelModels.__resetForTests();
+        getChannelModels().set("telegram", "-100live", {
+            provider: "google",
+            modelId: "gemini-3-flash-preview",
+            thinkingLevel: "medium",
+            setBy: "test",
+        });
+
+        const result = await rt.applyChannelModel("telegram", "-100live");
+        assert.equal(result.applied, true, "applied must be true when binding resolves to a real model");
+        // Exactly the expected hot-apply calls landed, in setModel-then-thinking order.
+        assert.equal(calls.length, 2);
+        assert.equal(calls[0]!.type, "setModel");
+        assert.deepEqual(calls[0]!.value, fakeModel, "the same model object returned by registry.find must flow into setModel");
+        assert.equal(calls[1]!.type, "setThinking");
+        assert.equal(calls[1]!.value, "medium");
+    });
+
+    it("binding provider/modelId missing from registry → applied:false with diagnostic reason (no crash)", async () => {
+        const rt = new ChannelRuntime();
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (rt as any).services = {
+            modelRegistry: { find: () => undefined }, // registry doesn't know the model
+        };
+        injectEntry(rt, "telegram:-100stale", {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            session: { setModel: async () => {}, setThinkingLevel: () => {} } as any,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            sessionManager: { appendCustomEntry: () => "id", getBranch: () => [] } as any,
+            sessionFile: "/tmp/stale.jsonl",
+            lastActivity: 0,
+            unsubscribe: () => {},
+        });
+        const { getChannelModels, ChannelModels } = await import("../core/channelModels.js");
+        ChannelModels.__resetForTests();
+        getChannelModels().set("telegram", "-100stale", {
+            provider: "anthropic",
+            modelId: "claude-gone-from-registry",
+            setBy: "test",
+        });
+
+        const result = await rt.applyChannelModel("telegram", "-100stale");
+        assert.equal(result.applied, false);
+        assert.equal(result.reason, "model-not-in-registry");
+    });
+});
+
+describe("ChannelRuntime.resetChannel — cache eviction (bug-class guard)", () => {
+    it("no cached session → reset:false, reason:no-active-session", async () => {
+        const rt = new ChannelRuntime();
+        const result = await rt.resetChannel("telegram", "-100absent");
+        assert.equal(result.reset, false);
+        assert.equal(result.reason, "no-active-session");
+    });
+
+    it("cached session → entry removed from map AND unsubscribe called", async () => {
+        const rt = new ChannelRuntime();
+        let unsubCalled = 0;
+        injectEntry(rt, "telegram:-100drop", {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            session: {} as any,
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any
+            sessionManager: {} as any,
+            sessionFile: "/tmp/drop.jsonl",
+            lastActivity: 0,
+            unsubscribe: () => { unsubCalled++; },
+        });
+        assert.equal(rt.listKeys().includes("telegram:-100drop"), true, "seeded");
+
+        const result = await rt.resetChannel("telegram", "-100drop");
+        assert.equal(result.reset, true);
+        assert.equal(rt.listKeys().includes("telegram:-100drop"), false, "entry must be gone from the channels Map");
+        assert.equal(unsubCalled, 1, "unsubscribe must run so Pi doesn't fire events at a torn-down session");
+    });
+});
+
+// =============================================================================
 // buildKickoffContent — pure helper. Unit-tests the multimodal wiring
 // (images → ImageContent[], text → inlined, binary → path+size mention).
 // =============================================================================

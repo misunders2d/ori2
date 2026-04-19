@@ -160,14 +160,25 @@ export default function (pi: ExtensionAPI) {
             // Clear path: empty strings → remove the override.
             if (!params.provider && !params.model_id) {
                 const had = getChannelModels().clear(resolved.target.platform, resolved.target.channelId);
+                // Live-evict the cached session so the next turn rebuilds
+                // with the bot-wide default. Without this, the cleared
+                // override persists on disk but the running session keeps
+                // the old model until cache eviction — same bug class as
+                // the set path below.
+                const live = had
+                    ? await getChannelRuntime().resetChannel(resolved.target.platform, resolved.target.channelId)
+                    : { reset: false, reason: "nothing-to-clear" };
                 return {
                     content: [{
                         type: "text",
                         text: had
-                            ? `Cleared model override for ${resolved.target.platform}:${resolved.target.channelId}. Future responses will use the bot-wide default.`
+                            ? `Cleared model override for ${resolved.target.platform}:${resolved.target.channelId}.` +
+                              (live.reset
+                                ? " Live session evicted; next message starts fresh on the bot-wide default."
+                                : " No cached session to evict; next message will use the default.")
                             : `No override was set for ${resolved.target.platform}:${resolved.target.channelId}.`,
                     }],
-                    details: { cleared: had, ...resolved.target },
+                    details: { cleared: had, live_reset: live.reset, ...resolved.target },
                 };
             }
 
@@ -203,19 +214,35 @@ export default function (pi: ExtensionAPI) {
                 setBy: resolved.callerDesc,
             });
 
+            // Live-apply to the cached session so the change takes effect on
+            // the NEXT turn in that channel — not on the next cache rebuild
+            // (which could be 15min away, or never). Without this, the agent
+            // confidently reports "model has been set" while continuing to
+            // answer on the old model indefinitely.
+            const live = await getChannelRuntime().applyChannelModel(
+                resolved.target.platform,
+                resolved.target.channelId,
+            );
+
             const suffix = params.thinking_level ? ` at thinking=${params.thinking_level}` : "";
+            const liveNote = live.applied
+                ? " The live session was updated — the NEXT turn uses the new model."
+                : live.reason === "no-active-session"
+                    ? " No cached session for that channel yet; the first message will use the new model."
+                    : ` (Live-apply warning: ${live.reason ?? "unknown"}. Persisted to disk; restart the channel or call reset_channel_session to force.)`;
             return {
                 content: [{
                     type: "text",
                     text:
                         `Channel model for ${resolved.target.platform}:${resolved.target.channelId} set to ` +
-                        `${params.provider}/${params.model_id}${suffix}. The next message in that channel ` +
-                        `runs on the new model.`,
+                        `${params.provider}/${params.model_id}${suffix}.${liveNote}`,
                 }],
                 details: {
                     provider: params.provider,
                     modelId: params.model_id,
                     ...(params.thinking_level !== undefined ? { thinkingLevel: params.thinking_level } : {}),
+                    live_applied: live.applied,
+                    ...(live.reason ? { live_reason: live.reason } : {}),
                     ...resolved.target,
                 },
             };
@@ -301,15 +328,32 @@ export default function (pi: ExtensionAPI) {
                 toolName: "reset_channel_session",
             });
 
-            const had = getChannelSessions().remove(resolved.target.platform, resolved.target.channelId);
+            // Two-step reset:
+            //   1. Drop the disk binding (platform/channelId → sessionFile) so
+            //      the next inbound lazy-creates a NEW JSONL.
+            //   2. Evict the CACHED AgentSession in ChannelRuntime. Without
+            //      this, the cached entry keeps the old session alive and
+            //      the user's "reset" is invisible — same class-of-bug as
+            //      the pre-fix set_channel_model.
+            const hadBinding = getChannelSessions().remove(resolved.target.platform, resolved.target.channelId);
+            const live = await getChannelRuntime().resetChannel(resolved.target.platform, resolved.target.channelId);
+            const anyEffect = hadBinding || live.reset;
             return {
                 content: [{
                     type: "text",
-                    text: had
-                        ? `Session binding for ${resolved.target.platform}:${resolved.target.channelId} cleared. The next message in that channel starts fresh.`
-                        : `No session binding existed for ${resolved.target.platform}:${resolved.target.channelId} — nothing to reset.`,
+                    text: anyEffect
+                        ? `Session for ${resolved.target.platform}:${resolved.target.channelId} reset. ` +
+                          `(Binding cleared: ${hadBinding}; cached session evicted: ${live.reset}.) ` +
+                          `The next message in that channel starts fresh.`
+                        : `No active state existed for ${resolved.target.platform}:${resolved.target.channelId} — nothing to reset.`,
                 }],
-                details: { reset: had, ...resolved.target },
+                details: {
+                    reset: anyEffect,
+                    binding_cleared: hadBinding,
+                    live_session_evicted: live.reset,
+                    ...(live.reason ? { live_reason: live.reason } : {}),
+                    ...resolved.target,
+                },
             };
         },
     });
