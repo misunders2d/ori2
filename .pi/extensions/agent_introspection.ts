@@ -314,6 +314,73 @@ export default function (pi: ExtensionAPI) {
         },
     });
 
+    // ---------------- hand_off_session (admin-only) ----------------
+    //
+    // Fresh session SEEDED with a summary of the current one. Different from:
+    //   - reset_channel_session — discards everything.
+    //   - compact_conversation — stays in-place, same session.
+    //
+    // The heavy-lifting (compact → dispose → swap → seed) lives in
+    // ChannelRuntime.handOffChannel. Deferred post-turn. Compact runs FIRST;
+    // if it fails we abort before any destructive step, so the user never
+    // loses history to a half-completed hand-off.
+
+    pi.registerTool({
+        name: "hand_off_session",
+        label: "Hand Off Session",
+        description:
+            "Start a FRESH session in this channel, seeded with a summary of the current " +
+            "conversation. Use when the chat has grown long OR the user says things like " +
+            "\"let's continue fresh but don't forget the gist\" / \"clear but remember what " +
+            "we did\" / \"new session but keep context\" / \"hand off to a new session\". " +
+            "\n\n" +
+            "Differs from `reset_channel_session` (which throws away everything) and from " +
+            "`compact_conversation` (which stays in-place). Here, Pi compacts the current " +
+            "session to produce a summary, then swaps to a new session file with that " +
+            "summary written as the first visible entry. Next message lands in the fresh " +
+            "session with the summary as its only context. " +
+            "\n\n" +
+            "Runs AFTER this turn completes — same pattern as reload_extensions. " +
+            "If compaction fails (e.g., session too short), the operation aborts and the " +
+            "current session is unchanged. Old session JSONL is preserved on disk. " +
+            "ADMIN-ONLY. " +
+            "\n\n" +
+            "Not supported on CLI/TUI — use Pi's `/new` slash command instead.",
+        parameters: Type.Object({
+            target_platform: Type.Optional(Type.String({ description: "Platform of the target channel. Optional; defaults to current chat." })),
+            target_channel_id: Type.Optional(Type.String({ description: "Channel id on target_platform. Optional; defaults to current chat." })),
+        }),
+        async execute(_id, params, _signal, _onUpdate, ctx) {
+            const resolved = resolveTargetAndAdmin(ctx, {
+                targetPlatform: params.target_platform,
+                targetChannelId: params.target_channel_id,
+                toolName: "hand_off_session",
+            });
+            if (resolved.target.platform === "cli") {
+                return {
+                    content: [{
+                        type: "text",
+                        text: "You're on the TUI — use Pi's `/new` slash command to start a fresh session. This tool only swaps per-channel chat sessions.",
+                    }],
+                    details: { queued: false, ...resolved.target, reason: "cli-uses-native-new" },
+                };
+            }
+            const result = await getChannelRuntime().handOffChannel(
+                resolved.target.platform,
+                resolved.target.channelId,
+            );
+            return {
+                content: [{
+                    type: "text",
+                    text: result.queued
+                        ? `Hand-off queued for ${resolved.target.platform}:${resolved.target.channelId}. After this turn: compact current conversation → swap to a fresh session → seed with summary. Your next message lands in the new session with the summary as context.`
+                        : `Cannot hand off ${resolved.target.platform}:${resolved.target.channelId}: ${result.reason ?? "unknown"}. For a fully-fresh start (no summary) use reset_channel_session.`,
+                }],
+                details: { ...result, ...resolved.target },
+            };
+        },
+    });
+
     // ---------------- reload_extensions (admin-only) ----------------
     //
     // Chat-native equivalent of Pi's TUI `/reload` slash command. Closes the

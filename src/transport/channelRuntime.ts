@@ -7,8 +7,9 @@ import {
 } from "@mariozechner/pi-coding-agent";
 import { getChannelSessions } from "../core/channelSessions.js";
 import { getDispatcher } from "./dispatcher.js";
-import { logError, logWarning } from "../core/errorLog.js";
+import { logError, logInfo, logWarning } from "../core/errorLog.js";
 import { getOrCreate } from "../core/singletons.js";
+import { writePendingHandoff } from "../core/handoffPending.js";
 import type { Message } from "./types.js";
 
 // =============================================================================
@@ -135,6 +136,107 @@ export class ChannelRuntime {
      */
     listKeys(): string[] {
         return Array.from(this.channels.keys()).sort();
+    }
+
+    /**
+     * Hand off a channel to a FRESH session seeded with a summary of the current
+     * one. Chat-native equivalent of "save context + /new + paste summary".
+     *
+     * Safety contract: compaction runs BEFORE any destructive step. If compact
+     * fails, the entire operation aborts and the old session is left intact.
+     * Old session JSONL stays on disk (same convention as reset_channel_session).
+     *
+     * Flow (all deferred post-turn via setImmediate):
+     *   1. session.compact() → CompactionResult { summary, ... }
+     *   2. writePendingHandoff(...) — side-channel file picked up by the
+     *      session_handoff extension's before_agent_start hook on the next
+     *      inbound. Written BEFORE destructive steps so a crash mid-hand-off
+     *      leaves both old session + pending summary intact.
+     *   3. Remove in-memory ChannelRuntime entry + unsubscribe
+     *   4. channelSessions.remove() — drop the binding so the next inbound
+     *      lazy-creates a fresh session.
+     *
+     * Returns { queued: true } when an active session exists, { queued: false }
+     * otherwise. Never throws — all errors land in the ledger. If compact
+     * fails, nothing else runs — old session intact.
+     */
+    async handOffChannel(
+        platform: string,
+        channelId: string,
+    ): Promise<{ queued: boolean; reason?: string }> {
+        const key = channelKey(platform, channelId);
+        const entry = this.channels.get(key);
+        if (!entry) {
+            return { queued: false, reason: "no active session for this channel" };
+        }
+        setImmediate(() => {
+            void this.runHandOff(platform, channelId, entry, key).catch((err: unknown) => {
+                logError("channelRuntime", "deferred hand-off failed", {
+                    platform,
+                    channelId,
+                    key,
+                    err: err instanceof Error ? err.message : String(err),
+                });
+            });
+        });
+        entry.lastActivity = Date.now();
+        return { queued: true };
+    }
+
+    private async runHandOff(
+        platform: string,
+        channelId: string,
+        entry: ChannelEntry,
+        key: string,
+    ): Promise<void> {
+        // Step 1: compact. Non-destructive. If this fails we bail and the
+        // user's session is untouched — no data loss, no split-brain.
+        let summary: string;
+        try {
+            const result = await entry.session.compact();
+            summary = result.summary;
+        } catch (err) {
+            logError("channelRuntime", "hand-off aborted: compact failed — session unchanged", {
+                platform,
+                channelId,
+                key,
+                err: err instanceof Error ? err.message : String(err),
+            });
+            return;
+        }
+
+        // Step 2: persist the summary to the side-channel BEFORE any
+        // destructive step. If the process crashes between here and the
+        // binding swap, the next restart finds an orphan pending file with
+        // the old binding still intact — worst-case the operator sees a
+        // duplicate summary on first inbound after restart. Much better than
+        // losing the summary to a mid-flight crash.
+        writePendingHandoff(platform, channelId, summary, entry.sessionFile);
+
+        // Step 3: dispose the in-memory entry. stopTyping in case a typing
+        // loop was mid-fire. unsubscribe detaches the agent_end handler so
+        // Pi doesn't dispatch replies against a session we're tearing down.
+        this.stopTyping(entry);
+        this.channels.delete(key);
+        try {
+            entry.unsubscribe();
+        } catch { /* best effort — next line proceeds regardless */ }
+
+        // Step 4: drop the channelSessions binding. Next inbound for this
+        // (platform, channelId) will lazy-create a fresh AgentSession against
+        // a new JSONL; the session_handoff extension's before_agent_start
+        // hook will pick up the pending file and inject the summary as a
+        // display=true custom message, then delete the pending file.
+        // Old JSONL stays on disk — operator-recoverable.
+        getChannelSessions().remove(platform, channelId);
+
+        logInfo("channelRuntime", "hand-off staged", {
+            platform,
+            channelId,
+            key,
+            previousSessionFile: entry.sessionFile,
+            summaryChars: summary.length,
+        });
     }
 
     /**

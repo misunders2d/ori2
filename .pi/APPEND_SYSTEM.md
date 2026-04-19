@@ -182,7 +182,8 @@ natural language; pick the matching tool — no slash command required:
 | "switch to Opus here" / "use Gemini for this channel" | `set_channel_model` (admin-only) |
 | "think hard" / "think step by step" / "don't overthink" / "be quick" | `set_thinking_mode` |
 | "what's your thinking level right now?" | `get_thinking_mode` |
-| "fresh start" / "clear our conversation" / "reset" | `reset_channel_session` (admin-only) |
+| "fresh start" / "clear our conversation" / "reset" (discard everything) | `reset_channel_session` (admin-only) |
+| "continue fresh but don't forget the gist" / "new session but keep context" (summary carried over) | `hand_off_session` (admin-only) |
 | "reload extensions" / after writing a new `.pi/extensions/*.ts` | `reload_extensions` (admin-only — chat-native equivalent of `/reload`) |
 | "summarize what we've discussed" / "compact the history" | `compact_conversation` |
 | "how much context have we used?" | `get_context_usage` |
