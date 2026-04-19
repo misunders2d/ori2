@@ -897,8 +897,34 @@ export default function (pi: ExtensionAPI) {
  * (/init, Approve ACT-...) at the body's start. CLI input has no header,
  * so this is a no-op for terminal users.
  */
-function stripMetadataHeader(text: string): string {
-    const m = text.match(/^\[Inbound \|[^\]]*\]\s*\n\n([\s\S]*)$/);
+/**
+ * Strip the inbound-metadata prefix that the transport layer prepends to
+ * every non-TUI message.
+ *
+ * Two formats historically in play — BOTH must be handled or body-pattern
+ * matches ("/init ...", "Approve ACT-..." etc.) fail on whichever path
+ * isn't covered:
+ *
+ *   transport_bridge (CLI path, pre-f69bb81 subprocess model):
+ *     "[Inbound | from: alice | cli=cli:default]\n\n<body>"
+ *
+ *   channelRuntime (non-CLI in-process path, post-f69bb81):
+ *     "[<platform> inbound | from: @user (123) | channel: -100xyz]\n<body>"
+ *     (lowercase "inbound", single newline)
+ *
+ * Regex: one leading `[...]` block that contains "inbound" (case-insensitive)
+ * followed by any whitespace/newlines, then the body. Matches both. Non-
+ * matching strings (terminal typed input, approval tests) fall through
+ * unchanged.
+ *
+ * Load-bearing: this is what lets body-content pattern matches (approval
+ * flow, /init chat command) work at all on non-CLI transports. Missing
+ * this was the root cause of the "approve loop" bug — admin approves,
+ * handler fails to match because of the leading "[telegram inbound ...]"
+ * envelope, LLM sees the approval as a fresh prompt, re-stages, loop.
+ */
+export function stripMetadataHeader(text: string): string {
+    const m = text.match(/^\[[^\]]*inbound[^\]]*\]\s*\n+([\s\S]*)$/i);
     return m ? m[1]! : text;
 }
 
