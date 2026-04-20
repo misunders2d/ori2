@@ -40,14 +40,14 @@ describe("ChannelRuntime.appendCustomMessageToChannel", () => {
     after(cleanTestDir);
     beforeEach(cleanTestDir);
 
-    it("disk-only path: no cached session → appends via fresh SessionManager.open on the channel's session file", () => {
+    it("disk-only path: no cached session → appends via fresh SessionManager.open on the channel's session file", async () => {
         // Pre-register the binding (same call the scheduler uses). Pi's
         // SessionManager.create may lazy-flush — we don't assert the file
         // exists before the append, only that the method path works.
         getChannelSessions().getOrCreateSessionFile("telegram", "330959414");
 
         const runtime = getChannelRuntime();
-        const result = runtime.appendCustomMessageToChannel(
+        const result = await runtime.appendCustomMessageToChannel(
             "telegram",
             "330959414",
             "scheduler-delivery",
@@ -60,9 +60,9 @@ describe("ChannelRuntime.appendCustomMessageToChannel", () => {
         assert.equal(result.via, "disk-only", "no cached session → disk path");
     });
 
-    it("never throws — always returns a result object", () => {
+    it("never throws — always returns a result object", async () => {
         const runtime = getChannelRuntime();
-        const result = runtime.appendCustomMessageToChannel(
+        const result = await runtime.appendCustomMessageToChannel(
             "telegram",
             "new-channel-never-seen-before",
             "scheduler-delivery",

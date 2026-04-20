@@ -451,39 +451,54 @@ export class ChannelRuntime {
     }
 
     /**
-     * Append a custom message entry to a channel's session — routed through
-     * the CACHED SessionManager when the channel has an active AgentSession,
-     * so the in-memory session state sees the entry and the next prompt's
-     * getBranch() picks it up. Falls back to opening a fresh SessionManager
-     * on the channel's session file when no cached session exists (the next
-     * lazy-create will read the JSONL from disk and see the entry).
+     * Append a custom message entry to a channel's session so the next LLM
+     * turn in that channel sees it as context.
      *
-     * Load-bearing for scheduler cross-channel delivery: Pi's SessionManager
-     * does NOT re-read the JSONL between turns. If you write to the file via
-     * a second SessionManager instance while the first is alive, the first
-     * never sees it. This method is the only safe way for an outside caller
-     * (scheduler fire → Telegram/Slack target) to inject context the target
-     * channel's next LLM turn will actually see.
+     * Load-bearing subtlety — why this is NOT just `sessionManager.append…`:
+     *   AgentSession keeps its own in-memory `agent.state.messages` array
+     *   which IS the actual source of LLM context on each prompt. Direct
+     *   writes to the underlying SessionManager update the persisted branch
+     *   but do NOT sync into `agent.state.messages` — so the next prompt
+     *   still runs on the stale in-memory conversation. Verified at
+     *   node_modules/@mariozechner/pi-coding-agent/dist/core/agent-session.js:969-970:
+     *   Pi's own `sendCustomMessage(msg, { triggerTurn: false })` pushes the
+     *   message onto BOTH agent.state.messages AND the SessionManager. That's
+     *   the only correct path from outside the session.
      *
-     * Never throws — returns `{ appended: false, via, reason }` on failure.
+     *   For non-cached channels (no live AgentSession), a disk-only write is
+     *   correct: the next lazy-create in getOrCreate() calls
+     *   SessionManager.open(file), which seeds state.messages from the full
+     *   branch including our appended entry.
+     *
+     * Never throws — returns `{ appended: false, via: "failed", reason }` on
+     * failure. On the cached path, resolution waits for sendCustomMessage to
+     * complete (it's async) so the caller can count on the append being
+     * visible to the next inbound.
      */
-    appendCustomMessageToChannel(
+    async appendCustomMessageToChannel(
         platform: string,
         channelId: string,
         customType: string,
         content: string,
         display: boolean,
         metadata: Record<string, unknown>,
-    ): { appended: boolean; via: "cached-session" | "disk-only" | "failed"; reason?: string } {
+    ): Promise<{ appended: boolean; via: "cached-session" | "disk-only" | "failed"; reason?: string }> {
         const key = channelKey(platform, channelId);
         const existing = this.channels.get(key);
         if (existing) {
             try {
-                existing.sessionManager.appendCustomMessageEntry(customType, content, display, metadata);
+                // Route through AgentSession so agent.state.messages gets the
+                // update (the in-memory array the NEXT prompt turns into the
+                // LLM's conversation). triggerTurn: false means we're only
+                // INJECTING context, not starting a new LLM turn.
+                await existing.session.sendCustomMessage(
+                    { customType, content, display, details: metadata },
+                    { triggerTurn: false },
+                );
                 existing.lastActivity = Date.now();
                 return { appended: true, via: "cached-session" };
             } catch (e) {
-                logError("channelRuntime", "cached-session append failed — falling through to disk", {
+                logError("channelRuntime", "cached-session sendCustomMessage failed — falling through to disk", {
                     platform, channelId, customType,
                     err: e instanceof Error ? e.message : String(e),
                 });

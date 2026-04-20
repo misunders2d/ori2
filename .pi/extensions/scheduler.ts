@@ -324,7 +324,7 @@ async function deliverAndAppend(meta: JobMeta, responseText: string): Promise<vo
         // Target is a real chat channel — use ChannelRuntime so the cached
         // AgentSession's in-memory state gets the entry. Follow-ups in THAT
         // channel will see the delivered reminder/digest in context.
-        const result = getChannelRuntime().appendCustomMessageToChannel(
+        const result = await getChannelRuntime().appendCustomMessageToChannel(
             target.platform,
             target.channelId,
             "scheduler-delivery",
