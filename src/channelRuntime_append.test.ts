@@ -62,19 +62,15 @@ describe("ChannelRuntime.appendCustomMessageToChannel", () => {
 
     it("never throws — always returns a result object", () => {
         const runtime = getChannelRuntime();
-        let result;
-        assert.doesNotThrow(() => {
-            result = runtime.appendCustomMessageToChannel(
-                "telegram",
-                "new-channel-never-seen-before",
-                "scheduler-delivery",
-                "content",
-                true,
-                {},
-            );
-        });
-        assert.ok(result);
-        assert.ok(typeof result!.appended === "boolean");
-        assert.ok(["cached-session", "disk-only", "failed"].includes(result!.via));
+        const result = runtime.appendCustomMessageToChannel(
+            "telegram",
+            "new-channel-never-seen-before",
+            "scheduler-delivery",
+            "content",
+            true,
+            {},
+        );
+        assert.ok(typeof result.appended === "boolean");
+        assert.ok(["cached-session", "disk-only", "failed"].includes(result.via));
     });
 });
