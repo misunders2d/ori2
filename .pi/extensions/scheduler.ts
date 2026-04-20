@@ -643,7 +643,13 @@ export default function (pi: ExtensionAPI) {
             "user-facing (weekly reports, daily standups). If omitted and the user is in " +
             "the CLI/TUI, the task runs but results only surface in session history on " +
             "the NEXT message. ASK THE USER where they want recurring output delivered " +
-            "before scheduling (Telegram? Slack? an A2A peer? the same chat they're in now?).",
+            "before scheduling (Telegram? Slack? an A2A peer? the same chat they're in now?). " +
+            "\n\n" +
+            "**CRITICAL — channel IDs.** Before populating `deliver_to.channelId`, call " +
+            "`list_known_channels` and pick the exact `channelId` from its output. NEVER " +
+            "invent IDs (plausible-looking numbers like '-1001234567890' cause silent " +
+            "Telegram 'chat not found' failures). If the channel the user means isn't in " +
+            "the list, ASK them to paste the exact chat ID — don't guess.",
         parameters: Type.Object({
             job_id: Type.String({ description: "Unique identifier (e.g. 'daily_inventory')" }),
             cron_expression: Type.String({ description: "Cron expression (e.g. '0 9 * * *' for 9 AM daily)" }),
@@ -651,9 +657,9 @@ export default function (pi: ExtensionAPI) {
             steps: Type.Optional(Type.Array(Type.String(), { description: "Explicit ordered steps for plan-enforcement mode (recommended for high-stakes tasks)" })),
             deliver_to: Type.Optional(Type.Object({
                 platform: Type.String({ description: "Adapter platform to deliver to: 'telegram', 'slack', 'a2a', … Must match a registered adapter at fire time or delivery is skipped (history still appends)." }),
-                channelId: Type.String({ description: "Platform-specific channel id (Telegram chat_id, Slack channel/group id, A2A friend name, …)" }),
+                channelId: Type.String({ description: "Platform-specific channel id. MUST come from `list_known_channels` output — never invented. If the target isn't listed, ASK the user to paste it." }),
                 threadId: Type.Optional(Type.String({ description: "Optional reply-to / thread id. Telegram: message id to reply to. Slack: thread_ts." })),
-            }, { description: "Optional override for WHERE output is delivered. Defaults to the chat that scheduled the job. Use this to route a recurring job to a different channel (e.g. schedule from DM, post to a team channel)." })),
+            }, { description: "Optional override for WHERE output is delivered. Defaults to the chat that scheduled the job. Use this to route a recurring job to a different channel (e.g. schedule from DM, post to a team channel). ALWAYS call `list_known_channels` first to resolve channelId." })),
         }),
         async execute(_id, params, _signal, _onUpdate, ctx) {
             if (activeJobs.has(params.job_id)) {
@@ -718,6 +724,13 @@ export default function (pi: ExtensionAPI) {
             "reminder sent ('via Telegram? Slack? or just kept in session history?') and pass " +
             "their choice via `deliver_to`. " +
             "\n\n" +
+            "**CRITICAL — channel IDs.** Before populating `deliver_to.channelId`, call " +
+            "`list_known_channels` and pick the exact `channelId` from its output. NEVER " +
+            "invent IDs. If the user says 'my Telegram' and the tool returns a telegram DM row " +
+            "that matches them (e.g. `telegram:330959414 name=\"you\"`), use THAT channelId. " +
+            "If nothing matches, ASK the user to paste the exact chat ID — don't guess. " +
+            "Hallucinated IDs like '-1001234567890' silently fail at Telegram with 'chat not found'. " +
+            "\n\n" +
             "When writing `reminder_message`, include the context the user currently has in chat " +
             "— the fire-time agent has no conversation history, so 'remind me to watch this movie' " +
             "needs to become 'remind user to watch Oppenheimer (they mentioned it in chat today)'. " +
@@ -727,9 +740,9 @@ export default function (pi: ExtensionAPI) {
             reminder_message: Type.String({ description: "Self-contained reminder text — include enough context that an agent with NO chat history can deliver a useful reminder." }),
             deliver_to: Type.Optional(Type.Object({
                 platform: Type.String({ description: "Adapter platform to deliver to: 'telegram', 'slack', 'a2a', … Must match a registered adapter at fire time." }),
-                channelId: Type.String({ description: "Platform-specific channel id." }),
+                channelId: Type.String({ description: "Platform-specific channel id. MUST come from `list_known_channels` output — never invented. If the target isn't listed, ASK the user to paste it." }),
                 threadId: Type.Optional(Type.String({ description: "Optional reply-to / thread id." })),
-            }, { description: "Optional override. Defaults to the chat that scheduled the reminder. Use to remind someone in a different chat (e.g. schedule from DM, deliver to a group)." })),
+            }, { description: "Optional override. Defaults to the chat that scheduled the reminder. Use to remind someone in a different chat (e.g. schedule from DM, deliver to a group). ALWAYS call `list_known_channels` first to resolve channelId." })),
         }),
         async execute(_id, params, _signal, _onUpdate, ctx) {
             const delayMs = Math.max(0, params.minutes_from_now * 60 * 1000);
@@ -791,6 +804,10 @@ export default function (pi: ExtensionAPI) {
             "(next message) but not live in the TUI — ASK THE USER where the completion notice " +
             "should be sent before scheduling. " +
             "\n\n" +
+            "**CRITICAL — channel IDs.** Before populating `deliver_to.channelId`, call " +
+            "`list_known_channels` and pick the exact `channelId` from its output. NEVER " +
+            "invent IDs. If nothing matches, ASK the user to paste the exact chat ID. " +
+            "\n\n" +
             "Use for async external work the user shouldn't have to watch manually — SP-API " +
             "report jobs, 'ping me when this PR is green', 'notify me when the listing becomes " +
             "active'. Different from schedule_recurring_task because polls self-terminate; " +
@@ -816,9 +833,9 @@ export default function (pi: ExtensionAPI) {
             })),
             deliver_to: Type.Optional(Type.Object({
                 platform: Type.String({ description: "Platform: 'telegram', 'slack', 'a2a', 'cli'." }),
-                channelId: Type.String({ description: "Platform-specific channel id." }),
+                channelId: Type.String({ description: "Platform-specific channel id. MUST come from `list_known_channels` output — never invented. If the target isn't listed, ASK the user to paste it." }),
                 threadId: Type.Optional(Type.String({ description: "Optional reply-to / thread id." })),
-            }, { description: "Optional override for WHERE the final result is delivered. Defaults to the chat that scheduled the poll." })),
+            }, { description: "Optional override for WHERE the final result is delivered. Defaults to the chat that scheduled the poll. ALWAYS call `list_known_channels` first to resolve channelId." })),
         }),
         async execute(_id, params, _signal, _onUpdate, ctx) {
             if (activeJobs.has(params.poll_id)) {

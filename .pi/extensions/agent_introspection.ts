@@ -491,6 +491,150 @@ export default function (pi: ExtensionAPI) {
             };
         },
     });
+
+    // ---------------- list_known_channels ----------------
+    //
+    // Single source of truth for "where can I send a message?" — unifies:
+    //   * whitelist users (each DM maps to a (platform, senderId)
+    //     where senderId IS the DM chat_id on Telegram; same convention holds
+    //     for other platforms),
+    //   * whitelist channels (explicit per-channel allow entries),
+    //   * channelSessions bindings (every channel that's ever had an inbound,
+    //     which is the authoritative list for groups / channels / supergroups
+    //     whose IDs don't appear anywhere else).
+    //
+    // CRITICAL for the scheduler / any cross-channel delivery: the LLM MUST
+    // call this before asking the user for a chat ID, and MUST NOT invent
+    // channel IDs. Hallucinated IDs like "-1001234567890" cause silent
+    // delivery failures (Telegram: "chat not found"). See the schedule_*
+    // tools' deliver_to docs.
+
+    pi.registerTool({
+        name: "list_known_channels",
+        label: "List Known Channels",
+        description:
+            "Enumerate every channel the bot is reachable on, with its exact channel ID. " +
+            "Sources: the whitelist (admin DMs + explicitly allowed per-channel entries) and " +
+            "the channel-sessions registry (every platform/channel that's ever had an inbound " +
+            "message — the authoritative ID source for groups, supergroups, and channels). " +
+            "\n\n" +
+            "USE THIS TOOL before populating `deliver_to.channelId` on any scheduled task, " +
+            "reminder, or cross-channel send. Hallucinating chat IDs (e.g. picking a plausible-" +
+            "looking '-100…' number) causes silent delivery failures. If none of the returned " +
+            "channels match what the user meant (e.g. they ask for 'my personal Telegram' but " +
+            "the whitelist only has a group), ASK them to paste the chat ID — never guess. " +
+            "\n\n" +
+            "Admin-only (the channel list reveals where the operator is reachable — not secret, " +
+            "but not for arbitrary group members to query either).",
+        parameters: Type.Object({
+            platform: Type.Optional(Type.String({ description: "Filter to one platform (e.g. 'telegram', 'slack', 'a2a'). Omit for all platforms." })),
+        }),
+        async execute(_id, params, _signal, _onUpdate, ctx) {
+            const origin = currentOrigin(ctx.sessionManager);
+            const whitelist = getWhitelist();
+            if (origin && !whitelist.isAdmin(origin.platform, origin.senderId)) {
+                return {
+                    content: [{ type: "text", text: "list_known_channels is admin-only." }],
+                    details: { error: "admin-only" },
+                    isError: true,
+                };
+            }
+
+            type Row = {
+                platform: string;
+                channelId: string;
+                source: "whitelist-user-dm" | "whitelist-channel" | "channel-sessions";
+                displayName?: string;
+                roles?: string[];
+                lastActivity?: string;
+            };
+            const rows: Row[] = [];
+            const seen = new Set<string>();
+            const key = (p: string, c: string): string => `${p}:${c}`;
+
+            // 1. Whitelist users — senderId is the DM chat_id on Telegram
+            //    (and the user/chat identifier on other DM-style transports).
+            for (const u of whitelist.list()) {
+                if (params.platform && u.platform !== params.platform) continue;
+                const k = key(u.platform, u.senderId);
+                if (seen.has(k)) continue;
+                seen.add(k);
+                const row: Row = {
+                    platform: u.platform,
+                    channelId: u.senderId,
+                    source: "whitelist-user-dm",
+                };
+                if (u.displayName) row.displayName = u.displayName;
+                if (u.roles?.length) row.roles = u.roles;
+                rows.push(row);
+            }
+
+            // 2. Whitelist channels — explicit per-channel entries.
+            for (const c of whitelist.listChannels()) {
+                if (params.platform && c.platform !== params.platform) continue;
+                const k = key(c.platform, c.channelId);
+                if (seen.has(k)) continue;
+                seen.add(k);
+                rows.push({
+                    platform: c.platform,
+                    channelId: c.channelId,
+                    source: "whitelist-channel",
+                });
+            }
+
+            // 3. Channel-sessions bindings — every channel that's ever had
+            //    inbound. The only source that covers groups/supergroups/
+            //    channels whose IDs don't appear in any per-user entry.
+            for (const b of getChannelSessions().all()) {
+                if (params.platform && b.platform !== params.platform) continue;
+                const k = key(b.platform, b.channelId);
+                if (seen.has(k)) continue;
+                seen.add(k);
+                rows.push({
+                    platform: b.platform,
+                    channelId: b.channelId,
+                    source: "channel-sessions",
+                    lastActivity: new Date(b.createdAt).toISOString().slice(0, 19) + "Z",
+                });
+            }
+
+            if (rows.length === 0) {
+                return {
+                    content: [{
+                        type: "text",
+                        text:
+                            `No known channels${params.platform ? ` on platform "${params.platform}"` : ""}.\n\n` +
+                            `The bot hasn't received any inbound yet, and the whitelist is empty. ` +
+                            `ASK the user to paste the exact chat ID they want to target — do NOT guess.`,
+                    }],
+                    details: { rows: [] },
+                };
+            }
+
+            const lines: string[] = [];
+            lines.push(`Known channels (${rows.length}${params.platform ? `, filtered to ${params.platform}` : ""}):`);
+            lines.push("");
+            for (const r of rows) {
+                const tail = [
+                    r.displayName ? `name="${r.displayName}"` : "",
+                    r.roles && r.roles.length ? `roles=[${r.roles.join(",")}]` : "",
+                    r.lastActivity ? `first-seen=${r.lastActivity}` : "",
+                    `source=${r.source}`,
+                ].filter(Boolean).join(" ");
+                lines.push(`- ${r.platform}:${r.channelId}  ${tail}`);
+            }
+            lines.push("");
+            lines.push(
+                "Use the exact `platform:channelId` pair when filling in `deliver_to` or any " +
+                "cross-channel send argument. If the channel the user means isn't listed, ASK " +
+                "them to paste the chat ID — never invent one.",
+            );
+            return {
+                content: [{ type: "text", text: lines.join("\n") }],
+                details: { rows },
+            };
+        },
+    });
 }
 
 // -----------------------------------------------------------------------------
