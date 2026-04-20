@@ -24,7 +24,7 @@ import { secretSubdir, ensureSecretDir } from "./paths.js";
 // Access pattern from evolved tools:
 //
 //     import { getCredentials } from "../../src/core/credentials.js";
-//     const auth = await getCredentials().getAuthHeader("github_pat");
+//     const auth = await getCredentials().getAuthHeader("github");
 //     // auth = { Authorization: "Bearer ghp_..." }
 //     await fetch(url, { headers: { ...auth, "Content-Type": "application/json" } });
 //
@@ -276,7 +276,7 @@ export class Credentials {
      * Build the HTTP header(s) the credential's auth_type implies. Tool
      * authors call this and spread the result into their fetch headers.
      *
-     *     const auth = await getCredentials().getAuthHeader("github_pat");
+     *     const auth = await getCredentials().getAuthHeader("github");
      *     await fetch(url, { headers: { ...auth, ... } });
      *
      * For auth_type === "raw", returns {} — caller handles authentication
