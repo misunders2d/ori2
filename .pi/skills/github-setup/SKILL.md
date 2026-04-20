@@ -44,31 +44,39 @@ Have the user paste the token once more via the credential command so I can use 
 The dispatcher intercepts this command before your context sees the raw token. Use the `github-read` skill for guidance on when to reach for each GitHub tool.
 
 ## Step 4: Configure the Remote (Agent Action)
-Once the user provides the URL and Token, use your `bash` tool to configure the Git remote. 
-You must construct the secure remote URL by embedding the token.
 
-Example logic:
-If URL is `https://github.com/johndoe/repo.git` and token is `ghp_12345`:
-The secure URL is: `https://ghp_12345@github.com/johndoe/repo.git`
+**Never embed the token in a remote URL.** Instead, add a plain `https://` remote and use the `credentials_git` tool for the authenticated push. `credentials_git` injects the token via `GIT_CONFIG_*` env vars — the token stays out of the argv, out of LLM context, and out of `.git/config`.
 
-Run these exact bash commands:
-```bash
-# Ensure git is initialized and initial commit is made
+```
+# 1. Init + first commit (plain bash — no auth needed yet)
 git init
 git add .
 git commit -m "Initial platform commit" || true
-
-# Rename branch to main
 git branch -M main
 
-# Remove existing remote if it exists
+# 2. Add the remote WITHOUT any token in the URL
 git remote remove origin || true
+git remote add origin https://github.com/<USERNAME>/<REPO>.git
+```
 
-# Add the secure remote
-git remote add origin "https://<TOKEN>@github.com/<USERNAME>/<REPO>.git"
+Then do the authenticated push via the tool:
 
-# Push the code
-git push -u origin main
+```
+credentials_git({
+  credential_id: "github",
+  args: ["push", "-u", "origin", "main"]
+})
+```
+
+(If the operator hasn't yet run `/credentials add github <token>` at this point, run `credentials_git` anyway — it'll return a clear "credential not found" error and you can prompt them to add it. **Never ask them to paste the token into a bash command or into a URL.**)
+
+Subsequent pushes (after `verify_and_commit` or any code change) use the same shape:
+
+```
+credentials_git({
+  credential_id: "github",
+  args: ["push", "origin", "main"]
+})
 ```
 
 ## Step 5: Verify and Clean Up

