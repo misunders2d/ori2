@@ -10,7 +10,7 @@ import { getWhitelist } from "../../src/core/whitelist.js";
 import { getKVCache } from "../../src/core/kvCache.js";
 import { getDispatcher } from "../../src/transport/dispatcher.js";
 import { getSharedAgentServices, extractAssistantText } from "../../src/core/agentServices.js";
-import { getChannelSessions } from "../../src/core/channelSessions.js";
+import { getChannelRuntime } from "../../src/transport/channelRuntime.js";
 import { seedPlan, recordPlanThread, type OriginChannel } from "./plan_enforcer.js";
 import { logError, logWarning } from "../../src/core/errorLog.js";
 
@@ -295,46 +295,56 @@ async function deliverAndAppend(meta: JobMeta, responseText: string): Promise<vo
 
     // 2) Append the delivery as a `scheduler-delivery` custom entry on the
     //    session where the user will follow up. Single append, target-preferred
-    //    (mirrors amazon_manager's `_inject_into_session`): when `deliver_to`
-    //    points at a real chat channel (telegram/slack/a2a/…), the follow-up
-    //    ("which exactly?" / "elaborate on that headline") happens in THAT
-    //    channel, so the TARGET channel's session needs the delivered text
-    //    in its history — not the scheduling session.
+    //    (mirrors amazon_manager's `_inject_into_session`).
     //
-    //    Priority:
-    //      (a) target chat channel's session file (resolved via channelSessions;
-    //          lazily created on disk so the entry lands even if the bot hasn't
-    //          received an inbound from that channel yet).
-    //      (b) origin_session_file — the fallback path for CLI/TUI-scheduled
-    //          jobs with NO explicit deliver_to (follow-ups happen in the same
-    //          TUI where scheduling happened).
-    //
-    //    When origin == target (scheduled from the same channel delivery goes
-    //    to), both paths resolve to the same file → single append.
-    const historyFile = deriveTargetSessionFile(target) ?? target?.sessionFile ?? meta.origin_session_file;
-    if (historyFile && fs.existsSync(historyFile)) {
-        appendSchedulerDeliveryEntry(historyFile, meta, responseText, target);
+    //    CRITICAL PATH SELECTION:
+    //      (a) target is a real chat channel (telegram/slack/a2a/…) →
+    //          route through ChannelRuntime.appendCustomMessageToChannel.
+    //          That method uses the CACHED SessionManager when the channel
+    //          has an active AgentSession (so the in-memory state sees the
+    //          entry and the next prompt's getBranch() picks it up). Falls
+    //          through to disk when no cached session exists; the next
+    //          lazy-create reads the JSONL and picks it up. Writing a
+    //          fresh SessionManager directly to the same JSONL file does
+    //          NOT work when the channel has a cached session — Pi doesn't
+    //          re-read JSONL between turns.
+    //      (b) target is cli / scheduler / undefined →
+    //          fall back to origin_session_file via direct disk write. The
+    //          TUI is owned by Pi's InteractiveMode (not ChannelRuntime)
+    //          and has its own live SessionManager we can't reach into;
+    //          disk write is best-effort (next-turn context may or may not
+    //          see it — historical TUI-rendering caveat unchanged).
+    const entryMetadata = {
+        job_id: meta.job_id,
+        job_type: meta.job_type,
+        fired_at: Date.now(),
+        target: target ?? null,
+    };
+    if (target && target.platform !== "cli" && target.platform !== "scheduler") {
+        // Target is a real chat channel — use ChannelRuntime so the cached
+        // AgentSession's in-memory state gets the entry. Follow-ups in THAT
+        // channel will see the delivered reminder/digest in context.
+        const result = getChannelRuntime().appendCustomMessageToChannel(
+            target.platform,
+            target.channelId,
+            "scheduler-delivery",
+            responseText,
+            true,
+            entryMetadata,
+        );
+        if (!result.appended) {
+            logError("scheduler", `failed to append scheduler-delivery to ${target.platform}:${target.channelId}`, {
+                job_id: meta.job_id,
+                reason: result.reason,
+            });
+        }
+        return;
     }
-}
-
-/**
- * Resolve the session file for a chat-platform delivery target. Returns null
- * for CLI / the synthetic "scheduler" platform / unknown shapes — those don't
- * have per-channel sessions to append to. Creates the channelSessions binding
- * (and the .jsonl on disk) if it doesn't exist yet — necessary for the
- * cross-channel case where the bot hasn't yet received an inbound from that
- * channel but is about to deliver there.
- */
-function deriveTargetSessionFile(target: DeliverTarget | undefined): string | null {
-    if (!target) return null;
-    if (target.platform === "cli" || target.platform === "scheduler") return null;
-    try {
-        return getChannelSessions().getOrCreateSessionFile(target.platform, target.channelId);
-    } catch (e) {
-        logWarning("scheduler", `cannot resolve target session file for ${target.platform}:${target.channelId}`, {
-            err: e instanceof Error ? e.message : String(e),
-        });
-        return null;
+    // Fallback path: CLI/TUI-scheduled with no chat target. Best-effort disk
+    // write to the scheduling session's JSONL.
+    const originFile = target?.sessionFile ?? meta.origin_session_file;
+    if (originFile && fs.existsSync(originFile)) {
+        appendSchedulerDeliveryEntry(originFile, meta, responseText, target);
     }
 }
 

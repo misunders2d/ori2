@@ -450,6 +450,57 @@ export class ChannelRuntime {
         return { queued: true };
     }
 
+    /**
+     * Append a custom message entry to a channel's session — routed through
+     * the CACHED SessionManager when the channel has an active AgentSession,
+     * so the in-memory session state sees the entry and the next prompt's
+     * getBranch() picks it up. Falls back to opening a fresh SessionManager
+     * on the channel's session file when no cached session exists (the next
+     * lazy-create will read the JSONL from disk and see the entry).
+     *
+     * Load-bearing for scheduler cross-channel delivery: Pi's SessionManager
+     * does NOT re-read the JSONL between turns. If you write to the file via
+     * a second SessionManager instance while the first is alive, the first
+     * never sees it. This method is the only safe way for an outside caller
+     * (scheduler fire → Telegram/Slack target) to inject context the target
+     * channel's next LLM turn will actually see.
+     *
+     * Never throws — returns `{ appended: false, via, reason }` on failure.
+     */
+    appendCustomMessageToChannel(
+        platform: string,
+        channelId: string,
+        customType: string,
+        content: string,
+        display: boolean,
+        metadata: Record<string, unknown>,
+    ): { appended: boolean; via: "cached-session" | "disk-only" | "failed"; reason?: string } {
+        const key = channelKey(platform, channelId);
+        const existing = this.channels.get(key);
+        if (existing) {
+            try {
+                existing.sessionManager.appendCustomMessageEntry(customType, content, display, metadata);
+                existing.lastActivity = Date.now();
+                return { appended: true, via: "cached-session" };
+            } catch (e) {
+                logError("channelRuntime", "cached-session append failed — falling through to disk", {
+                    platform, channelId, customType,
+                    err: e instanceof Error ? e.message : String(e),
+                });
+            }
+        }
+        try {
+            const sessionFile = getChannelSessions().getOrCreateSessionFile(platform, channelId);
+            const sm = SessionManager.open(sessionFile);
+            sm.appendCustomMessageEntry(customType, content, display, metadata);
+            return { appended: true, via: "disk-only" };
+        } catch (e) {
+            const reason = e instanceof Error ? e.message : String(e);
+            logError("channelRuntime", "disk append failed", { platform, channelId, customType, err: reason });
+            return { appended: false, via: "failed", reason };
+        }
+    }
+
     /** Test-only — clear in-memory state. Caller must call stop() first. */
     reset(): void {
         this.channels.clear();
