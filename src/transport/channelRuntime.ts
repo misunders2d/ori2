@@ -1,7 +1,6 @@
 import {
     SessionManager,
     createAgentSessionFromServices,
-    createAgentSessionServices,
     type AgentSession,
     type AgentSessionServices,
 } from "@mariozechner/pi-coding-agent";
@@ -16,6 +15,7 @@ import { logError, logInfo, logWarning } from "../core/errorLog.js";
 import { getOrCreate } from "../core/singletons.js";
 import { writePendingHandoff } from "../core/handoffPending.js";
 import { drainPending } from "../core/pendingAttachments.js";
+import { getSharedAgentServices, extractAssistantText } from "../core/agentServices.js";
 import type { MediaPayload, Message } from "./types.js";
 
 // =============================================================================
@@ -99,7 +99,9 @@ export class ChannelRuntime {
      */
     async start(): Promise<void> {
         if (this.servicesPromise) return;
-        this.servicesPromise = createAgentSessionServices({ cwd: process.cwd() });
+        // Shared process-wide services — scheduler fires + per-channel
+        // inbound both use the same instance. Created once, lazy.
+        this.servicesPromise = getSharedAgentServices();
         this.services = await this.servicesPromise;
         this.sweepTimer = setInterval(() => this.sweep(), SWEEP_INTERVAL_MS);
         this.sweepTimer.unref();
@@ -725,32 +727,6 @@ export async function buildKickoffContent(msg: Message): Promise<{ text: string;
         }
     }
     return { text: lines.join("\n"), images };
-}
-
-/** Pull the assistant's textual reply out of the agent_end event's messages.
- *  Pi's AgentMessage shape has `content: Array<{type: "text", text: string} | …>`
- *  — concat all text content blocks across the assistant messages. */
-function extractAssistantText(messages: ReadonlyArray<unknown>): string {
-    const parts: string[] = [];
-    for (const m of messages) {
-        if (!m || typeof m !== "object") continue;
-        const msg = m as { role?: string; content?: unknown };
-        if (msg.role !== "assistant") continue;
-        const content = msg.content;
-        if (typeof content === "string") {
-            parts.push(content);
-            continue;
-        }
-        if (!Array.isArray(content)) continue;
-        for (const c of content) {
-            if (!c || typeof c !== "object") continue;
-            const block = c as { type?: string; text?: string };
-            if (block.type === "text" && typeof block.text === "string") {
-                parts.push(block.text);
-            }
-        }
-    }
-    return parts.join("\n").trim();
 }
 
 /**

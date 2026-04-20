@@ -124,37 +124,37 @@ describe("arch invariant: no English-only intent regex", () => {
     });
 });
 
-describe("arch invariant: every pi -p spawn passes ORI2_SCHEDULER_SUBPROCESS=1", () => {
-    // Rule 5 (AGENTS.md). Otherwise the child's scheduler extension
-    // rehydrates the parent's jobs dir and can double-fire.
-    it("every spawn of pi (as npx pi or similar) sets the subprocess flag in env", () => {
+describe("arch invariant: no pi -p subprocess anywhere in source", () => {
+    // Both inbound (f69bb81) and scheduler fires (subsequent rewrite) run
+    // in-process via createAgentSessionFromServices now. Any new pi -p
+    // child-process would re-introduce the event-loop-alive hang class
+    // (extensions with persistent timers keep the child alive past the
+    // agent reply → proc.on(close) never fires → delivery never runs).
+    // Fail CI on reintroduction.
+    it("no source file starts pi -p as a child process", () => {
         const violations: string[] = [];
+        const re = /\bspawn\s*\(\s*["']([^"']+)["']\s*,\s*\[([^\]]*)\]/g;
         for (const file of SOURCE_FILES()) {
             const content = fs.readFileSync(file, "utf-8");
-            const spawnRegex = /\bspawn\s*\(\s*["']([^"']+)["']\s*,\s*\[([^\]]*)\]/g;
             let m: RegExpExecArray | null;
-            while ((m = spawnRegex.exec(content)) !== null) {
+            while ((m = re.exec(content)) !== null) {
                 const cmd = m[1]!;
                 const args = m[2]!;
                 const invokesPi =
                     cmd === "pi" ||
                     (cmd === "npx" && /["']pi["']/.test(args));
                 if (!invokesPi) continue;
-
-                // Look for ORI2_SCHEDULER_SUBPROCESS in the next ~1200 chars
-                // (the spawn options object usually closes within that).
-                const after = content.slice(m.index, m.index + 1200);
-                if (!/ORI2_SCHEDULER_SUBPROCESS/.test(after)) {
-                    violations.push(
-                        `${path.relative(REPO_ROOT, file)}: spawn("${cmd}", [${args.slice(0, 80)}...]) — missing ORI2_SCHEDULER_SUBPROCESS=1 in env`,
-                    );
-                }
+                // Only -p / print-mode is the hazard; `pi --version` etc. are fine.
+                if (!/["']-p["']/.test(args)) continue;
+                violations.push(
+                    `${path.relative(REPO_ROOT, file)}: spawn of pi -p is forbidden; use createAgentSessionFromServices in-process`,
+                );
             }
         }
         assert.deepEqual(
             violations,
             [],
-            `pi subprocess spawn missing ORI2_SCHEDULER_SUBPROCESS flag. Violations:\n${violations.map((v) => `  ${v}`).join("\n")}`,
+            `pi -p child reintroduced. Violations:\n${violations.map((v) => `  ${v}`).join("\n")}`,
         );
     });
 });

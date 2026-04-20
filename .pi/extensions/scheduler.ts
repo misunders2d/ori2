@@ -1,8 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { SessionManager } from "@mariozechner/pi-coding-agent";
+import { SessionManager, createAgentSessionFromServices } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import schedule from "node-schedule";
-import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { botSubdir, ensureDir } from "../../src/core/paths.js";
@@ -10,21 +9,26 @@ import { currentOrigin } from "../../src/core/identity.js";
 import { getWhitelist } from "../../src/core/whitelist.js";
 import { getKVCache } from "../../src/core/kvCache.js";
 import { getDispatcher } from "../../src/transport/dispatcher.js";
+import { getSharedAgentServices, extractAssistantText } from "../../src/core/agentServices.js";
 import { seedPlan, recordPlanThread, type OriginChannel } from "./plan_enforcer.js";
 import { logError, logWarning } from "../../src/core/errorLog.js";
 
 // =============================================================================
-// scheduler — per-fire fresh-session model.
+// scheduler — per-fire fresh-session model, IN-PROCESS.
 //
-// REWRITE NOTES (vs Sprint 4-era version):
-//   - OLD: cron callback called ctx.sendUserMessage(...), injecting the task
-//     into whichever Pi session was active at registration time. Captured ctx
-//     went stale after /new or restart.
-//   - NEW: cron callback creates a FRESH SessionManager + optionally calls
-//     seedPlan() (for jobs with explicit step lists) + spawns a subprocess
-//     (scripts/scheduled-run.ts) to run the agent against that session.
-//     The parent process keeps polling Telegram (inbound undisturbed) while
-//     the subprocess runs the scheduled task.
+// HISTORY:
+//   - Sprint 4: cron callback captured ctx.sendUserMessage on registration.
+//     Went stale after /new or restart.
+//   - Sprint 7: per-fire FRESH SessionManager + seedPlan + spawn `npx pi -p`
+//     subprocess. Fixed the stale-ctx bug but introduced a hang: extensions
+//     with persistent timers kept the subprocess's event loop alive past
+//     the agent's reply, so `proc.on("close")` never fired and deliverAndAppend
+//     never ran. Same class f69bb81 fixed for the inbound path.
+//   - THIS REWRITE: cron callback creates a FRESH SessionManager + seedPlan
+//     + in-process AgentSession via createAgentSessionFromServices against
+//     shared services. Subscribe to agent_end to capture the reply; deliver
+//     via dispatcher.send. No subprocess, no stdout capture, no watchdog,
+//     no hang window.
 //
 // Job persistence: data/<bot>/jobs/<job_id>.json. Format:
 //   {
@@ -192,48 +196,26 @@ function makeRunsDir(): string {
     return dir;
 }
 
-// ----- Live session manager for fire-time history-append -----
+// ----- History-append after delivery -----
 //
-// Captured on every session_start. fireJob uses it to
-// sm.appendCustomMessageEntry(...) on the scheduling session so the
-// delivered reminder/task-result ends up in conversation history. That's
-// what makes future references like "thanks, just watched it" resolve:
-// the reminder event is in the session transcript.
+// For reminders/tasks scheduled FROM the TUI or a chat channel, we persist
+// the delivery as a `scheduler-delivery` CustomMessageEntry on the scheduling
+// session's JSONL file. That MAKES IT AVAILABLE IN CONTEXT on the next LLM
+// turn — "thanks, just watched it" resolves because the reminder event is in
+// the session transcript.
 //
-// The reference CAN go stale across /new — tracked by updating on every
-// session_start. Rehydration of persisted jobs uses the session file path
-// stored in meta.origin_session_file (captured at schedule time) rather
-// than this reference, so rehydrated jobs still target the correct session
-// even if the TUI is on a different session when they fire.
-// TUI-delivery design note:
-//   For reminders scheduled FROM the TUI, we persist the delivery as a
-//   `scheduler-delivery` CustomMessageEntry on the session file. This
-//   MAKES IT AVAILABLE IN CONTEXT on the next LLM turn — if the user
-//   sends another message after the reminder fires, the agent sees the
-//   event in its session history and can reference it ("you asked about
-//   that movie earlier; I watched it").
+// It does NOT appear as a live-rendered bubble in the TUI at fire time —
+// Pi's InteractiveMode binds its render pipeline to the AgentSession event
+// stream, and a cron-fired append from an extension callback doesn't flow
+// through AgentSession. Tradeoff explicitly accepted: TUI operators see
+// reminders next turn, not real-time; chat platforms see them live via
+// dispatcher.send → adapter.send.
 //
-//   It does NOT, however, appear as a live-rendered bubble in the TUI
-//   at fire time. Pi's InteractiveMode binds its render pipeline to the
-//   AgentSession event stream; a cron-fired write from an extension
-//   callback doesn't flow through AgentSession, so the live TUI misses
-//   it. We experimented with pi.sendMessage (routes through AgentSession)
-//   but it brought significant complexity for a marginal path — TUI is
-//   for local operator tinkering; the real reminder target is chat
-//   platforms (Telegram, Slack) where dispatcher.send reaches adapter.send
-//   reaches the user as a real message.
-//
-//   Tradeoff explicitly accepted: TUI operators see reminders next turn,
-//   not real-time. Chat platforms see them live. If TUI real-time
-//   becomes critical later, the path is pi.sendMessage + potentially a
-//   registerMessageRenderer for styling.
-
-// Narrow structural type — we only need getSessionFile() from the live
-// handle for the fallback path.
-interface LiveSessionHandle {
-    getSessionFile(): string | undefined;
-}
-let liveSessionManager: LiveSessionHandle | null = null;
+// Lookup precedence in deliverAndAppend: target.sessionFile > origin_session_file.
+// Both are captured at schedule time (ctx.sessionManager.getSessionFile()),
+// so we no longer need a live-session fallback — that was leftover from
+// the subprocess model where cron fires ran in a child process and couldn't
+// see the parent's live sm.
 
 // ----- Kickoff prompts differ by job type -----
 //
@@ -311,16 +293,12 @@ async function deliverAndAppend(meta: JobMeta, responseText: string): Promise<vo
     }
 
     // 2) Append to the session JSONL so next-turn LLM context has the
-    //    event. Priority: explicit target.sessionFile > origin_session_file
-    //    > liveSessionManager.getSessionFile(). Opens a fresh
-    //    SessionManager on the file — persistence is reliable; live-TUI
-    //    rendering is best-effort (see module header note). The real
-    //    user-visible delivery for chat platforms already happened in
+    //    event. Priority: explicit target.sessionFile > origin_session_file.
+    //    Opens a fresh SessionManager on the file — persistence is reliable;
+    //    live-TUI rendering is best-effort (see module header note). The
+    //    real user-visible delivery for chat platforms already happened in
     //    step (1) via dispatcher.send → adapter.send.
-    const resolvedFile =
-        target?.sessionFile ??
-        meta.origin_session_file ??
-        liveSessionManager?.getSessionFile();
+    const resolvedFile = target?.sessionFile ?? meta.origin_session_file;
     if (!resolvedFile || !fs.existsSync(resolvedFile)) return;
 
     try {
@@ -483,85 +461,87 @@ async function fireJob(meta: JobMeta, manualTrigger = false): Promise<void> {
     // message to the user; tasks tell it to EXECUTE the instruction.
     const kickoff = buildKickoff(meta);
 
-    // Spawn Pi's native print-mode runner (pi -p <kickoff> --session <file>).
-    // Pi auto-discovers .pi/extensions/, resolves auth via
-    // PI_CODING_AGENT_DIR/auth.json (seeded by index.ts), and exits after
-    // the prompt settles.
-    //
-    // We CAPTURE stdout instead of streaming it to the parent console — the
-    // agent's response becomes the delivery text. stderr still streams (Pi
-    // warnings go there), but we suppress "Done, I drank the coffee" style
-    // noise from appearing in the TUI.
-    const proc = spawn(
-        "npx",
-        ["pi", "-p", kickoff, "--session", sessionFile],
-        {
-            cwd: process.cwd(),
-            // ORI2_SCHEDULER_SUBPROCESS=1 tells the child's scheduler
-            // extension to skip rehydration (parent owns the jobs dir).
-            env: { ...process.env, ORI2_SCHEDULER_SUBPROCESS: "1" },
-            stdio: ["ignore", "pipe", "pipe"],
-            detached: false,
-        },
-    );
-    let capturedStdout = "";
-    proc.stdout.on("data", (d: Buffer) => { capturedStdout += d.toString(); });
-    proc.stderr.on("data", (d: Buffer) => {
-        for (const line of d.toString().split("\n")) {
-            if (line.trim()) console.error(`[scheduler:${meta.job_id}:stderr] ${line}`);
+    // In-process AgentSession against the fresh session file. Shared services
+    // (one instance per process, shared with channelRuntime) keep extension
+    // parse cost amortized. prompt() awaits the turn — when it resolves the
+    // agent_end subscription has captured the reply. No subprocess, no stdout
+    // capture, no watchdog. Matches the f69bb81 inbound pattern.
+    let capturedReply = "";
+    let session;
+    try {
+        const services = await getSharedAgentServices();
+        const result = await createAgentSessionFromServices({
+            services,
+            sessionManager: sm,
+        });
+        session = result.session;
+    } catch (e) {
+        logError("scheduler", `${meta.job_id} failed to create in-process agent session`, {
+            err: e instanceof Error ? e.message : String(e),
+            job_id: meta.job_id,
+            trigger,
+        });
+        return;
+    }
+    const unsubscribe = session.subscribe((event) => {
+        if (event.type === "agent_end") {
+            capturedReply = extractAssistantText(event.messages);
         }
     });
-    proc.on("close", (code) => {
-        console.log(`[scheduler] [${trigger}] ${meta.job_id} subprocess exit code=${code} session=${sessionFile}`);
-        if (code !== 0) {
-            logWarning("scheduler", `${meta.job_id} subprocess non-zero exit`, { code, job_id: meta.job_id });
-            return;
-        }
+    try {
+        await Promise.race([
+            session.prompt(kickoff),
+            new Promise<never>((_, reject) => {
+                const t = setTimeout(
+                    () => reject(new Error(`turn exceeded ${MAX_FIRE_TURN_MS}ms — aborting`)),
+                    MAX_FIRE_TURN_MS,
+                );
+                t.unref();
+            }),
+        ]);
+    } catch (e) {
+        logError("scheduler", `${meta.job_id} agent turn failed (${trigger})`, {
+            err: e instanceof Error ? e.message : String(e),
+            job_id: meta.job_id,
+            trigger,
+        });
+        try { await session.abort(); } catch { /* best effort on timeout */ }
+        // Fall through — still attempt delivery if a partial reply landed
+        // before the failure.
+    } finally {
+        try { unsubscribe(); } catch { /* best effort */ }
+    }
+    console.log(`[scheduler] [${trigger}] ${meta.job_id} turn complete session=${sessionFile} reply_chars=${capturedReply.length}`);
 
-        // Polls use a different delivery model: mark_poll_done writes to
-        // kvCache from inside the subprocess. The subprocess's stdout is
-        // NOT delivered to the user — it's just status chatter ("still
-        // pending..."). Delivery happens only when the done-flag is set,
-        // either by THIS subprocess's mark_poll_done call or by a prior
-        // fire that's caught up asynchronously. Check immediately after
-        // exit so the user gets their result without waiting for the next
-        // cron tick.
-        if (meta.job_type === "poll") {
-            const signal = readPollDone(meta.job_id);
-            if (signal) {
-                void finalizePoll(meta, signal.result, "done");
-            }
-            // If no done-flag: silent. The subprocess told the user's future
-            // self "still pending" via its stdout (which we ignore). Next
-            // cron fire will try again.
-            return;
+    // Polls use a different delivery model: mark_poll_done writes to kvCache
+    // from inside the fire turn. The agent's assistant text is NOT delivered
+    // to the user — it's just status chatter ("still pending..."). Delivery
+    // happens only when the done-flag is set, either by THIS fire's
+    // mark_poll_done call or by a prior fire that's caught up asynchronously.
+    // Check immediately after the turn so the user gets their result without
+    // waiting for the next cron tick.
+    if (meta.job_type === "poll") {
+        const signal = readPollDone(meta.job_id);
+        if (signal) {
+            void finalizePoll(meta, signal.result, "done");
         }
+        // If no done-flag: silent. The fire turn told the user's future self
+        // "still pending" via its assistant text (which we ignore). Next cron
+        // fire will try again.
+        return;
+    }
 
-        const text = extractAgentResponse(capturedStdout);
-        if (!text) {
-            logWarning("scheduler", `${meta.job_id} produced no agent response`, { job_id: meta.job_id });
-            return;
-        }
-        void deliverAndAppend(meta, text);
-    });
-    proc.on("error", (e) => {
-        logError("scheduler", `${meta.job_id} subprocess error (${trigger})`, { err: e.message, job_id: meta.job_id, trigger });
-    });
+    if (!capturedReply) {
+        logWarning("scheduler", `${meta.job_id} produced no agent response`, { job_id: meta.job_id });
+        return;
+    }
+    void deliverAndAppend(meta, capturedReply);
 }
 
-/**
- * Extract the agent's textual response from captured `pi -p` stdout.
- *
- * Pi's print-mode format (docs/rpc.md §Print Mode): plain text of the final
- * agent message, one blank line before. Startup banners / warnings go to
- * stderr (which we ignore for delivery). A simple extraction: trim and
- * strip the trailing newline.
- *
- * If Pi gains a structured print mode in the future, tighten this.
- */
-function extractAgentResponse(stdout: string): string {
-    return stdout.trim();
-}
+// Safety net on a runaway turn. 5 min matches channelRuntime's MAX_TURN_TIMEOUT_MS.
+// Real fires settle in <30s for reminders, <60s for task executions. If this
+// fires, something is genuinely stuck — session.abort() releases the turn.
+const MAX_FIRE_TURN_MS = 300_000;
 
 function scheduleJob(meta: JobMeta): schedule.Job | null {
     const job = schedule.scheduleJob(meta.cron, () => { void fireJob(meta); });
@@ -581,25 +561,12 @@ function isAdminCaller(ctx: ExtensionContext): boolean {
 // =============================================================================
 
 export default function (pi: ExtensionAPI) {
-    // On load: rehydrate persisted jobs + capture the live SessionManager
-    // for fire-time history-append. liveSessionManager is updated on every
-    // session_start so a new TUI session (after /new) still gets reminders
-    // appended — even if the ORIGINAL session file (saved in meta) no
-    // longer exists, the fallback path uses the current live session.
-    pi.on("session_start", async (_event, ctx) => {
-        liveSessionManager = ctx.sessionManager;
-
-        // Subprocess guard: every `pi -p` child auto-loads .pi/extensions/
-        // including this scheduler, and without this check the subprocess
-        // would rehydrate the parent's jobs dir into its OWN node-schedule
-        // instance — wasted work + small risk of double-firing if the
-        // subprocess lives past a cron tick. Our scheduler.fireJob and
-        // channelRouter.realSpawnPiPrint both set ORI2_SCHEDULER_SUBPROCESS=1
-        // when spawning children so this branch fires.
-        if (process.env["ORI2_SCHEDULER_SUBPROCESS"] === "1") {
-            return;
-        }
-
+    // On session_start: rehydrate persisted jobs. Skipped on any fresh
+    // scheduled-run session (activeJobs already populated by the parent's
+    // first-ever session_start). The old ORI2_SCHEDULER_SUBPROCESS env guard
+    // is gone — fires are now in-process, and `activeJobs.size > 0` is the
+    // single correct condition to prevent double-registration.
+    pi.on("session_start", async () => {
         if (activeJobs.size > 0) return; // already loaded — don't double-register
         const all = loadAllJobMeta();
         for (const meta of all) {

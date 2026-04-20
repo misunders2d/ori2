@@ -34,7 +34,6 @@ describe("healthServer", () => {
         clearRegistryForTests();
         delete process.env["ORI2_HEALTH_PORT"];
         delete process.env["ORI2_HEALTH_BIND"];
-        delete process.env["ORI2_SCHEDULER_SUBPROCESS"];
     });
     afterEach(async () => {
         if (server) {
@@ -52,13 +51,6 @@ describe("healthServer", () => {
         process.env["ORI2_HEALTH_PORT"] = "not-a-port";
         const handle = await maybeStartHealthServer();
         assert.equal(handle, undefined);
-    });
-
-    it("no-ops when running in subprocess mode (ORI2_SCHEDULER_SUBPROCESS=1) — avoids port conflict", async () => {
-        process.env["ORI2_HEALTH_PORT"] = "0"; // invalid anyway but belt+braces
-        process.env["ORI2_SCHEDULER_SUBPROCESS"] = "1";
-        const handle = await maybeStartHealthServer();
-        assert.equal(handle, undefined, "subprocess must not bind the health port");
     });
 
     it("binds + serves /live (always 200, just proves process is alive)", async () => {

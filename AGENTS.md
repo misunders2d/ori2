@@ -110,9 +110,12 @@ These are pinned by `src/security/pipeline.test.ts` and
    Pi's jiti + tsx load extensions in separate module graphs (Phase 6
    of the alignment plan documents this). Silently wrong; hard to debug.
 
-5. **Every subprocess spawn of `pi -p` MUST pass
-   `ORI2_SCHEDULER_SUBPROCESS=1` in env.** Without it, the child's
-   scheduler extension rehydrates the parent's jobs dir and can double-fire.
+5. **Never start `pi -p` as a child process.** Both inbound (f69bb81) and
+   scheduler fires run in-process via `createAgentSessionFromServices` against
+   `getSharedAgentServices()`. Child-process `pi -p` re-introduces the
+   event-loop-alive hang class (extensions with persistent timers kept the
+   child alive past the agent reply → delivery never ran). Enforced by
+   `src/arch/invariants.test.ts`.
 
 6. **Pinned tests MUST NOT be skipped.** `src/security/pipeline.test.ts`
    and `src/arch/invariants.test.ts` are the contract. No `.skip`, no

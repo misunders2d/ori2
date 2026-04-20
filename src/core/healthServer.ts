@@ -76,12 +76,11 @@ export async function maybeStartHealthServer(): Promise<HealthServerHandle | und
     const port = resolvePort();
     if (port === undefined) return undefined;
 
-    // Subprocesses (channelRouter's pi -p, scheduler's fireJob) inherit the
-    // parent's env including ORI2_HEALTH_PORT. They MUST NOT try to bind
-    // the same port — bind would EADDRINUSE. Detect and skip.
-    if (process.env["ORI2_SCHEDULER_SUBPROCESS"] === "1") {
-        return undefined;
-    }
+    // NOTE: the ORI2_SCHEDULER_SUBPROCESS guard that lived here was necessary
+    // back when channelRouter and scheduler spawned `pi -p` children —
+    // subprocesses inherited ORI2_HEALTH_PORT and would EADDRINUSE. Both
+    // subprocess paths are gone (f69bb81 for inbound, later rewrite for
+    // scheduler fires). One process, one health server, no guard needed.
 
     const bindAddress = resolveBind();
     const app = express();

@@ -12,9 +12,9 @@ import { getKVCache, __resetKVCacheForTests } from "./core/kvCache.js";
 /**
  * Cancel every node-schedule job registered during this test process.
  * schedule_poll uses real cron scheduling — without teardown, a `*\/30 * * * * *`
- * poll fires ~30s after registration (inside the test process), spawning
- * `pi -p` subprocesses and keeping the event loop alive forever. Pi's own
- * test runner would give up and kill us.
+ * poll fires ~30s after registration (inside the test process), creating
+ * in-process AgentSessions and keeping the event loop alive forever. Pi's
+ * own test runner would give up and kill us.
  */
 function cancelAllScheduledJobs(): void {
     for (const name of Object.keys(schedule.scheduledJobs)) {
@@ -25,14 +25,16 @@ function cancelAllScheduledJobs(): void {
 // =============================================================================
 // schedule_poll + mark_poll_done tests.
 //
-// The signalling path between subprocess and parent goes through kvCache,
-// specifically namespace "poll-control". Subprocess's mark_poll_done writes
-// a done-signal; parent's fireJob reads it before spawning (short-circuit
-// to finalize) and after spawn exit (immediate finalize without next tick).
+// The signalling path between the fire's in-process AgentSession and the
+// outer scheduler goes through kvCache, namespace "poll-control". The fire
+// turn's mark_poll_done writes a done-signal; fireJob reads it before
+// creating the next AgentSession (short-circuit to finalize) and after the
+// turn completes (immediate finalize without next tick).
 //
 // We test the CONTROL-CHANNEL semantics directly — calling the exported
 // tool handlers with a fake ExtensionContext and verifying kvCache state.
-// Full fire loop is out of scope (spawns real pi -p, requires credentials).
+// Full fire loop is out of scope (creates a real AgentSession, requires
+// credentials).
 // =============================================================================
 
 function cleanTestDir(): void {
