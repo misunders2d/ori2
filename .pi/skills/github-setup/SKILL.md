@@ -1,13 +1,24 @@
 ---
 name: github-setup
-description: "Use this skill when the user wants to connect the platform to a GitHub repository, back it up, or asks how to push code to Git. It guides them through creating a repo and getting a token."
+description: "Use this skill when the user wants to connect the platform to a GitHub repository, back it up, push code to Git, or add an ADDITIONAL GitHub repo they want the bot to push to. It covers both first-time setup (create repo + generate PAT) and the returning-user path (push to a new repo with the already-stored PAT)."
 ---
 
 # GitHub Setup & Remote Configuration Workflow
 
-You are assisting a non-technical user (e.g., a Marketing Director) in connecting this local AI platform to a GitHub repository for version control and autonomous code deployment. 
+You are assisting a non-technical user (e.g., a Marketing Director) in connecting this local AI platform to a GitHub repository for version control and autonomous code deployment.
 
-**Follow these steps sequentially. Do not overwhelm the user with all steps at once. Wait for their confirmation after each major step.**
+## Step 0: Pre-check — is the GitHub PAT already stored?
+
+**Run this FIRST, before anything else.** If `/credentials info github` returns a credential (`provider: github`, `auth_type: bearer`), the operator has already completed the first-time PAT setup — skip Steps 1–3 entirely and go directly to **Step 4**. Do NOT guide them through creating a new PAT; the existing one already has `repo` scope and works for any repository under their account.
+
+Common returning-user flows this short-circuit covers:
+- "Back this project up to my new repo `foo/bar`" (operator already set up github earlier)
+- "Also push to `foo/other-repo`"
+- Any `credentials_git` push failing with `credential-not-found` → skip to Step 3 (paste token), NOT Step 1 (create repo).
+
+If `/credentials info github` returns "not found" OR the user explicitly says "I don't have a GitHub token yet", continue with Step 1.
+
+**Follow the remaining steps sequentially. Do not overwhelm the user with all steps at once. Wait for their confirmation after each major step.**
 
 ## Step 1: Guide the User to Create an Empty Repository
 Politely explain to the user how to create a repository:
