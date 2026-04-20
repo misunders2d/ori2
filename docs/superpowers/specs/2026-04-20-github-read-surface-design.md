@@ -51,7 +51,8 @@ export class GithubRateLimitError extends Error {
 }
 
 // Reads the PAT auth header from credentials by fixed key "github".
-// Returns null if no credential is configured (→ unauthenticated mode).
+// Returns null if no credential is configured — the extension treats this
+// as a "guide the operator to set up a PAT" case, not as a degraded mode.
 // Uses getCredentials().getAuthHeader() so auth_type wrapping + secretAccessLog
 // both come for free.
 export function getGithubAuthHeader(): Record<string, string> | null;
@@ -99,7 +100,7 @@ export async function githubReadIssueWithComments(
 
 **Auth mode:**
 - If the `github` credential exists, requests include the header returned by `getCredentials().getAuthHeader("github")` — which for `auth_type: "bearer"` (default) produces `Authorization: Bearer <pat>`. The helper already records the read to `secretAccessLog`, giving us an audit trail for free.
-- If no `github` credential is configured, requests omit the Authorization header. GitHub enforces 60 req/hr unauthenticated — tools still work on public data but with tight limits. Extension surfaces a one-line hint in this degraded mode: `"(unauthenticated — 60/hr limit. Set a PAT via /credentials add github for 5000/hr.)"` appended to successful results.
+- If no `github` credential is configured, every tool returns a guidance result **without firing any HTTP request**. See "No-PAT guidance" below. No degraded unauthenticated fallback; no partial work.
 - Search endpoints (`/search/code`, `/search/repositories`, `/search/issues`) additionally send `Accept: application/vnd.github.text-match+json` (instead of the default `application/vnd.github+json`) so responses include the `text_matches[]` field used to render 3 lines of surrounding context per code-search hit. Non-search endpoints keep the default Accept.
 
 ### `.pi/extensions/github.ts`
@@ -268,13 +269,9 @@ Every tool output passes through the existing `checkTextForInjection` from `guar
 
 ## Rate-limit behavior
 
-**Per endpoint (authenticated):**
+**Authenticated (only mode supported):**
 - REST (all non-search endpoints): 5000 req/hr
 - Search (`/search/*`): 30 req/min (secondary rate limit)
-
-**Per endpoint (unauthenticated):**
-- REST: 60 req/hr
-- Search: 10 req/min
 
 **Handling:**
 - `githubClient` inspects `X-RateLimit-Remaining` + `X-RateLimit-Reset` on every 403 response.
@@ -284,6 +281,25 @@ Every tool output passes through the existing `checkTextForInjection` from `guar
   GitHub rate limit exhausted. Resets at 2026-04-20T14:23Z (in ~7 min). Try again after.
   ```
 - No automatic retries. LLM decides whether to pause further GitHub calls, try a narrower query, or fall back to `web_search` for the current lookup.
+
+## No-PAT guidance
+
+Before any HTTP fetch, each tool's `execute()` calls `getGithubAuthHeader()`. If it returns `null` (no `github` credential in the store), the tool short-circuits and returns:
+
+```
+GitHub access isn't set up yet. Here's how to enable it:
+
+1. Go to https://github.com/settings/tokens and click "Generate new token (classic)".
+2. Name it "Ori Agent" and check the box for "public_repo" (read access to public repos).
+   — If you want me to read your own private repos too, also check "repo".
+   — Optional: "read:org" lets me see org membership if that matters to your searches.
+3. Click Generate, copy the token (starts with "ghp_").
+4. Paste it into chat: /credentials add github <paste token here>
+
+Once that's done, call me again and I'll run the <tool_name> you just asked for.
+```
+
+`<tool_name>` is substituted per tool so Ori can re-invoke correctly. Result shape: `{ content: [{ type: "text", text: <guidance> }], details: { needs_setup: true, credential_id: "github" } }`. No `isError`. No HTTP call fired. The `github-setup` skill gets re-used for the longer walkthrough if the operator needs more hand-holding; the inline guidance above is the short-form nudge the LLM surfaces on first attempt.
 
 ## Auth helper integration
 
@@ -326,7 +342,7 @@ No runtime rerouting. The LLM picks via tool descriptions.
 
 ## Testing
 
-Unit + extension tests, zero live network. Target: ~20-25 new tests, all green, strict-tsc clean.
+Unit + extension tests, zero live network. Target: ~25-30 new tests, all green, strict-tsc clean.
 
 ### `src/core/githubClient.test.ts` (~15 cases)
 
@@ -340,7 +356,7 @@ Unit + extension tests, zero live network. Target: ~20-25 new tests, all green, 
 - 200 file with `encoding: "none"` → follows `download_url` for the raw bytes
 - Binary detection: decoded content with a null byte → flagged binary
 - Auth header: PAT present → `Authorization: Bearer ghp_...` sent
-- Auth header: no PAT → Authorization omitted (still 200 on public endpoints)
+- `getGithubAuthHeader()` returns null when `credentials.has("github")` is false; returns the bearer header when true
 - Headers: UA + `Accept: application/vnd.github+json` + `X-GitHub-Api-Version: 2022-11-28` on every request
 - `githubSearch` helper general case: mocked to simulate 3 pages × 30 results, caller passes `limit: 80` → returns 80 items across 3 fetches (exercises paging path even though the 5 tools' per-call cap of 30 never triggers it in production)
 - `githubSearch` with `total_count > limit` → `truncated: true`
@@ -350,6 +366,7 @@ Unit + extension tests, zero live network. Target: ~20-25 new tests, all green, 
 ### `.pi/extensions/github.test.ts` (~8 cases)
 
 - Per tool (5 tools): happy-path mocked response → correct `{ content, details }` shape, correct text formatting
+- Per tool (5 tools): `credentials.has("github") === false` → returns no-PAT guidance text with `details.needs_setup === true`, and the mocked `fetch` is never called (assert via spy)
 - Guardrail tagging: mock `checkTextForInjection` to return high score → output text prefixed with `⚠ possible prompt-injection`
 - `github_read` three branches: file / directory / binary → three distinct text-content shapes
 - `github_read` not-found → `{ content: [{ type: "text", text: "Not found: ..." }], details: { not_found: true } }`
@@ -369,10 +386,10 @@ No CI network calls. Real-GitHub smoke test is manual: operator sets PAT, runs `
 ## Acceptance criteria
 
 - [ ] All 5 tools callable from chat; LLM uses them instead of `web_search`/`web_fetch` for GitHub queries in a smoke test.
-- [ ] Unauthenticated mode works (public data, 60/hr, hint string appended).
+- [ ] With no PAT configured: any of the 5 tools returns the no-PAT guidance text and fires zero HTTP requests.
 - [ ] PAT mode works (5000/hr authenticated reads).
 - [ ] Malicious README (containing "ignore all previous instructions" anchor) tagged with `⚠ possible prompt-injection` but still delivered.
 - [ ] Rate-limit exhaustion surfaces `reset_at` to the LLM; no hang, no throw.
 - [ ] `secret_files_guard` continues to block `read vault.json` etc. after GitHub tools land (regression check).
 - [ ] All tests green; tsc strict clean.
-- [ ] Total suite count increases by ≥20.
+- [ ] Total suite count increases by ≥25.
