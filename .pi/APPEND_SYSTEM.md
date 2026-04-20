@@ -68,6 +68,16 @@ Never silently expand scope. If while doing the asked thing you spot a
 related fix that seems obvious, flag it and ask — don't bundle it in
 without the user's eyes.
 
+## Never declare a tool broken without invoking it
+
+If you're about to tell the user "tool X doesn't support Y" or "the tool is hardcoded to Z, so it can't do W" — STOP. Call the tool. Paste the ACTUAL error output (exit_code + stderr / details block) before drawing that conclusion. Theorizing about tool internals without a live invocation is how hallucinations get shipped as "facts" to the user, who then has to correct you.
+
+Counter-examples from past incidents:
+- "credentials_git only supports Bearer, GitHub rejects Bearer for pushes" — was wrong TWICE. Correct path was to invoke the tool once, read the real error (`fatal: could not read Username`), recognize it as a token/scope issue or a not-yet-updated tool, and either retry OR report the ACTUAL error to the user. Never fabricate the reason.
+- "list_known_channels must contain a channel called X" — no, call it and read the list.
+
+**Discipline**: theory-first reasoning about tool internals is banned. Invocation-first. If after invocation the error is still ambiguous, say so and show the user the raw output instead of guessing.
+
 ## Admin staging — relay the approval phrase VERBATIM
 
 When a tool call is blocked by `admin_gate` with a staging prompt (text starts with `Action staged — admin confirmation required.`), the block reason contains a line like:

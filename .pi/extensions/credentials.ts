@@ -311,17 +311,29 @@ export default function (pi: ExtensionAPI) {
         label: "Git with stored credential",
         description:
             "Run a git HTTP operation (push, clone, pull, fetch, ls-remote) authenticated " +
-            "with a stored credential. The bearer token is injected into git via env vars " +
-            "(GIT_CONFIG_COUNT/KEY/VALUE) equivalent to `git -c http.extraheader=\"Authorization: Bearer …\"`, " +
+            "with a stored credential. Auth is injected into git via env vars " +
+            "(GIT_CONFIG_COUNT/KEY/VALUE) equivalent to `git -c http.extraheader=\"Authorization: …\"`, " +
             "so the token NEVER enters LLM context and NEVER appears on the argv. " +
+            "\n\n" +
+            "Auth scheme: for bearer-stored credentials we synthesize Basic auth with the convention " +
+            "`x-access-token:<PAT>` — because GitHub's git HTTPS endpoint (unlike their REST API) " +
+            "only accepts Basic, not Bearer. GitLab / Gitea / BitBucket Server also accept this shape. " +
+            "The LLM never sees the raw token bytes. " +
             "\n\n" +
             "USE THIS INSTEAD OF asking the user to paste their PAT for a push, or constructing " +
             "URLs with the token embedded (`https://<TOKEN>@github.com/…`). Admin only; every " +
             "https:// URL arg is checked against the egress allowlist for the credential. " +
             "\n\n" +
+            "**INVOKE FIRST, THEORIZE LATER.** If you're about to claim the tool doesn't work for a " +
+            "given host, auth scheme, or scenario — call it and paste the actual stderr / exit_code " +
+            "output. Declaring `the tool is hardcoded to X` without having invoked it is a red flag " +
+            "and the user will correctly call it a hallucination. " +
+            "\n\n" +
             "Example — push a local branch to a repo the remote isn't yet configured for:\n" +
             "  credentials_git({ credential_id: \"github\", args: [\"push\",\n" +
-            "    \"https://github.com/misunders2d/amazon_manager2.git\", \"main:main\"] })",
+            "    \"https://github.com/misunders2d/amazon_manager2.git\", \"main:main\"] })\n" +
+            "Example — push to an already-configured remote:\n" +
+            "  credentials_git({ credential_id: \"github\", args: [\"push\", \"origin\", \"main\"] })",
         parameters: Type.Object({
             credential_id: Type.String({ description: "Credential id (bearer type only). For GitHub use 'github'." }),
             args: Type.Array(Type.String(), {
@@ -379,22 +391,30 @@ export default function (pi: ExtensionAPI) {
                 }
             }
 
-            // Inject auth via GIT_CONFIG_* env so the token stays off argv.
-            const authHeader = liveCreds.getAuthHeader(params.credential_id);
-            const authValue = authHeader["Authorization"];
-            if (typeof authValue !== "string") {
-                return {
-                    content: [{ type: "text", text: `Credential "${params.credential_id}" did not produce an Authorization header.` }],
-                    details: { error: "no-auth-header" },
-                };
-            }
+            // Git-over-HTTPS auth for a bearer-stored credential.
+            //
+            // GitHub's git protocol endpoint DOES NOT accept `Authorization: Bearer <PAT>`
+            // — it requires Basic auth with the PAT as password. (GitHub's REST API
+            // takes Bearer, but the git HTTP transport is a different code path and
+            // only honors Basic or its x-access-token pattern.) GitLab, Gitea, and
+            // BitBucket Server all accept Basic with a username-free/oauth2 convention
+            // too, so Basic is the portable choice for git transport.
+            //
+            // We synthesize Basic from the raw secret — never expose the raw bytes to
+            // the LLM, never put them on argv. The base64(username:password) blob goes
+            // only into GIT_CONFIG_VALUE_0 and the child process env, redacted on the
+            // way back.
+            const rawToken = liveCreds.get(params.credential_id);
+            const basicUser = "x-access-token"; // GitHub convention; GitLab accepts "oauth2" too.
+            const basicValue = `Basic ${Buffer.from(`${basicUser}:${rawToken}`, "utf-8").toString("base64")}`;
 
             const { spawn } = await import("node:child_process");
             const redact = (s: string): string =>
                 s
                     .replace(/ghp_[A-Za-z0-9]{20,}/g, "[REDACTED]")
                     .replace(/github_pat_[A-Za-z0-9_]{20,}/g, "[REDACTED]")
-                    .replace(new RegExp(authValue.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"), "[REDACTED]");
+                    .replace(new RegExp(rawToken.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"), "[REDACTED]")
+                    .replace(new RegExp(basicValue.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"), "[REDACTED]");
 
             return await new Promise((resolve) => {
                 const proc = spawn("git", params.args, {
@@ -403,7 +423,7 @@ export default function (pi: ExtensionAPI) {
                         ...process.env,
                         GIT_CONFIG_COUNT: "1",
                         GIT_CONFIG_KEY_0: "http.extraheader",
-                        GIT_CONFIG_VALUE_0: `Authorization: ${authValue}`,
+                        GIT_CONFIG_VALUE_0: `Authorization: ${basicValue}`,
                         // Suppress any credential helper that might prompt / log.
                         GIT_TERMINAL_PROMPT: "0",
                     },
