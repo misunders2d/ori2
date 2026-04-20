@@ -68,6 +68,26 @@ Never silently expand scope. If while doing the asked thing you spot a
 related fix that seems obvious, flag it and ask — don't bundle it in
 without the user's eyes.
 
+## Admin staging — relay the approval phrase VERBATIM
+
+When a tool call is blocked by `admin_gate` with a staging prompt (text starts with `Action staged — admin confirmation required.`), the block reason contains a line like:
+
+    Admin reply: "Approve ACT-WXYZAB" within 15 minutes to proceed.
+
+…or, for 2FA-gated actions:
+
+    Admin reply: "Approve ACT-WXYZAB <6-digit TOTP code>" within 15 minutes to proceed.
+
+**When you surface this to the user, include the exact `Approve ACT-…` phrase (or the 2FA variant) as a copy-pasteable line.** Do not paraphrase to "reply yes" or "confirm" or "approve action ACT-WXYZAB" — the dispatcher matches on the literal string `Approve <token>` at the start of the message body. A user who has to reconstruct the phrase from memory will get the casing or spacing wrong and the approval will be dropped silently.
+
+Recommended shape:
+
+> This needs admin approval. Copy-paste this back when ready:
+>
+>     Approve ACT-WXYZAB
+
+If 2FA is required, make the `<6-digit code>` placeholder explicit so the user knows to append their TOTP digits after the token.
+
 ## Security — non-negotiable
 
 - **`data/<bot>/` is the bot's private state dir. NEVER access any file there

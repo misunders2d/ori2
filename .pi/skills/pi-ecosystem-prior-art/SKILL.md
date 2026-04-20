@@ -1,11 +1,38 @@
 ---
 name: pi-ecosystem-prior-art
-description: "Use when doing evolution-sop Phase 2 prior-art search, or before building ANY new extension/adapter/tool — the Pi SDK ecosystem (bundled examples + badlogic/* + openclaw/*) has canonical implementations for most patterns ori2 will ever need."
+description: "Use before writing OR modifying ANY code that touches Pi SDK internals — session state, AgentSession events, LLM-context building, channel/adapter plumbing, custom-message entries, compaction, scheduling, cross-channel delivery. Applies to NEW features (evolution-sop Phase 2) AND bugfixes/refactors on existing extensions. Also applies before calling any `session.*` / `sessionManager.*` / `pi.*` API — grep the Pi SDK `.d.ts` files for higher-level methods before reaching for lower-level primitives (e.g. `sendCustomMessage` over `appendCustomMessageEntry`). The Pi SDK ecosystem (bundled examples + badlogic/* + openclaw/*) has canonical implementations for most patterns ori2 will ever need."
 ---
 
 # Pi Ecosystem Prior-Art Index
 
 **Purpose:** the Pi SDK ecosystem has canonical, maintained implementations for nearly every pattern ori2 is likely to evolve — channel adapters, sandbox execution, image generation, custom compaction, plan-mode, dynamic tools, file-trigger automation, custom LLM providers. **Check here FIRST** before a fresh WebSearch. Reinventing a wheel the author of Pi already built is a failure mode we've hit repeatedly.
+
+## Pi SDK self-check (do this BEFORE any Pi-API call, in new code OR bugfixes)
+
+Before using any `session.*`, `sessionManager.*`, `pi.*` method, grep Pi's own `.d.ts` files for related names — higher-level API methods that bundle state updates almost always exist next to the lower-level primitives. Missing them is how we ship bugs like "scheduler-delivery persisted to branch but invisible to the next LLM turn" (the fix was `session.sendCustomMessage({triggerTurn: false})`, which updates BOTH `agent.state.messages` AND the SessionManager — `sessionManager.appendCustomMessageEntry` alone only does the latter).
+
+One-liner that surfaces related methods every time:
+
+```bash
+# What API lives near this concept? Run BEFORE writing any Pi-API call.
+grep -rn "<concept>" node_modules/@mariozechner/pi-coding-agent/dist/core/*.d.ts \
+  | grep -v "\.d\.ts\.map"
+```
+
+Concrete examples:
+
+| I was about to call… | Better alternative you'd find by grepping | Why |
+|---|---|---|
+| `sessionManager.appendCustomMessageEntry(...)` | `session.sendCustomMessage({...}, { triggerTurn: false })` | Updates `agent.state.messages` (the actual LLM-context array) in addition to persistence. |
+| `session.subscribe(...)` polling for agent_end | `session.prompt(text, {...})` already awaits turn completion | Subscribe only when you need event-driven delivery; for sequential flow, prompt resolves when done. |
+| manual child_process `spawn("git", ...)` with URL-embedded token | `credentials_git` tool (ori2) — injects auth via `GIT_CONFIG_*` env | Keeps the token off argv and off `.git/config`. |
+
+**Before any Pi-API call in new or existing code, run the grep above.** If you find a higher-level method that already does the thing you're piecing together, use it and stop.
+
+Red flag — STOP if any of these apply:
+- You're writing "Pi doesn't have an API for this, let me do it via lower-level primitives…" without having grepped the `.d.ts` files for related names.
+- You're about to `sessionManager.append…` from outside the AgentSession — grep for `session.send…`/`session.push…` variants first.
+- You're about to `spawn` a process to do something Pi has a tool for. Check `pi.registerTool` callsites in `pi-coding-agent/examples/` for the tool shape.
 
 ## When to Use
 
