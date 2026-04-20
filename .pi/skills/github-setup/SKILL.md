@@ -36,6 +36,13 @@ Ask the user to paste two things into the chat:
 2. The **Personal Access Token** they just generated.
 *(Assure them that you will securely configure it and will not save the token in the codebase).*
 
+### 3a: Also save the PAT so I can READ GitHub (not just push to my backing repo)
+Have the user paste the token once more via the credential command so I can use it for `github_search_code` / `github_read` / `github_read_issue` (prior-art lookups, reading reference implementations, investigating known issues — all rate-limited on DuckDuckGo otherwise):
+```
+/credentials add github <paste the same PAT here>
+```
+The dispatcher intercepts this command before your context sees the raw token. Use the `github-read` skill for guidance on when to reach for each GitHub tool.
+
 ## Step 4: Configure the Remote (Agent Action)
 Once the user provides the URL and Token, use your `bash` tool to configure the Git remote. 
 You must construct the secure remote URL by embedding the token.

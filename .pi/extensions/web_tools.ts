@@ -16,7 +16,8 @@ export default function (pi: ExtensionAPI) {
         name: "web_fetch",
         label: "Fetch Webpage Content",
         description:
-            "Fetch and read the text content of a URL. Branches on content-type: HTML→text-extracted, plain text/markdown/JSON→inline, other (PDF/images/binaries)→reports the type and size, suggests dedicated parsing.",
+            "Fetch and read the text content of a URL. Branches on content-type: HTML→text-extracted, plain text/markdown/JSON→inline, other (PDF/images/binaries)→reports the type and size, suggests dedicated parsing. " +
+            "For github.com URLs, prefer github_read (files, directories) or github_read_issue (issue/PR threads with comments) — parsed JSON, decoded file contents, no HTML scraping.",
         parameters: Type.Object({
             url: Type.String({ description: "The full URL to fetch" }),
         }),
@@ -65,7 +66,9 @@ export default function (pi: ExtensionAPI) {
     pi.registerTool({
         name: "web_search",
         label: "Search the Web",
-        description: "Perform a web search to find documentation, news, or answers (DuckDuckGo HTML, no API key required).",
+        description:
+            "Perform a web search to find documentation, news, or answers (DuckDuckGo HTML, no API key required). " +
+            "For GitHub code / repo / issue / PR lookups, prefer github_search_code / github_search_repos / github_search_issues — authenticated (5000/hr) and structured, vs DuckDuckGo's frequent rate-limiting.",
         parameters: Type.Object({
             query: Type.String({ description: "The search query" }),
         }),
