@@ -10,6 +10,7 @@ import { getWhitelist } from "../../src/core/whitelist.js";
 import { getKVCache } from "../../src/core/kvCache.js";
 import { getDispatcher } from "../../src/transport/dispatcher.js";
 import { getSharedAgentServices, extractAssistantText } from "../../src/core/agentServices.js";
+import { getChannelSessions } from "../../src/core/channelSessions.js";
 import { seedPlan, recordPlanThread, type OriginChannel } from "./plan_enforcer.js";
 import { logError, logWarning } from "../../src/core/errorLog.js";
 
@@ -292,17 +293,59 @@ async function deliverAndAppend(meta: JobMeta, responseText: string): Promise<vo
         }
     }
 
-    // 2) Append to the session JSONL so next-turn LLM context has the
-    //    event. Priority: explicit target.sessionFile > origin_session_file.
-    //    Opens a fresh SessionManager on the file — persistence is reliable;
-    //    live-TUI rendering is best-effort (see module header note). The
-    //    real user-visible delivery for chat platforms already happened in
-    //    step (1) via dispatcher.send → adapter.send.
-    const resolvedFile = target?.sessionFile ?? meta.origin_session_file;
-    if (!resolvedFile || !fs.existsSync(resolvedFile)) return;
+    // 2) Append the delivery as a `scheduler-delivery` custom entry on the
+    //    session where the user will follow up. Single append, target-preferred
+    //    (mirrors amazon_manager's `_inject_into_session`): when `deliver_to`
+    //    points at a real chat channel (telegram/slack/a2a/…), the follow-up
+    //    ("which exactly?" / "elaborate on that headline") happens in THAT
+    //    channel, so the TARGET channel's session needs the delivered text
+    //    in its history — not the scheduling session.
+    //
+    //    Priority:
+    //      (a) target chat channel's session file (resolved via channelSessions;
+    //          lazily created on disk so the entry lands even if the bot hasn't
+    //          received an inbound from that channel yet).
+    //      (b) origin_session_file — the fallback path for CLI/TUI-scheduled
+    //          jobs with NO explicit deliver_to (follow-ups happen in the same
+    //          TUI where scheduling happened).
+    //
+    //    When origin == target (scheduled from the same channel delivery goes
+    //    to), both paths resolve to the same file → single append.
+    const historyFile = deriveTargetSessionFile(target) ?? target?.sessionFile ?? meta.origin_session_file;
+    if (historyFile && fs.existsSync(historyFile)) {
+        appendSchedulerDeliveryEntry(historyFile, meta, responseText, target);
+    }
+}
 
+/**
+ * Resolve the session file for a chat-platform delivery target. Returns null
+ * for CLI / the synthetic "scheduler" platform / unknown shapes — those don't
+ * have per-channel sessions to append to. Creates the channelSessions binding
+ * (and the .jsonl on disk) if it doesn't exist yet — necessary for the
+ * cross-channel case where the bot hasn't yet received an inbound from that
+ * channel but is about to deliver there.
+ */
+function deriveTargetSessionFile(target: DeliverTarget | undefined): string | null {
+    if (!target) return null;
+    if (target.platform === "cli" || target.platform === "scheduler") return null;
     try {
-        const sm = SessionManager.open(resolvedFile);
+        return getChannelSessions().getOrCreateSessionFile(target.platform, target.channelId);
+    } catch (e) {
+        logWarning("scheduler", `cannot resolve target session file for ${target.platform}:${target.channelId}`, {
+            err: e instanceof Error ? e.message : String(e),
+        });
+        return null;
+    }
+}
+
+function appendSchedulerDeliveryEntry(
+    sessionFile: string,
+    meta: JobMeta,
+    responseText: string,
+    target: DeliverTarget | undefined,
+): void {
+    try {
+        const sm = SessionManager.open(sessionFile);
         sm.appendCustomMessageEntry(
             "scheduler-delivery",
             responseText,
@@ -318,7 +361,7 @@ async function deliverAndAppend(meta: JobMeta, responseText: string): Promise<vo
         logError("scheduler", "session append failed", {
             err: e instanceof Error ? e.message : String(e),
             job_id: meta.job_id,
-            sessionFile: resolvedFile,
+            sessionFile,
         });
     }
 }
