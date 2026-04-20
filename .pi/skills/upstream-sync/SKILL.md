@@ -58,7 +58,23 @@ Conflict → resolve → `git cherry-pick --continue`.
 
 If the commit touches anything the operator has evolved (extensions, skills, APPEND_SYSTEM), expect conflict — show them the diff and **ask** how to resolve before continuing. Never resolve conflicts on evolved files without approval.
 
-### 4. Mark the new baseline
+### 4. Activate the changes
+
+**This project runs TypeScript DIRECTLY via `tsx` — no compile step, no `dist/`, no `npm run build` script.** Pulling `.ts` files is the ONLY code update needed; activation is a matter of telling the running process to re-read them.
+
+| What changed | How to activate | Notes |
+|---|---|---|
+| `.pi/extensions/*.ts` only | Call `reload_extensions` tool (chat) OR `/reload` (TUI). | Hot-reload. New tools callable on the NEXT message. No restart. |
+| `src/**/*.ts` (anything else) | Restart the bot: `Ctrl+C` in the tmux pane → `./start.sh` (or `npm start`). | `src/` modules are loaded by the main process; only a fresh boot picks them up. |
+| `package.json` / `package-lock.json` | `npm install` THEN restart as above. | Only when deps or scripts changed. |
+| `.pi/skills/*.md`, `.pi/APPEND_SYSTEM.md`, `.pi/prompts/*` | `reload_extensions` OR `/reload`. | Pi's resource loader re-reads on reload. |
+| Config only (`.env`, `data/<bot>/vault.json`) | Restart. | Env hydration happens once at boot. |
+
+**Anti-pattern:** never suggest `npm run build`, `tsc`, or "sync dist/". Those are generic Node instincts that don't apply here — `package.json` has no `build` script and the repo has no `dist/`. Grep the scripts block if in doubt: `grep '"scripts"' package.json -A 10`.
+
+After activation, verify by asking: did any tests run during `npm test` in step 3, and did any cherry-picked commit change a tool or command? If yes, try invoking it before reporting success.
+
+### 5. Mark the new baseline
 
 After a merge or cherry-pick that represents "caught up to `<sha>`":
 
@@ -68,13 +84,17 @@ After a merge or cherry-pick that represents "caught up to `<sha>`":
 
 Future `sync-baseline.sh` runs report delta from THIS point forward. **Only mark AFTER commits are actually in the tree** — marking without merging lies about state.
 
-### 5. Clean up
+### 6. Clean up
 
 ```bash
 git remote remove ori2-upstream
 ```
 
 Only needed if step 3 used `--remote`. Default (no flag) mode drops it on exit.
+
+> Numbering note: step 4 is activation (not mark-baseline). Mark AFTER activating
+> and verifying the new code works — otherwise `baseline_sha` moves forward
+> while you're still on old behavior.
 
 ## Quick Reference
 
@@ -92,6 +112,8 @@ Only needed if step 3 used `--remote`. Default (no flag) mode drops it on exit.
 - **Skipping `--mark`** — next run re-reports the same commits as new.
 - **Marking without merging** — lies about state. Mark AFTER, not before.
 - **Auto-running cherry-pick / merge / mark** — operator-driven flow. Present findings, suggest commands, wait for approval before modifying history.
+- **Recommending `npm run build` / `tsc` / "rebuild dist/"** — this project runs TypeScript directly via `tsx`. No build script, no `dist/`. Activation is `reload_extensions` (`.pi/` changes) or a bot restart (`src/` changes). See step 4.
+- **Forgetting to activate** — pulling + cherry-picking writes new `.ts` to disk; nothing happens until reload/restart. Step 4 is not optional.
 
 ## Reporting Back
 
